@@ -11,7 +11,6 @@ services:
     image: nvs:local
     container_name: nvs-local
     restart: unless-stopped
-    init: true
     environment:
       NVS_BUILD_SHA: ${NVS_BUILD_SHA:-local}
       NVS_BUILD_TIMESTAMP: ${NVS_BUILD_TIMESTAMP:-local}

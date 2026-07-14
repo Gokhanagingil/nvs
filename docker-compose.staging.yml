@@ -5,7 +5,6 @@ services:
     image: ${NVS_IMAGE:?Set NVS_IMAGE to the exact loaded image tag}
     container_name: nvs
     restart: unless-stopped
-    init: true
     env_file:
       - .env
     environment:

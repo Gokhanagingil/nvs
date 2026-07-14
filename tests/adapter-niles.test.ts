@@ -16,6 +16,16 @@ const environment: EnvironmentDefinitionV1 = {
   enabled: true,
 };
 
+function hangsUntilAborted(_input: string | URL | Request, init?: RequestInit): Promise<Response> {
+  return new Promise((_resolve, reject) => {
+    init?.signal?.addEventListener(
+      'abort',
+      () => reject(new DOMException('transport detail', 'AbortError')),
+      { once: true },
+    );
+  });
+}
+
 describe('read-only NILES adapter', () => {
   it('uses only GET and reports health, readiness, OpenAPI, and build capabilities', async () => {
     const fetchMock = vi
@@ -91,6 +101,36 @@ describe('read-only NILES adapter', () => {
     expect(result.version).toEqual({ available: false, status: 404, source: 'NONE' });
   });
 
+  it.each([
+    ['HTML', new Response('<html>not OpenAPI</html>', { status: 200 })],
+    ['unrelated JSON', new Response(JSON.stringify({ status: 'ok' }), { status: 200 })],
+  ])('does not accept an HTTP 200 %s response as OpenAPI', async (_name, openApiResponse) => {
+    const fetchMock = vi
+      .fn<FetchImplementation>()
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ status: 'ok' }), { status: 200 }))
+      .mockResolvedValueOnce(openApiResponse)
+      .mockResolvedValueOnce(new Response(null, { status: 404 }));
+
+    const result = await new NilesReadOnlyAdapter(fetchMock).probe(environment);
+
+    expect(result.verdict).toBe('PASS');
+    expect(result.openApi).toEqual({ available: false, status: 200 });
+  });
+
+  it('accepts a top-level Swagger document as valid OpenAPI capability evidence', async () => {
+    const fetchMock = vi
+      .fn<FetchImplementation>()
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ status: 'ok' }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ swagger: '2.0' }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(null, { status: 404 }));
+
+    const result = await new NilesReadOnlyAdapter(fetchMock).probe(environment);
+
+    expect(result.openApi).toEqual({ available: true, status: 200 });
+  });
+
   it('classifies required health failure as an environment BLOCKED result', async () => {
     const fetchMock = vi
       .fn<FetchImplementation>()
@@ -135,5 +175,59 @@ describe('read-only NILES adapter', () => {
     expect(result.verdict).toBe('BLOCKED');
     expect(result.error?.code).toBe('HEALTH_UNREACHABLE');
     expect(JSON.stringify(result)).not.toContain('secret host detail');
+  });
+
+  it('blocks a health request that exceeds the deterministic deadline', async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchMock = vi.fn<FetchImplementation>(hangsUntilAborted);
+      const probe = new NilesReadOnlyAdapter(fetchMock, 100).probe(environment);
+
+      await vi.advanceTimersByTimeAsync(100);
+      const result = await probe;
+
+      expect(result).toMatchObject({
+        verdict: 'BLOCKED',
+        health: { available: false },
+        error: {
+          category: 'ENVIRONMENT',
+          code: 'HEALTH_TIMEOUT',
+          retryable: true,
+        },
+      });
+      expect(JSON.stringify(result)).not.toMatch(/niles\.invalid|transport detail|AbortError/i);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('blocks a readiness request that exceeds the deterministic deadline', async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchMock = vi
+        .fn<FetchImplementation>()
+        .mockResolvedValueOnce(new Response(null, { status: 204 }))
+        .mockImplementationOnce(hangsUntilAborted);
+      const probe = new NilesReadOnlyAdapter(fetchMock, 100).probe(environment);
+
+      await vi.advanceTimersByTimeAsync(100);
+      const result = await probe;
+
+      expect(result).toMatchObject({
+        verdict: 'BLOCKED',
+        health: { available: true, status: 204 },
+        readiness: { available: false },
+        error: {
+          category: 'ENVIRONMENT',
+          code: 'READINESS_TIMEOUT',
+          retryable: true,
+        },
+      });
+      expect(JSON.stringify(result)).not.toMatch(/niles\.invalid|transport detail|AbortError/i);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

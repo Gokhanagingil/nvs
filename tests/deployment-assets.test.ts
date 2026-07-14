@@ -63,6 +63,14 @@ describe('production and deployment assets', () => {
     expect(compose).toContain('./config:/app/config:ro');
     expect(compose).toContain('./data:/var/lib/nvs');
     expect(compose).toContain('127.0.0.1:${NVS_HOST_PORT:-4100}:4100');
+    expect(compose).toContain('networks:');
+    expect(compose).toContain('- niles-internal');
+    expect(compose).toContain('external: true');
+    expect(compose).toContain('name: ${NVS_NILES_DOCKER_NETWORK:-bridge}');
+    expect(compose).not.toContain('network_mode: host');
+    expect(compose).not.toMatch(/3002:\d+/);
+    expect(environmentExample).toContain('NVS_NILES_DOCKER_NETWORK=bridge');
+    expect(environmentExample).toContain('grc-platform_grc-staging-network');
     expect(localCompose).toContain('read_only: true');
     expect(image).toContain('USER 10001:10001');
     expect(image).toContain('groupadd --gid 10001 nvs');
@@ -72,6 +80,10 @@ describe('production and deployment assets', () => {
     expect(apiPackage).toContain('"@fastify/static": "10.1.0"');
     expect(environmentExample).not.toMatch(/^NVS_CREDENTIAL_[A-Z0-9_]+=(?!\s*$).+/m);
     expect(bootstrap).toContain('nvsdeploy:10001');
+    expect(bootstrap).toContain('NVS_NILES_DOCKER_NETWORK=grc-platform_grc-staging-network');
+    expect(bootstrap).toContain('http://backend:3002');
+    expect(bootstrap).toContain('docker network inspect grc-platform_grc-staging-network');
+    expect(bootstrap).toContain('Authentication preflight is the explicit connectivity');
     expect(bootstrap).toContain('sudo tar --create --gzip');
     expect(bootstrap).toContain('chmod 0600');
     expect(containerProof).toContain('nvsdeploy:10001');

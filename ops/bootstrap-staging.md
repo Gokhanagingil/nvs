@@ -64,7 +64,7 @@ Bootstrap non-secret configuration from reviewed templates, then replace every s
 2. Copy only the `staging-*` actor profiles into `/opt/nvs/config/actors/profiles/`.
 3. Copy `actors/mappings/staging-example.yaml` into `/opt/nvs/config/actors/mappings/staging.yaml` (or an equivalent staging environment id mapping).
 4. Copy `environments/staging.example.yaml` to `/opt/nvs/config/environments/staging.yaml`.
-5. Replace the `.invalid` base URL with the operator-approved staging NILES URL.
+5. Set the staging NILES `baseUrl` to `http://backend:3002` for internal Docker-network reachability. Do not point NVS at public NILES URLs that return Cloudflare managed-challenge responses to automation.
 6. Replace all sanitized tenant UUIDs. Do not leave template tenant IDs unchanged.
 7. Enable the environment only after review.
 
@@ -92,6 +92,32 @@ export NVS_VALIDATE_IMAGE=nvs:<full-git-sha>
 ```
 
 The command must report readiness `ready`. Empty, malformed, inconsistent, or wrongly owned configuration returns typed `BLOCKED` / exit status `2`.
+
+Configuration readiness is local-only: it validates ownership, schema, and file consistency on the host. It does not prove NVS can reach or authenticate against the NILES backend.
+
+## 2a. Internal NILES Docker network
+
+NVS and NILES may share a private Docker network on the same approved staging host. NVS joins that network through Compose; it does not publish NILES backend ports and does not use host networking.
+
+Set this server-owned value in `/opt/nvs/.env`:
+
+```bash
+NVS_NILES_DOCKER_NETWORK=grc-platform_grc-staging-network
+```
+
+The staging environment `baseUrl` must be `http://backend:3002`, matching the NILES backend Docker alias on that network.
+
+Before cutover, confirm the shared network and backend alias:
+
+```bash
+docker network inspect grc-platform_grc-staging-network
+```
+
+Verify the NILES backend service lists the alias `backend`. A temporary container on the same network must reach `http://backend:3002/health/live` with HTTP 200.
+
+Public NILES endpoints (`https://niles-grc.com`, `https://api.niles-grc.com`) remain Cloudflare-protected. Do not weaken managed-challenge protection merely to support NVS automation. The NILES backend must not be published on a broad or public host interface.
+
+Authentication preflight is the explicit connectivity and authentication acceptance step after deployment. Run it only after NVS is healthy and the internal `baseUrl` is configured.
 
 ## 3. Pinned SSH trust and GitHub environment
 

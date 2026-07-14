@@ -40,3 +40,10 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    networks:
+      - niles-internal
+
+networks:
+  niles-internal:
+    external: true
+    name: ${NVS_NILES_DOCKER_NETWORK:-bridge}

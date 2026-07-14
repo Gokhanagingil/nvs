@@ -11,7 +11,7 @@ CONTAINER_PORT=4120
 trap '
   docker compose --project-directory "$WORK" -f "$WORK/docker-compose.staging.yml" stop nvs >/dev/null 2>&1 || true
   docker rm --force nvs >/dev/null 2>&1 || true
-  rm -rf "$WORK"
+  sudo rm -rf "$WORK" >/dev/null 2>&1 || rm -rf "$WORK" >/dev/null 2>&1 || true
 ' EXIT
 
 mkdir -p "$WORK/config" "$WORK/data" "$WORK/ops" "$WORK/releases"

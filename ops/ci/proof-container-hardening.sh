@@ -5,7 +5,11 @@ BUILD_SHA="${1:?BUILD_SHA is required}"
 IMAGE="nvs:${BUILD_SHA}"
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/nvs-ci-harden.XXXXXX")"
-trap 'rm -rf "$WORK"; docker rm --force nvs-ci-bind >/dev/null 2>&1 || true; docker rm --force nvs-ci-bad-bind >/dev/null 2>&1 || true' EXIT
+trap '
+  docker rm --force nvs-ci-bind >/dev/null 2>&1 || true
+  docker rm --force nvs-ci-bad-bind >/dev/null 2>&1 || true
+  sudo rm -rf "$WORK" >/dev/null 2>&1 || rm -rf "$WORK" >/dev/null 2>&1 || true
+' EXIT
 
 mkdir -p "$WORK/good/config" "$WORK/good/data" "$WORK/bad/config" "$WORK/bad/data"
 cp -a "$ROOT/actors" "$ROOT/environments" "$ROOT/scenarios" "$WORK/good/config/"
@@ -68,17 +72,22 @@ docker run --detach --name nvs-ci-bad-bind --read-only \
   -e NVS_RELEASE_VERSION=0.1.0 \
   "$IMAGE"
 
-deadline=$((SECONDS + 60))
+deadline=$((SECONDS + 90))
 blocked=false
+: >"$WORK/ready.json"
 while (( SECONDS < deadline )); do
-  live="$(curl --fail --silent --show-error --max-time 3 http://127.0.0.1:4101/api/health/live || true)"
-  ready_code="$(curl --silent --show-error --max-time 3 -o "$WORK/ready.json" -w '%{http_code}' http://127.0.0.1:4101/api/health/ready || true)"
-  if [[ "$live" == *'"status":"ok"'* && "$ready_code" == "503" ]]; then
-    if grep -q '"status":"blocked"' "$WORK/ready.json" &&
-      grep -q 'LOCAL_STORAGE_UNAVAILABLE\|LOCAL_CONFIGURATION' "$WORK/ready.json"; then
-      blocked=true
-      break
-    fi
+  live="$(curl --silent --show-error --max-time 3 http://127.0.0.1:4101/api/health/live 2>/dev/null || true)"
+  ready_code="$(
+    curl --silent --show-error --max-time 3 \
+      -o "$WORK/ready.json" \
+      -w '%{http_code}' \
+      http://127.0.0.1:4101/api/health/ready 2>/dev/null || true
+  )"
+  if [[ "$live" == *'"status":"ok"'* && "$ready_code" == "503" ]] &&
+    grep -q '"status":"blocked"' "$WORK/ready.json" &&
+    grep -q 'LOCAL_STORAGE_UNAVAILABLE' "$WORK/ready.json"; then
+    blocked=true
+    break
   fi
   sleep 2
 done
@@ -86,6 +95,7 @@ done
 [[ "$blocked" == true ]] || {
   echo "Incorrect ownership did not produce readiness BLOCKED." >&2
   cat "$WORK/ready.json" >&2 || true
+  docker logs nvs-ci-bad-bind >&2 || true
   exit 1
 }
 

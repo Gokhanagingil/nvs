@@ -60,7 +60,7 @@ importers:
   apps/api:
     dependencies:
       '@fastify/static':
-        specifier: ^10.1.0
+        specifier: 10.1.0
         version: 10.1.0
       '@nvs/adapter-niles':
         specifier: workspace:*

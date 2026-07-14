@@ -37,24 +37,31 @@ ENV NVS_WEB_DIR=/app/web
 ENV NVS_BUILD_SHA="${NVS_BUILD_SHA}"
 ENV NVS_BUILD_TIMESTAMP="${NVS_BUILD_TIMESTAMP}"
 ENV NVS_RELEASE_VERSION="${NVS_RELEASE_VERSION}"
+ENV HOME=/nonexistent
 
 RUN apt-get update \
     && apt-get install --no-install-recommends -y tini \
     && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 10001 nvs \
+    && useradd --uid 10001 --gid 10001 --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin nvs \
     && mkdir -p /app/api /app/config /app/web /var/lib/nvs \
-    && chown -R node:node /app /var/lib/nvs
+    && chown 10001:10001 /var/lib/nvs \
+    && chmod 0750 /var/lib/nvs
 
 WORKDIR /app
 
-COPY --from=build --chown=node:node /opt/nvs-api/package.json ./package.json
-COPY --from=build --chown=node:node /opt/nvs-api/node_modules ./node_modules
-COPY --from=build --chown=node:node /opt/nvs-api/dist ./api
-COPY --from=build --chown=node:node /workspace/apps/web/dist ./web
-COPY --from=build --chown=node:node /workspace/actors ./config/actors
-COPY --from=build --chown=node:node /workspace/environments ./config/environments
-COPY --from=build --chown=node:node /workspace/scenarios ./config/scenarios
+COPY --from=build /opt/nvs-api/package.json ./package.json
+COPY --from=build /opt/nvs-api/node_modules ./node_modules
+COPY --from=build /opt/nvs-api/dist ./api
+COPY --from=build /workspace/apps/web/dist ./web
+COPY --from=build /workspace/actors ./config/actors
+COPY --from=build /workspace/environments ./config/environments
+COPY --from=build /workspace/scenarios ./config/scenarios
 
-USER node
+RUN chmod -R a-w /app \
+    && chmod 0755 /app /app/api /app/config /app/web
+
+USER 10001:10001
 
 EXPOSE 4100
 VOLUME ["/var/lib/nvs"]

@@ -11,6 +11,9 @@ services:
     image: nvs:local
     container_name: nvs-local
     restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=64m,mode=1777
     environment:
       NVS_BUILD_SHA: ${NVS_BUILD_SHA:-local}
       NVS_BUILD_TIMESTAMP: ${NVS_BUILD_TIMESTAMP:-local}

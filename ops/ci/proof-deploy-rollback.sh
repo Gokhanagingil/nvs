@@ -25,6 +25,14 @@ cp "$ROOT/ops/deploy-staging.sh" "$ROOT/ops/verify-deployment.sh" "$WORK/ops/"
 chmod 0750 "$WORK/ops/deploy-staging.sh" "$WORK/ops/verify-deployment.sh"
 install -m 0600 /dev/null "$WORK/.env"
 printf 'NVS_LOG_LEVEL=silent\n' >"$WORK/.env"
+# Docker's predefined bridge network cannot be attached as a Compose external network.
+# Keep compose interpolation default bridge for config validation; proofs use a
+# user-defined external network with the same driver semantics.
+if [[ "${NVS_NILES_DOCKER_NETWORK:-bridge}" == bridge ]]; then
+  docker network inspect nvs-ci-internal >/dev/null 2>&1 || docker network create nvs-ci-internal
+  printf 'NVS_NILES_DOCKER_NETWORK=nvs-ci-internal\n' >>"$WORK/.env"
+  export NVS_NILES_DOCKER_NETWORK=nvs-ci-internal
+fi
 sudo chown -R nvsdeploy:10001 "$WORK/config"
 sudo find "$WORK/config" -type d -exec chmod 0750 {} +
 sudo find "$WORK/config" -type f -exec chmod 0640 {} +

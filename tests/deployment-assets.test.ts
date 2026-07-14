@@ -41,6 +41,7 @@ describe('production and deployment assets', () => {
     expect(deploy).toContain('Loaded image metadata does not match the requested SHA.');
     expect(deploy).toContain('Restoring previously active image');
     expect(deploy).toContain('immutable image ID');
+    expect(deploy).toContain('ROLLBACK_VERIFY_SCRIPT');
     expect(deploy).toContain('prune_rollback_tags');
     expect(deploy).not.toContain('docker compose down');
     expect(rollback).toContain('Rollback image metadata does not match the requested SHA.');

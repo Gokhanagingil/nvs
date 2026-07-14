@@ -11,6 +11,7 @@ RELEASE_VERSION="${NVS_RELEASE_VERSION:-0.1.0}"
 COMPOSE_FILE="${NVS_COMPOSE_FILE:-${DEPLOY_PATH}/docker-compose.staging.yml}"
 HEALTH_URL="${NVS_HEALTH_URL:-http://127.0.0.1:${HOST_PORT}}"
 VERIFY_SCRIPT="${NVS_VERIFY_SCRIPT:-${DEPLOY_PATH}/ops/verify-deployment.sh}"
+ROLLBACK_VERIFY_SCRIPT="${NVS_ROLLBACK_VERIFY_SCRIPT:-${DEPLOY_PATH}/ops/verify-deployment.sh}"
 ROLLBACK_RETENTION="${NVS_ROLLBACK_RETENTION:-5}"
 CONTAINER_NAME="nvs"
 
@@ -35,6 +36,8 @@ fail_input() {
 [[ -f "$IMAGE_ARCHIVE" ]] || fail_input "The transferred image archive is missing."
 [[ -f "$COMPOSE_FILE" ]] || fail_input "The staging Compose file is missing."
 [[ -x "$VERIFY_SCRIPT" ]] || fail_input "The deployment verification script is missing."
+[[ -x "$ROLLBACK_VERIFY_SCRIPT" ]] ||
+  fail_input "The rollback verification script is missing."
 [[ -f "${DEPLOY_PATH}/.env" ]] || fail_input "Server-owned ${DEPLOY_PATH}/.env is missing."
 [[ -d "${DEPLOY_PATH}/config" && -d "${DEPLOY_PATH}/data" ]] ||
   fail_input "Server-owned config or data directory is missing."
@@ -134,7 +137,7 @@ if [[ -n "$rollback_tag" && -n "$previous_sha" ]]; then
   export NVS_BUILD_TIMESTAMP="${previous_timestamp:-unknown}"
   export NVS_RELEASE_VERSION="${previous_version:-unknown}"
   compose up -d --no-deps --force-recreate nvs
-  if "$VERIFY_SCRIPT" "$HEALTH_URL" "$previous_sha" 120; then
+  if "$ROLLBACK_VERIFY_SCRIPT" "$HEALTH_URL" "$previous_sha" 120; then
     echo "Rollback verified at ${previous_sha} via immutable image ID." >&2
   else
     echo "Rollback was attempted but did not become healthy." >&2

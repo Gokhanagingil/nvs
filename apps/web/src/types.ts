@@ -5,6 +5,49 @@ export interface TypedError {
   retryable: boolean;
 }
 
+export interface BuildInformation {
+  schemaVersion: 'nvs.version/v1';
+  buildSha: string;
+  buildTimestamp: string;
+  releaseVersion: string;
+  nodeVersion: string;
+  contractVersion: string;
+}
+
+export interface ActorReadiness {
+  actorProfileId: string;
+  displayName: string;
+  persona:
+    'requester' | 'service-desk-agent' | 'incident-manager' | 'tenant-admin' | 'cross-tenant-agent';
+  credentialConfiguration: 'NOT_CONFIGURED' | 'CONFIGURED' | 'INVALID' | 'DISABLED';
+  authenticationState: 'NOT_ATTEMPTED' | 'AUTHENTICATED' | 'BLOCKED' | 'DISABLED';
+  expectedTenantId?: string;
+  observedTenantId?: string;
+  userId?: string;
+  durationMs?: number;
+  correlationId?: string;
+  timestamp?: string;
+  error?: TypedError;
+}
+
+export interface ActorList {
+  schemaVersion: 'nvs.actor-list/v1';
+  environmentId: string;
+  gateEligible: false;
+  actors: ActorReadiness[];
+}
+
+export interface AuthPreflight {
+  schemaVersion: 'nvs.auth-preflight/v1';
+  environmentId: string;
+  verdict: 'PASS' | 'BLOCKED';
+  gateEligible: false;
+  assuranceScope: 'AUTHENTICATION_READINESS_ONLY';
+  startedAt: string;
+  completedAt: string;
+  actors: ActorReadiness[];
+}
+
 export interface EnvironmentDefinition {
   schemaVersion: 'nvs.environment/v1';
   id: string;

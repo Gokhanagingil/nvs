@@ -10,8 +10,10 @@ import {
   useParams,
   useSearchParams,
 } from 'react-router-dom';
+import { ActorReadinessPanel } from './ActorReadinessPanel.js';
 import { ApiError, apiRequest, errorMessage } from './api.js';
 import type {
+  BuildInformation,
   CoverageResult,
   EnvironmentDefinition,
   EvidenceManifest,
@@ -87,6 +89,14 @@ function PageHeader({
 }
 
 function Shell() {
+  const [build, setBuild] = useState<BuildInformation>();
+
+  useEffect(() => {
+    void apiRequest<BuildInformation>('/api/version')
+      .then(setBuild)
+      .catch(() => setBuild(undefined));
+  }, []);
+
   return (
     <div className="app-shell">
       <a className="skip-link" href="#main-content">
@@ -102,9 +112,24 @@ function Shell() {
             <small>Validation Console</small>
           </span>
         </Link>
-        <div className="scope-chip">
-          <span aria-hidden="true" />
-          Local control plane
+        <div className="masthead-meta">
+          <div className="scope-chip">
+            <span aria-hidden="true" />
+            Local control plane
+          </div>
+          <div
+            className="build-fingerprint"
+            title={build ? `Build SHA ${build.buildSha}` : 'Build fingerprint unavailable'}
+          >
+            <small>Running build</small>
+            <strong>
+              {build
+                ? `${build.releaseVersion} · ${
+                    build.buildSha === 'unknown' ? 'unknown SHA' : build.buildSha.slice(0, 12)
+                  }`
+                : 'Unavailable'}
+            </strong>
+          </div>
         </div>
       </header>
       <nav className="primary-nav" aria-label="Primary navigation">
@@ -131,7 +156,8 @@ function Shell() {
         </Routes>
       </main>
       <footer>
-        M1-01 validates NVS compilation plumbing. It does not validate NILES runtime behavior.
+        M1-02A proves deployability and actor authentication readiness only. It creates no NILES
+        Incident records.
       </footer>
     </div>
   );
@@ -311,6 +337,7 @@ function EnvironmentsPage() {
                     )}
                   </section>
                 )}
+                <ActorReadinessPanel environment={environment} />
               </article>
             );
           })}

@@ -54,6 +54,9 @@ describe('production and deployment assets', () => {
     const image = await source('Dockerfile');
     const environmentExample = await source('.env.example');
     const apiPackage = await source('apps/api/package.json');
+    const bootstrap = await source('ops/bootstrap-staging.md');
+    const containerProof = await source('ops/ci/proof-container-hardening.sh');
+    const rollbackProof = await source('ops/ci/proof-deploy-rollback.sh');
 
     expect(compose).toContain('image: ${NVS_IMAGE:');
     expect(compose).toContain('read_only: true');
@@ -68,5 +71,14 @@ describe('production and deployment assets', () => {
     expect(image).toContain('NVS_BUILD_SHA');
     expect(apiPackage).toContain('"@fastify/static": "10.1.0"');
     expect(environmentExample).not.toMatch(/^NVS_CREDENTIAL_[A-Z0-9_]+=(?!\s*$).+/m);
+    expect(bootstrap).toContain('nvsdeploy:10001');
+    expect(bootstrap).toContain('sudo tar --create --gzip');
+    expect(bootstrap).toContain('chmod 0600');
+    expect(containerProof).toContain('nvsdeploy:10001');
+    expect(containerProof).toContain('LOCAL_CONFIGURATION_UNAVAILABLE');
+    expect(containerProof).not.toContain('chmod -R a+rX');
+    expect(rollbackProof).toContain('Same-SHA collision requires distinct image IDs');
+    expect(rollbackProof).toContain('IMAGE_ID_A');
+    expect(rollbackProof).toContain('IMAGE_ID_B');
   });
 });

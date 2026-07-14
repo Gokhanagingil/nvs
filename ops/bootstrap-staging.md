@@ -20,26 +20,29 @@ docker compose version
 curl --version
 ```
 
-Create an unprivileged deployment account with Docker access according to the host's approved administration policy. As an administrator:
+Create an unprivileged deployment account with Docker access according to the host's approved administration policy. Ensure numeric group `10001` exists on the host so configuration can be group-readable by the container runtime GID (create `nvsruntime` or an equivalent group at GID `10001` if missing). As an administrator:
 
 ```bash
+sudo groupadd --gid 10001 nvsruntime 2>/dev/null || true
 sudo install -d -m 0750 -o nvsdeploy -g nvsdeploy /opt/nvs
 sudo install -d -m 0750 -o nvsdeploy -g nvsdeploy \
-  /opt/nvs/config \
   /opt/nvs/ops \
   /opt/nvs/releases
-sudo install -d -m 0750 -o 10001 -g 10001 /opt/nvs/data
-sudo install -d -m 0750 -o nvsdeploy -g nvsdeploy \
+sudo install -d -m 0750 -o nvsdeploy -g 10001 \
+  /opt/nvs/config \
   /opt/nvs/config/actors/mappings \
   /opt/nvs/config/actors/profiles \
   /opt/nvs/config/environments \
   /opt/nvs/config/scenarios
+sudo install -d -m 0750 -o 10001 -g 10001 /opt/nvs/data
 ```
 
 Ownership contract:
 
-- `/opt/nvs`, `/opt/nvs/ops`, `/opt/nvs/releases`, and `/opt/nvs/config` are owned by the deploy user for updates;
-- configuration files under `/opt/nvs/config` must be world-/group-readable by the runtime identity (`mode 0640` or `0644` for files, `0750`/`0755` for directories) and never writable by UID `10001`;
+- `/opt/nvs`, `/opt/nvs/ops`, and `/opt/nvs/releases` are owned by `nvsdeploy:nvsdeploy` for updates;
+- `/opt/nvs/config` owner is `nvsdeploy`, numeric group is `10001`, directories are mode `0750`, files are mode `0640`;
+- runtime UID/GID `10001:10001` must have read and traverse access to configuration only through GID `10001`, and must never have write permission on configuration;
+- do not use world-writable or world-readable configuration modes;
 - `/opt/nvs/data` must be owned by `10001:10001` with mode `0750` and is the only writable application path;
 - `/opt/nvs/.env` is mode `0600` and owned by the deploy user.
 
@@ -71,10 +74,10 @@ Required tenant assignment for staging actors:
 - separate cross-tenant validation tenant UUID: used only by the cross-tenant agent;
 - all five actors are dedicated synthetic non-production users in the approved staging NILES environment.
 
-After writing files, restore runtime-readable modes without handing write access to UID `10001`:
+After writing files, normalize ownership and modes so GID `10001` can read configuration while UID `10001` still cannot write it:
 
 ```bash
-sudo chown -R nvsdeploy:nvsdeploy /opt/nvs/config
+sudo chown -R nvsdeploy:10001 /opt/nvs/config
 sudo find /opt/nvs/config -type d -exec chmod 0750 {} +
 sudo find /opt/nvs/config -type f -exec chmod 0640 {} +
 sudo chown -R 10001:10001 /opt/nvs/data
@@ -166,18 +169,20 @@ Prefer the automatic immutable image-ID rollback created by `deploy-staging.sh`.
 
 ## 7. Evidence backup and credential updates
 
-Create an application-consistent evidence backup during an approved maintenance window:
+`/opt/nvs/data` is owned by `10001:10001` with mode `0750`, so an unprivileged deploy user cannot read it directly. Create an application-consistent evidence backup during an approved maintenance window with a narrowly privileged `sudo tar` flow:
 
 ```bash
+backup="/opt/nvs/releases/nvs-data-backup-$(date -u +%Y%m%dT%H%M%SZ).tar.gz"
 docker stop nvs
-tar --create --gzip --file "/opt/nvs-backup-$(date -u +%Y%m%dT%H:%M:%SZ).tar.gz" \
-  --directory /opt/nvs data
+sudo tar --create --gzip --file "$backup" --directory /opt/nvs data
+sudo chown nvsdeploy:nvsdeploy "$backup"
+sudo chmod 0600 "$backup"
 docker start nvs
 /opt/nvs/ops/verify-deployment.sh http://127.0.0.1:4100 \
   "$(docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' nvs)" \
   120
 ```
 
-Store and test backups according to the organization's retention policy. Backups may contain validation evidence and must be access-controlled.
+After creation the backup archive must remain deploy-user owned and mode `0600`. Store and test backups according to the organization's retention policy. Backups may contain validation evidence and must stay access-controlled.
 
 To add or rotate a synthetic actor later, update only the corresponding server-side `.env` JSON value, retain mode `0600`, and recreate the NVS service using the currently active exact image. Never commit the populated file or print it during troubleshooting. Authentication preflight is an explicit operator action and remains denied for production-classified environments.

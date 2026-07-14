@@ -24,7 +24,7 @@ The NILES reference repository was inspected read-only at commit `33af470e10fa75
 
 - Use manual `workflow_dispatch`; do not deploy automatically from `main`.
 - Resolve the requested Git ref to one full commit SHA, pass that SHA into image metadata, transfer that exact saved image archive with a SHA-256 digest, verify the digest before load, then load it on staging. Never rebuild source on the server.
-- Keep `/opt/nvs/.env`, `/opt/nvs/config`, and `/opt/nvs/data` server-owned and non-versioned with explicit numeric ownership for bind mounts. Deployment replaces only NVS image/Compose/operations resources and never touches NILES or GRC containers.
+- Keep `/opt/nvs/.env`, `/opt/nvs/config`, and `/opt/nvs/data` server-owned and non-versioned. Configuration is `nvsdeploy:10001` (`0750`/`0640`) so GID `10001` can read it without write access; data is `10001:10001` (`0750`). Deployment replaces only NVS image/Compose/operations resources and never touches NILES or GRC containers.
 - Before replacement, capture the running container's immutable image ID under a unique temporary rollback tag. Verify bounded liveness, readiness, and reported build SHA. If replacement fails, restore and verify that immutable image ID. Successful deploys retain a bounded set of rollback tags.
 
 ### Actors, secrets, and sessions
@@ -36,6 +36,7 @@ The NILES reference repository was inspected read-only at commit `33af470e10fa75
 - Return only configuration state, authenticated/blocking state, safe typed errors, and non-secret actor metadata to the API and browser.
 - Deny authentication preflight for every production-classified environment before secret resolution or network access.
 - Require NILES login `user.id` to be a UUID; missing or non-UUID identities are typed `LOGIN_RESPONSE_MALFORMED`.
+- Treat login `passwordChangeRequired === true` or user `mustChangePassword === true` as `BLOCKED` / `PASSWORD_CHANGE_REQUIRED` without creating a usable actor session.
 - Treat MFA, invalid credentials, malformed responses, timeouts, network failures, and tenant mismatch as `BLOCKED`, never as product `FAIL`.
 - Local readiness validates usable configuration: readable trees, at least one valid environment and scenario, required actor mappings/profiles for enabled non-production environments, contract parsing, and writable persistent storage.
 

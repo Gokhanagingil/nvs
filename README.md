@@ -16,7 +16,7 @@ versioned business blueprint YAML
   -> Zod runtime validation
   -> deterministic semantic compilation
   -> COMPILE_ONLY run orchestration
-  -> atomic filesystem run/evidence artifacts
+  -> atomic immutable filesystem run bundle
   -> Fastify control-plane API
   -> React operations console
 ```
@@ -26,8 +26,8 @@ It includes:
 - one approved payment/API service-degradation blueprint and eight risk variations;
 - versioned environment, blueprint, executable-plan, run, evidence, probe, error, and coverage contracts;
 - deterministic plan and step IDs with source links back to business steps;
-- filesystem repositories behind core ports;
-- a read-only NILES probe for confirmed liveness, readiness, build, and OpenAPI routes;
+- committed-only filesystem bundles behind a single core persistence port;
+- a bounded read-only NILES probe for confirmed liveness, readiness, build, and validated OpenAPI routes;
 - a CLI and machine-readable artifacts;
 - Environments, Scenario Library, Run Center, Evidence Explorer, and Coverage UI routes;
 - unit, integration, API, and Playwright smoke coverage;
@@ -42,7 +42,13 @@ A compile-only `PASS` means only that the reviewed blueprint compiled and its ar
   "runType": "COMPILE_ONLY",
   "verdict": "PASS",
   "assuranceScope": "COMPILATION_ONLY",
-  "gateEligible": false
+  "gateEligible": false,
+  "stepResults": [
+    {
+      "compilationStatus": "PASS",
+      "executionStatus": "NOT_EXECUTED"
+    }
+  ]
 }
 ```
 

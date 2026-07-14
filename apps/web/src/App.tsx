@@ -24,7 +24,7 @@ import type {
 type Loadable<T> =
   | { status: 'loading' }
   | { status: 'empty' }
-  | { status: 'error'; message: string }
+  | { status: 'error'; message: string; code?: string }
   | { status: 'ready'; data: T };
 
 const navItems = [
@@ -571,7 +571,11 @@ function RunCenterPage() {
       ]);
       setLaunch({ status: 'ready', data: { run, plan, scenario } });
     } catch (error) {
-      setLaunch({ status: 'error', message: errorMessage(error) });
+      setLaunch({
+        status: 'error',
+        message: errorMessage(error),
+        ...(error instanceof ApiError ? { code: error.code } : {}),
+      });
     }
   };
 
@@ -659,7 +663,10 @@ function RunCenterPage() {
             {launch?.status === 'loading' && <LoadingPanel label="Compiling deterministic plan…" />}
             {launch?.status === 'empty' && <EmptyPanel message="No run result was returned." />}
             {launch?.status === 'error' && (
-              <ErrorPanel title="Run BLOCKED or failed" message={launch.message} />
+              <ErrorPanel
+                title={`Run BLOCKED or failed${launch.code ? ` · ${launch.code}` : ''}`}
+                message={launch.message}
+              />
             )}
             {launch?.status === 'ready' && <CompileOnlyResult result={launch.data} />}
           </section>
@@ -701,15 +708,24 @@ function CompileOnlyResult({ result }: { result: LaunchResult }) {
             return (
               <li key={planStep.id}>
                 <span className="progress-dot" aria-hidden="true">
-                  ✓
+                  {resultStep?.compilationStatus === 'PASS' ? '✓' : '—'}
                 </span>
                 <div>
                   <h3>{businessStep?.title ?? planStep.source.blueprintStepId}</h3>
                   <p>{businessStep?.narrative}</p>
-                  <small>
-                    {resultStep?.status ?? 'PASS'} in compilation scope · source{' '}
-                    {planStep.source.blueprintStepId}
-                  </small>
+                  {resultStep ? (
+                    <div className="status-pair">
+                      <span>
+                        Compilation <StatusBadge value={resultStep.compilationStatus} />
+                      </span>
+                      <span>
+                        NILES execution <StatusBadge value={resultStep.executionStatus} />
+                      </span>
+                    </div>
+                  ) : (
+                    <small>Compilation result unavailable</small>
+                  )}
+                  <small>Source {planStep.source.blueprintStepId}</small>
                 </div>
               </li>
             );
@@ -870,6 +886,7 @@ function EvidenceDetailView({ detail }: { detail: EvidenceDetail }) {
         <ol className="plan-entry-list">
           {detail.plan.steps.map((step) => {
             const businessStep = businessSteps.get(step.source.blueprintStepId);
+            const resultStep = detail.run.stepResults.find((result) => result.stepId === step.id);
             return (
               <li key={step.id}>
                 <div>
@@ -889,6 +906,26 @@ function EvidenceDetailView({ detail }: { detail: EvidenceDetail }) {
                     <dt>Technical action</dt>
                     <dd>
                       <code>{step.action}</code>
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>Compilation</dt>
+                    <dd>
+                      {resultStep ? (
+                        <StatusBadge value={resultStep.compilationStatus} />
+                      ) : (
+                        'Unavailable'
+                      )}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>NILES execution</dt>
+                    <dd>
+                      {resultStep ? (
+                        <StatusBadge value={resultStep.executionStatus} />
+                      ) : (
+                        'Unavailable'
+                      )}
                     </dd>
                   </div>
                 </dl>
@@ -914,6 +951,11 @@ function EvidenceDetailView({ detail }: { detail: EvidenceDetail }) {
                 <strong>{entry.id}</strong>
                 <code>{entry.path}</code>
                 <small>{entry.mediaType}</small>
+                {entry.sha256 && (
+                  <small>
+                    SHA-256 <code>{entry.sha256}</code>
+                  </small>
+                )}
               </div>
             </li>
           ))}

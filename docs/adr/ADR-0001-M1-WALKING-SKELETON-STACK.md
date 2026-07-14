@@ -34,7 +34,7 @@ The binding project baseline requires strict TypeScript, a pinned Node LTS and p
 - `packages/domain` owns deterministic compilation, canonical serialization, verdict classification, and environment safety policy.
 - `packages/core` owns use cases and repository/adapter ports.
 - `packages/adapter-niles` owns confirmed NILES transport details and uses GET only.
-- `packages/storage-filesystem` owns YAML input loading and atomic JSON artifact persistence.
+- `packages/storage-filesystem` owns YAML input loading and immutable run-bundle persistence.
 - `apps/api` is the only Fastify-aware composition root.
 - `apps/web` consumes the control-plane API and does not import filesystem or domain implementations.
 
@@ -45,7 +45,9 @@ No separate HTTP-runner or Playwright-runner package is created because M1-01 ex
 - Reviewed environments and scenarios are versioned YAML.
 - Local run bundles are stable JSON under ignored `artifacts/runs/<run-id>/`.
 - Repository interfaces isolate filesystem mechanics from use cases.
-- Writes use temporary files and atomic rename where the host filesystem supports it.
+- A single bundle operation validates, sanitizes, and canonicalizes run, plan, and evidence documents before writing them to a hidden staging directory.
+- Exact persisted bytes are hashed before an atomic commit marker makes the complete bundle visible; readers ignore uncommitted or incomplete directories.
+- Run IDs are immutable. An existing directory is never overwritten and produces `RUN_ID_ALREADY_EXISTS`.
 - Persisted and client-visible paths are artifact-relative.
 
 ### Assurance semantics
@@ -53,6 +55,7 @@ No separate HTTP-runner or Playwright-runner package is created because M1-01 ex
 - M1-01 creates only `COMPILE_ONLY` runs.
 - A successful compile-only run may be `PASS` only for `COMPILATION_ONLY`.
 - Every compile-only run has `gateEligible: false`.
+- Step results report compilation independently from NILES execution; compile-only execution is always `NOT_EXECUTED`.
 - The console must state that compile-only PASS is not a NILES Incident, SLA, authorization, tenant-isolation, or release verdict.
 - Missing prerequisites or uncertain required evidence become `BLOCKED`.
 
@@ -61,6 +64,8 @@ No separate HTTP-runner or Playwright-runner package is created because M1-01 ex
 - Confirmed defaults are `GET /health/live`, `GET /health/ready`, `GET /health/version`, and optional `GET /api/docs-json`.
 - Paths remain configurable in versioned environment definitions.
 - The adapter accepts direct or globally wrapped readiness/version responses.
+- Every probe request has a bounded deterministic deadline.
+- OpenAPI is available only when a successful JSON response contains a top-level `openapi` or `swagger` field.
 - A degraded or unclassifiable readiness response blocks the probe.
 - Missing optional OpenAPI or build metadata remains an unavailable capability.
 - No authentication, Incident action, SLA mutation, fixture control, or test clock is part of M1-01.

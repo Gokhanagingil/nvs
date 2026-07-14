@@ -26,6 +26,7 @@ test('reviews the payment narrative and inspects compile-only evidence', async (
   await expect(
     page.getByRole('heading', { name: 'Business-step compilation progress' }),
   ).toBeVisible();
+  await expect(page.getByText('NOT_EXECUTED').first()).toBeVisible();
 
   await page.getByRole('link', { name: 'View evidence' }).click();
   await expect(page.getByRole('heading', { name: 'Evidence Explorer' })).toBeVisible();
@@ -35,4 +36,6 @@ test('reviews the payment narrative and inspects compile-only evidence', async (
   await expect(page.getByText('No (gateEligible: false)')).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Compiled plan entries' })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Evidence manifest' })).toBeVisible();
+  await expect(page.getByText(/runs\/.+\/run\.json/)).toBeVisible();
+  await expect(page.getByText(/runs\/.+\/plan\.json/)).toBeVisible();
 });

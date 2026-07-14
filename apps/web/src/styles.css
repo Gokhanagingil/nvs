@@ -309,6 +309,7 @@ footer {
 }
 
 .status-blocked,
+.status-fail,
 .status-disabled,
 .status-access-denied,
 .status-missing-evidence,

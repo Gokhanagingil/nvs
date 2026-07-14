@@ -119,7 +119,7 @@ export interface ExecutablePlan {
 
 export interface EvidenceEntry {
   id: string;
-  kind: string;
+  kind: 'RUN' | 'PLAN' | 'MANIFEST' | 'LOG' | 'REQUEST' | 'RESPONSE' | 'OBSERVATION';
   path: string;
   mediaType: string;
   sha256?: string;
@@ -155,7 +155,8 @@ export interface RunRecord {
   };
   stepResults: Array<{
     stepId: string;
-    status: 'PASS' | 'FAIL' | 'BLOCKED';
+    compilationStatus: 'PASS' | 'FAIL' | 'BLOCKED';
+    executionStatus: 'NOT_EXECUTED';
     error?: TypedError;
   }>;
   error?: TypedError;

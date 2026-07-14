@@ -1,10 +1,16 @@
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { buildApp } from '../apps/api/src/app.js';
-import { NilesReadOnlyAdapter, type FetchImplementation } from '@nvs/adapter-niles';
-import { NvsCore } from '@nvs/core';
 import {
+  NilesAuthenticationAdapter,
+  NilesReadOnlyAdapter,
+  type FetchImplementation,
+} from '@nvs/adapter-niles';
+import { NvsCore } from '@nvs/core';
+import { EnvironmentVariableSecretProvider } from '@nvs/secret-provider-environment';
+import {
+  FilesystemActorProfileRepository,
   FilesystemEnvironmentRepository,
   FilesystemRunBundleRepository,
   FilesystemScenarioRepository,
@@ -13,10 +19,17 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 let app: ReturnType<typeof buildApp>;
 let temporaryRoot: string;
+const repositoryRoot = process.cwd();
 
 beforeEach(async () => {
   temporaryRoot = await mkdtemp(path.join(tmpdir(), 'nvs-api-'));
-  const repositoryRoot = process.cwd();
+  const webRoot = path.join(temporaryRoot, 'web');
+  await mkdir(webRoot);
+  await writeFile(
+    path.join(webRoot, 'index.html'),
+    '<!doctype html><html><body>NVS production console</body></html>',
+    'utf8',
+  );
   const fetchMock = vi
     .fn<FetchImplementation>()
     .mockResolvedValueOnce(new Response(null, { status: 204 }))
@@ -28,9 +41,19 @@ beforeEach(async () => {
     new FilesystemScenarioRepository(path.join(repositoryRoot, 'scenarios')),
     new FilesystemRunBundleRepository(temporaryRoot),
     new NilesReadOnlyAdapter(fetchMock),
+    {
+      profiles: new FilesystemActorProfileRepository(path.join(repositoryRoot, 'actors')),
+      secrets: new EnvironmentVariableSecretProvider({}),
+      authenticator: new NilesAuthenticationAdapter(fetchMock),
+    },
   );
   app = buildApp({
     core,
+    runtimePaths: {
+      configDir: repositoryRoot,
+      dataDir: temporaryRoot,
+      webDir: webRoot,
+    },
     idFactory: () => 'api-test-run',
     clock: () => '2026-07-14T12:00:00.000Z',
   });
@@ -39,15 +62,25 @@ beforeEach(async () => {
 afterEach(async () => {
   await app.close();
   await rm(temporaryRoot, { recursive: true, force: true });
+  vi.unstubAllEnvs();
 });
 
 describe('versioned control-plane API', () => {
   it('serves the critical compile-only foundation endpoints', async () => {
     expect((await app.inject({ method: 'GET', url: '/api/health' })).statusCode).toBe(200);
+    expect((await app.inject({ method: 'GET', url: '/api/health/live' })).json()).toMatchObject({
+      schemaVersion: 'nvs.liveness/v1',
+      status: 'ok',
+    });
+    expect((await app.inject({ method: 'GET', url: '/api/health/ready' })).json()).toEqual({
+      schemaVersion: 'nvs.readiness/v1',
+      status: 'ready',
+      checks: { configuration: 'ok', storage: 'ok' },
+    });
 
     const environments = await app.inject({ method: 'GET', url: '/api/environments' });
     expect(environments.statusCode).toBe(200);
-    expect(environments.json().items).toHaveLength(2);
+    expect(environments.json().items).toHaveLength(3);
 
     const probe = await app.inject({
       method: 'POST',
@@ -56,6 +89,59 @@ describe('versioned control-plane API', () => {
     });
     expect(probe.statusCode).toBe(200);
     expect(probe.json()).toMatchObject({ verdict: 'PASS', health: { available: true } });
+
+    const actors = await app.inject({
+      method: 'GET',
+      url: '/api/environments/local-example/actors',
+    });
+    expect(actors.statusCode).toBe(200);
+    expect(actors.json().actors).toHaveLength(5);
+    expect(
+      actors
+        .json()
+        .actors.every(
+          (actor: { credentialConfiguration: string }) =>
+            actor.credentialConfiguration === 'NOT_CONFIGURED',
+        ),
+    ).toBe(true);
+    expect(JSON.stringify(actors.json())).not.toMatch(/credentialRef|password|token|@/i);
+
+    const authPreflight = await app.inject({
+      method: 'POST',
+      url: '/api/environments/local-example/auth-preflight',
+      payload: {},
+    });
+    expect(authPreflight.statusCode).toBe(200);
+    expect(authPreflight.json()).toMatchObject({
+      schemaVersion: 'nvs.auth-preflight/v1',
+      verdict: 'BLOCKED',
+      gateEligible: false,
+      assuranceScope: 'AUTHENTICATION_READINESS_ONLY',
+    });
+    expect(
+      authPreflight
+        .json()
+        .actors.every(
+          (actor: { error?: { code?: string } }) => actor.error?.code === 'CREDENTIAL_MISSING',
+        ),
+    ).toBe(true);
+    expect(JSON.stringify(authPreflight.json())).not.toMatch(
+      /password|accessToken|authorization|@/i,
+    );
+
+    const productionPreflight = await app.inject({
+      method: 'POST',
+      url: '/api/environments/production-example/auth-preflight',
+      payload: {},
+    });
+    expect(productionPreflight.statusCode).toBe(403);
+    expect(productionPreflight.json()).toEqual({
+      error: {
+        code: 'PRODUCTION_AUTH_PREFLIGHT_FORBIDDEN',
+        category: 'ENVIRONMENT',
+        message: 'Authentication preflight is forbidden for production environments.',
+      },
+    });
 
     const scenarios = await app.inject({ method: 'GET', url: '/api/scenarios' });
     expect(scenarios.statusCode).toBe(200);
@@ -137,6 +223,35 @@ describe('versioned control-plane API', () => {
     const coverage = await app.inject({ method: 'GET', url: '/api/coverage' });
     expect(coverage.statusCode).toBe(200);
     expect(coverage.json().summary).toEqual({ cells: 8, executed: 0 });
+  });
+
+  it('serves build information and the SPA from the API port without masking API misses', async () => {
+    vi.stubEnv('NVS_BUILD_SHA', '0123456789abcdef0123456789abcdef01234567');
+    vi.stubEnv('NVS_BUILD_TIMESTAMP', '2026-07-14T17:00:00Z');
+    vi.stubEnv('NVS_RELEASE_VERSION', '0.2.0-test');
+
+    const version = await app.inject({ method: 'GET', url: '/api/version' });
+    expect(version.statusCode).toBe(200);
+    expect(version.json()).toEqual({
+      schemaVersion: 'nvs.version/v1',
+      buildSha: '0123456789abcdef0123456789abcdef01234567',
+      buildTimestamp: '2026-07-14T17:00:00Z',
+      releaseVersion: '0.2.0-test',
+      nodeVersion: process.version,
+      contractVersion: 'nvs.operational/v1',
+    });
+
+    const root = await app.inject({ method: 'GET', url: '/' });
+    expect(root.statusCode).toBe(200);
+    expect(root.body).toContain('NVS production console');
+
+    const spaRoute = await app.inject({ method: 'GET', url: '/environments' });
+    expect(spaRoute.statusCode).toBe(200);
+    expect(spaRoute.body).toContain('NVS production console');
+
+    const missingApi = await app.inject({ method: 'GET', url: '/api/not-real' });
+    expect(missingApi.statusCode).toBe(404);
+    expect(missingApi.json().error.code).toBe('NOT_FOUND');
   });
 
   it('rejects unknown fields with a safe consistent error envelope', async () => {

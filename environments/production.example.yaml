@@ -1,0 +1,15 @@
+schemaVersion: nvs.environment/v1
+id: production-example
+displayName: Sanitized production NILES example
+baseUrl: https://niles-production.invalid
+kind: production
+healthPath: /health/live
+readinessPath: /health/ready
+versionPath: /health/version
+capabilities:
+  health: true
+  readiness: true
+  openApi: false
+  version: true
+authProfileRef: niles.production-readonly
+enabled: true

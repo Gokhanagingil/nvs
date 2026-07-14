@@ -1,0 +1,10 @@
+schemaVersion: nvs.environment-actor-map/v1
+environmentId: local-example
+actors:
+  requester: local-requester
+  service-desk-agent: local-service-desk-agent
+  incident-manager: local-incident-manager
+  tenant-admin: local-tenant-admin
+  cross-tenant-agent: local-cross-tenant-agent
+provenance:
+  source: Sanitized M1-02A example mapping; replace through an ignored local override.

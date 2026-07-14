@@ -7,6 +7,9 @@ test-results/
 *.local.yaml
 environments/local.yaml
 environments/*.override.yaml
+actors/local/
+actors/**/*.local.yaml
+actors/**/*.override.yaml
 .env
 .env.*
 !.env.example

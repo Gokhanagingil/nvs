@@ -1,9 +1,16 @@
 import {
   probeResultV1Schema,
+  type ActorProfileV1,
   type EnvironmentDefinitionV1,
   type ProbeResultV1,
 } from '@nvs/contracts';
-import type { EnvironmentProbe } from '@nvs/core';
+import {
+  AuthenticationBlockedError,
+  type ActorAuthenticator,
+  type ActorSession,
+  type AuthenticationCredential,
+  type EnvironmentProbe,
+} from '@nvs/core';
 
 export type FetchImplementation = (
   input: string | URL | Request,
@@ -11,6 +18,7 @@ export type FetchImplementation = (
 ) => Promise<Response>;
 
 export const DEFAULT_PROBE_TIMEOUT_MS = 5_000;
+export const DEFAULT_AUTHENTICATION_TIMEOUT_MS = 5_000;
 
 class ProbeRequestTimeoutError extends Error {
   constructor() {
@@ -342,5 +350,221 @@ export class NilesReadOnlyAdapter implements EnvironmentProbe {
       openApi,
       version,
     });
+  }
+}
+
+class AuthenticationRequestTimeoutError extends Error {
+  constructor() {
+    super('The authentication request exceeded its deadline.');
+    this.name = 'AuthenticationRequestTimeoutError';
+  }
+}
+
+async function withAuthenticationTimeout<T>(
+  timeoutMs: number,
+  operation: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  const controller = new AbortController();
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timeout = setTimeout(() => {
+      reject(new AuthenticationRequestTimeoutError());
+      controller.abort();
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([operation(controller.signal), deadline]);
+  } finally {
+    if (timeout) {
+      clearTimeout(timeout);
+    }
+  }
+}
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function unwrapLoginPayload(value: unknown): Record<string, unknown> | undefined {
+  const root = asRecord(value);
+  if (!root) {
+    return undefined;
+  }
+  if ('data' in root) {
+    return root['success'] === true ? asRecord(root['data']) : undefined;
+  }
+  return root;
+}
+
+export class NilesActorSession implements ActorSession {
+  #accessToken: string;
+  #destroyed = false;
+
+  constructor(
+    readonly actorProfileId: string,
+    readonly userId: string,
+    readonly tenantId: string | undefined,
+    readonly correlationId: string,
+    accessToken: string,
+  ) {
+    this.#accessToken = accessToken;
+  }
+
+  get destroyed(): boolean {
+    return this.#destroyed;
+  }
+
+  async withAuthorization<T>(operation: (authorization: string) => Promise<T>): Promise<T> {
+    if (this.#destroyed) {
+      throw new AuthenticationBlockedError(
+        'ACTOR_SESSION_DESTROYED',
+        'The actor session is no longer available.',
+        false,
+      );
+    }
+    return operation(`Bearer ${this.#accessToken}`);
+  }
+
+  destroy(): void {
+    this.#accessToken = '';
+    this.#destroyed = true;
+  }
+
+  toJSON(): unknown {
+    return {
+      actorProfileId: this.actorProfileId,
+      userId: this.userId,
+      ...(this.tenantId ? { tenantId: this.tenantId } : {}),
+      correlationId: this.correlationId,
+      destroyed: this.destroyed,
+    };
+  }
+}
+
+export class NilesAuthenticationAdapter implements ActorAuthenticator {
+  constructor(
+    private readonly fetchImplementation: FetchImplementation = fetch,
+    private readonly timeoutMs = DEFAULT_AUTHENTICATION_TIMEOUT_MS,
+  ) {
+    if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 30_000) {
+      throw new RangeError(
+        'Authentication timeout must be an integer between 1 and 30000 milliseconds.',
+      );
+    }
+  }
+
+  async authenticate(input: {
+    environment: EnvironmentDefinitionV1;
+    profile: ActorProfileV1;
+    credential: AuthenticationCredential;
+    correlationId: string;
+  }): Promise<ActorSession> {
+    if (input.environment.kind === 'production') {
+      throw new AuthenticationBlockedError(
+        'PRODUCTION_AUTH_PREFLIGHT_FORBIDDEN',
+        'Authentication preflight is forbidden for production environments.',
+        false,
+        'ENVIRONMENT',
+      );
+    }
+
+    let response: Response;
+    try {
+      response = await withAuthenticationTimeout(this.timeoutMs, (signal) =>
+        input.credential.use((email, password) =>
+          this.fetchImplementation(new URL('/auth/login', input.environment.baseUrl), {
+            method: 'POST',
+            headers: {
+              accept: 'application/json',
+              'content-type': 'application/json',
+              'x-correlation-id': input.correlationId,
+            },
+            body: JSON.stringify({ email, password }),
+            signal,
+          }),
+        ),
+      );
+    } catch (error) {
+      const timedOut =
+        error instanceof AuthenticationRequestTimeoutError ||
+        (error instanceof Error && error.name === 'AbortError');
+      throw new AuthenticationBlockedError(
+        timedOut ? 'LOGIN_TIMEOUT' : 'LOGIN_NETWORK_FAILURE',
+        timedOut
+          ? 'NILES login did not respond within the authentication deadline.'
+          : 'NILES login could not be reached.',
+        true,
+      );
+    }
+
+    if (!response.ok) {
+      throw new AuthenticationBlockedError(
+        response.status === 429 ? 'LOGIN_RATE_LIMITED' : 'LOGIN_DENIED',
+        response.status === 429 ? 'NILES login was rate limited.' : 'NILES denied the actor login.',
+        response.status === 429 || response.status >= 500,
+      );
+    }
+
+    const payload = unwrapLoginPayload(await readJson(response));
+    if (!payload) {
+      throw new AuthenticationBlockedError(
+        'LOGIN_RESPONSE_MALFORMED',
+        'NILES returned an invalid login response.',
+        false,
+      );
+    }
+    if (payload['mfaRequired'] === true) {
+      throw new AuthenticationBlockedError(
+        'MFA_REQUIRED',
+        'NILES requires an MFA challenge that M1-02A does not automate.',
+        false,
+      );
+    }
+
+    const accessToken =
+      typeof payload['accessToken'] === 'string' ? payload['accessToken'].trim() : '';
+    if (!accessToken) {
+      throw new AuthenticationBlockedError(
+        'ACCESS_TOKEN_MISSING',
+        'NILES login succeeded without a usable access token.',
+        false,
+      );
+    }
+    if (accessToken.length > 16_384) {
+      throw new AuthenticationBlockedError(
+        'LOGIN_RESPONSE_MALFORMED',
+        'NILES returned an invalid login response.',
+        false,
+      );
+    }
+
+    const user = asRecord(payload['user']);
+    const userId =
+      typeof user?.['id'] === 'string' && user['id'].trim() ? user['id'].trim() : undefined;
+    if (!userId || userId.length > 160) {
+      throw new AuthenticationBlockedError(
+        'USER_IDENTITY_MISSING',
+        'NILES login succeeded without a usable user identity.',
+        false,
+      );
+    }
+
+    const rawTenantId =
+      typeof user?.['tenantId'] === 'string' && user['tenantId'].trim()
+        ? user['tenantId'].trim()
+        : undefined;
+    if (rawTenantId && !UUID_PATTERN.test(rawTenantId)) {
+      throw new AuthenticationBlockedError(
+        'LOGIN_RESPONSE_MALFORMED',
+        'NILES returned an invalid login response.',
+        false,
+      );
+    }
+
+    return new NilesActorSession(
+      input.profile.id,
+      userId,
+      rawTenantId,
+      input.correlationId,
+      accessToken,
+    );
   }
 }

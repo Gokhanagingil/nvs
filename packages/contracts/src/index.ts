@@ -7,7 +7,7 @@ export const safeIdSchema = z
   .max(96)
   .regex(SAFE_ID_PATTERN, 'must be a lowercase safe identifier');
 
-const symbolicRefSchema = z
+export const symbolicRefSchema = z
   .string()
   .min(3)
   .max(128)
@@ -98,6 +98,62 @@ export const environmentDefinitionV1Schema = z
   });
 
 export type EnvironmentDefinitionV1 = z.infer<typeof environmentDefinitionV1Schema>;
+
+export const actorPersonaSchema = z.enum([
+  'requester',
+  'service-desk-agent',
+  'incident-manager',
+  'tenant-admin',
+  'cross-tenant-agent',
+]);
+export type ActorPersona = z.infer<typeof actorPersonaSchema>;
+
+export const actorProfileV1Schema = z
+  .object({
+    schemaVersion: z.literal('nvs.actor-profile/v1'),
+    id: safeIdSchema,
+    displayName: z.string().min(1).max(120),
+    persona: actorPersonaSchema,
+    environmentId: safeIdSchema,
+    tenantId: z.uuid().optional(),
+    credentialRef: symbolicRefSchema,
+    expectedDomains: z.array(safeIdSchema).max(20),
+    expectedRoles: z.array(safeIdSchema).max(20),
+    capabilityNotes: z.array(z.string().min(1).max(240)).max(30),
+    enabled: z.boolean(),
+    mfa: z.enum(['NOT_EXPECTED', 'EXPECTED', 'UNSUPPORTED']),
+    provenance: z
+      .object({
+        source: z.string().min(1).max(200),
+        reviewedAt: z.iso.datetime({ offset: true }).optional(),
+      })
+      .strict(),
+  })
+  .strict();
+export type ActorProfileV1 = z.infer<typeof actorProfileV1Schema>;
+
+export const environmentActorMapV1Schema = z
+  .object({
+    schemaVersion: z.literal('nvs.environment-actor-map/v1'),
+    environmentId: safeIdSchema,
+    actors: z
+      .object({
+        requester: safeIdSchema,
+        'service-desk-agent': safeIdSchema,
+        'incident-manager': safeIdSchema,
+        'tenant-admin': safeIdSchema,
+        'cross-tenant-agent': safeIdSchema,
+      })
+      .strict(),
+    provenance: z
+      .object({
+        source: z.string().min(1).max(200),
+        reviewedAt: z.iso.datetime({ offset: true }).optional(),
+      })
+      .strict(),
+  })
+  .strict();
+export type EnvironmentActorMapV1 = z.infer<typeof environmentActorMapV1Schema>;
 
 export const semanticActionSchema = z.enum([
   'incident.report',
@@ -467,6 +523,92 @@ export const typedErrorSchema = z
   .strict();
 export type TypedError = z.infer<typeof typedErrorSchema>;
 
+export const actorCredentialConfigurationSchema = z.enum([
+  'NOT_CONFIGURED',
+  'CONFIGURED',
+  'INVALID',
+  'DISABLED',
+]);
+export type ActorCredentialConfiguration = z.infer<typeof actorCredentialConfigurationSchema>;
+
+export const actorAuthenticationStateSchema = z.enum([
+  'NOT_ATTEMPTED',
+  'AUTHENTICATED',
+  'BLOCKED',
+  'DISABLED',
+]);
+export type ActorAuthenticationState = z.infer<typeof actorAuthenticationStateSchema>;
+
+export const actorReadinessV1Schema = z
+  .object({
+    actorProfileId: safeIdSchema,
+    displayName: z.string().min(1).max(120),
+    persona: actorPersonaSchema,
+    credentialConfiguration: actorCredentialConfigurationSchema,
+    authenticationState: actorAuthenticationStateSchema,
+    expectedTenantId: z.uuid().optional(),
+    observedTenantId: z.uuid().optional(),
+    userId: z.string().min(1).max(160).optional(),
+    durationMs: z.number().int().nonnegative().optional(),
+    correlationId: safeIdSchema.optional(),
+    timestamp: z.iso.datetime({ offset: true }).optional(),
+    error: typedErrorSchema.optional(),
+  })
+  .strict()
+  .superRefine((actor, context) => {
+    if (actor.authenticationState === 'AUTHENTICATED' && actor.error) {
+      context.addIssue({
+        code: 'custom',
+        path: ['error'],
+        message: 'an authenticated actor cannot include an error',
+      });
+    }
+    if (actor.authenticationState === 'BLOCKED' && !actor.error) {
+      context.addIssue({
+        code: 'custom',
+        path: ['error'],
+        message: 'a blocked actor requires a typed error',
+      });
+    }
+  });
+export type ActorReadinessV1 = z.infer<typeof actorReadinessV1Schema>;
+
+export const actorListV1Schema = z
+  .object({
+    schemaVersion: z.literal('nvs.actor-list/v1'),
+    environmentId: safeIdSchema,
+    gateEligible: z.literal(false),
+    actors: z.array(actorReadinessV1Schema).min(1),
+  })
+  .strict();
+export type ActorListV1 = z.infer<typeof actorListV1Schema>;
+
+export const authPreflightV1Schema = z
+  .object({
+    schemaVersion: z.literal('nvs.auth-preflight/v1'),
+    environmentId: safeIdSchema,
+    verdict: z.enum(['PASS', 'BLOCKED']),
+    gateEligible: z.literal(false),
+    assuranceScope: z.literal('AUTHENTICATION_READINESS_ONLY'),
+    startedAt: z.iso.datetime({ offset: true }),
+    completedAt: z.iso.datetime({ offset: true }),
+    actors: z.array(actorReadinessV1Schema).min(1),
+  })
+  .strict()
+  .superRefine((preflight, context) => {
+    if (
+      preflight.verdict === 'PASS' &&
+      preflight.actors.some((actor) => actor.authenticationState !== 'AUTHENTICATED')
+    ) {
+      context.addIssue({
+        code: 'custom',
+        path: ['actors'],
+        message: 'a PASS preflight requires every mapped actor to authenticate',
+      });
+    }
+  });
+export type AuthPreflightV1 = z.infer<typeof authPreflightV1Schema>;
+
 const sanitizationSchema = z
   .object({
     applied: z.boolean(),
@@ -675,6 +817,9 @@ export interface CoverageCell {
 }
 
 export function isSecretBearingFieldName(key: string): boolean {
+  if (key === 'credentialRef' || key === 'authProfileRef') {
+    return false;
+  }
   const tokens = key
     .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
     .replace(/([A-Z])([A-Z][a-z])/g, '$1_$2')
@@ -723,4 +868,14 @@ export function parseEnvironmentDefinition(value: unknown): EnvironmentDefinitio
 export function parseBusinessBlueprint(value: unknown): BusinessBlueprintV1 {
   assertNoObviousSecretFields(value);
   return businessBlueprintV1Schema.parse(value);
+}
+
+export function parseActorProfile(value: unknown): ActorProfileV1 {
+  assertNoObviousSecretFields(value);
+  return actorProfileV1Schema.parse(value);
+}
+
+export function parseEnvironmentActorMap(value: unknown): EnvironmentActorMapV1 {
+  assertNoObviousSecretFields(value);
+  return environmentActorMapV1Schema.parse(value);
 }

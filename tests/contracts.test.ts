@@ -1,12 +1,16 @@
 import {
+  actorProfileV1Schema,
   businessBlueprintV1Schema,
   environmentDefinitionV1Schema,
+  environmentActorMapV1Schema,
+  parseActorProfile,
   parseBusinessBlueprint,
   parseEnvironmentDefinition,
   runRecordV1Schema,
   type BusinessBlueprintV1,
 } from '@nvs/contracts';
 import {
+  FilesystemActorProfileRepository,
   FilesystemEnvironmentRepository,
   FilesystemScenarioRepository,
 } from '@nvs/storage-filesystem';
@@ -72,10 +76,56 @@ describe('versioned contracts', () => {
 
     expect(environments.map((environment) => environment.id)).toEqual([
       'local-example',
+      'production-example',
       'staging-example',
     ]);
     expect(scenarios).toHaveLength(1);
     expect(scenarios[0]?.reviewState).toBe('approved');
+  });
+
+  it('loads sanitized actor profiles through a versioned environment mapping', async () => {
+    const actorSet = await new FilesystemActorProfileRepository(`${root}/actors`).getForEnvironment(
+      'local-example',
+    );
+
+    expect(actorSet.mapping.schemaVersion).toBe('nvs.environment-actor-map/v1');
+    expect(actorSet.profiles.map((profile) => profile.persona)).toEqual([
+      'requester',
+      'service-desk-agent',
+      'incident-manager',
+      'tenant-admin',
+      'cross-tenant-agent',
+    ]);
+    expect(
+      actorSet.profiles.every((profile) => profile.schemaVersion === 'nvs.actor-profile/v1'),
+    ).toBe(true);
+    expect(JSON.stringify(actorSet)).not.toMatch(/@|password|accessToken|authorization/i);
+  });
+
+  it('rejects unknown actor contract versions and recursive secret-bearing fields', async () => {
+    const actorSet = await new FilesystemActorProfileRepository(`${root}/actors`).getForEnvironment(
+      'local-example',
+    );
+    const validProfile = actorSet.profiles[0]!;
+
+    expect(
+      actorProfileV1Schema.safeParse({
+        ...validProfile,
+        schemaVersion: 'nvs.actor-profile/v2',
+      }).success,
+    ).toBe(false);
+    expect(
+      environmentActorMapV1Schema.safeParse({
+        ...actorSet.mapping,
+        schemaVersion: 'nvs.environment-actor-map/v2',
+      }).success,
+    ).toBe(false);
+    expect(() =>
+      parseActorProfile({
+        ...validProfile,
+        capabilityNotes: [{ nested: { refreshToken: 'forbidden' } }],
+      }),
+    ).toThrow(/secret-bearing field/i);
   });
 
   it.each([

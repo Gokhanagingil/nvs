@@ -29,6 +29,7 @@
     "@nvs/contracts": "workspace:*",
     "@nvs/core": "workspace:*",
     "@nvs/domain": "workspace:*",
+    "@nvs/secret-provider-environment": "workspace:*",
     "@nvs/storage-filesystem": "workspace:*",
     "@playwright/test": "1.61.1",
     "@types/node": "24.13.3",

@@ -1,9 +1,16 @@
+import { existsSync } from 'node:fs';
 import path from 'node:path';
-import { NilesReadOnlyAdapter, type FetchImplementation } from '@nvs/adapter-niles';
-import { safeIdSchema } from '@nvs/contracts';
-import { NvsCore } from '@nvs/core';
-import { DomainPolicyError } from '@nvs/domain';
 import {
+  NilesAuthenticationAdapter,
+  NilesReadOnlyAdapter,
+  type FetchImplementation,
+} from '@nvs/adapter-niles';
+import { safeIdSchema } from '@nvs/contracts';
+import { AuthenticationBlockedError, NvsCore } from '@nvs/core';
+import { DomainPolicyError } from '@nvs/domain';
+import { EnvironmentVariableSecretProvider } from '@nvs/secret-provider-environment';
+import {
+  FilesystemActorProfileRepository,
   FilesystemEnvironmentRepository,
   FilesystemRunBundleRepository,
   FilesystemScenarioRepository,
@@ -11,8 +18,15 @@ import {
   StorageCorruptionError,
   UnsafeIdentifierError,
 } from '@nvs/storage-filesystem';
+import fastifyStatic from '@fastify/static';
 import Fastify, { type FastifyInstance } from 'fastify';
 import { z, ZodError } from 'zod';
+import {
+  buildInformation,
+  checkLocalReadiness,
+  resolveRuntimePaths,
+  type RuntimePaths,
+} from './operations.js';
 
 const idParamsSchema = z.object({ id: safeIdSchema }).strict();
 const compileBodySchema = z
@@ -33,10 +47,12 @@ const emptyBodySchema = z.object({}).strict();
 
 export interface BuildAppOptions {
   rootDir?: string;
+  runtimePaths?: RuntimePaths;
   core?: NvsCore;
   fetchImplementation?: FetchImplementation;
   idFactory?: () => string;
   clock?: () => string;
+  logger?: boolean;
 }
 
 let runSequence = 0;
@@ -46,12 +62,26 @@ function defaultRunId(): string {
 }
 
 export function createCore(rootDir: string, fetchImplementation?: FetchImplementation): NvsCore {
-  const artifactRoot = path.join(rootDir, 'artifacts');
+  const runtimePaths = resolveRuntimePaths(rootDir);
+  const configuredAuthenticationTimeout = Number(
+    process.env['NVS_AUTHENTICATION_TIMEOUT_MS'] ?? '5000',
+  );
+  const authenticationTimeout =
+    Number.isInteger(configuredAuthenticationTimeout) &&
+    configuredAuthenticationTimeout >= 1 &&
+    configuredAuthenticationTimeout <= 30_000
+      ? configuredAuthenticationTimeout
+      : 5_000;
   return new NvsCore(
-    new FilesystemEnvironmentRepository(path.join(rootDir, 'environments')),
-    new FilesystemScenarioRepository(path.join(rootDir, 'scenarios')),
-    new FilesystemRunBundleRepository(artifactRoot),
+    new FilesystemEnvironmentRepository(path.join(runtimePaths.configDir, 'environments')),
+    new FilesystemScenarioRepository(path.join(runtimePaths.configDir, 'scenarios')),
+    new FilesystemRunBundleRepository(runtimePaths.dataDir),
     new NilesReadOnlyAdapter(fetchImplementation),
+    {
+      profiles: new FilesystemActorProfileRepository(path.join(runtimePaths.configDir, 'actors')),
+      secrets: new EnvironmentVariableSecretProvider(),
+      authenticator: new NilesAuthenticationAdapter(fetchImplementation, authenticationTimeout),
+    },
   );
 }
 
@@ -78,6 +108,18 @@ function safeError(error: unknown): {
         error: {
           code: error.code,
           category: 'ENVIRONMENT',
+          message: error.message,
+        },
+      },
+    };
+  }
+  if (error instanceof AuthenticationBlockedError) {
+    return {
+      statusCode: error.category === 'ENVIRONMENT' ? 403 : 502,
+      body: {
+        error: {
+          code: error.code,
+          category: error.category,
           message: error.message,
         },
       },
@@ -147,13 +189,27 @@ function safeError(error: unknown): {
 }
 
 export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
-  const app = Fastify({ logger: false });
+  const app = Fastify({ logger: options.logger ?? false });
   const rootDir = options.rootDir ?? process.cwd();
+  const runtimePaths = options.runtimePaths ?? resolveRuntimePaths(rootDir);
   const core = options.core ?? createCore(rootDir, options.fetchImplementation);
   const idFactory = options.idFactory ?? defaultRunId;
   const clock = options.clock ?? (() => new Date().toISOString());
+  const servesWeb = existsSync(path.join(runtimePaths.webDir, 'index.html'));
 
-  app.setNotFoundHandler((_request, reply) => {
+  if (servesWeb) {
+    void app.register(fastifyStatic, {
+      root: runtimePaths.webDir,
+      prefix: '/',
+      wildcard: false,
+    });
+  }
+
+  app.setNotFoundHandler((request, reply) => {
+    const pathname = request.url.split('?', 1)[0] ?? request.url;
+    if (servesWeb && request.method === 'GET' && !pathname.startsWith('/api')) {
+      return reply.type('text/html; charset=utf-8').sendFile('index.html');
+    }
     void reply.status(404).send({
       error: {
         code: 'NOT_FOUND',
@@ -168,11 +224,24 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     void reply.status(response.statusCode).send(response.body);
   });
 
-  app.get('/api/health', async () => ({
-    schemaVersion: 'nvs.api-health/v1',
+  const liveness = {
+    schemaVersion: 'nvs.liveness/v1' as const,
     status: 'ok',
     scope: 'LOCAL_CONTROL_PLANE',
-  }));
+  };
+
+  app.get('/api/health/live', async () => liveness);
+  app.get('/api/health', async () => liveness);
+
+  app.get('/api/health/ready', async (_request, reply) => {
+    const readiness = await checkLocalReadiness(runtimePaths);
+    if (readiness.status !== 'ready') {
+      void reply.status(503);
+    }
+    return readiness;
+  });
+
+  app.get('/api/version', async () => buildInformation());
 
   app.get('/api/environments', async () => ({ items: await core.listEnvironments() }));
 
@@ -180,6 +249,17 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     const { id } = idParamsSchema.parse(request.params);
     emptyBodySchema.parse(request.body ?? {});
     return core.probeEnvironment(id);
+  });
+
+  app.get('/api/environments/:id/actors', async (request) => {
+    const { id } = idParamsSchema.parse(request.params);
+    return core.listActorReadiness(id);
+  });
+
+  app.post('/api/environments/:id/auth-preflight', async (request) => {
+    const { id } = idParamsSchema.parse(request.params);
+    emptyBodySchema.parse(request.body ?? {});
+    return core.runAuthenticationPreflight(id);
   });
 
   app.get('/api/scenarios', async () => ({ items: await core.listScenarios() }));

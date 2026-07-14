@@ -2,20 +2,29 @@ import { mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promise
 import path from 'node:path';
 import {
   SAFE_ID_PATTERN,
+  actorProfileV1Schema,
   businessBlueprintV1Schema,
   environmentDefinitionV1Schema,
+  environmentActorMapV1Schema,
   evidenceManifestV1Schema,
   executablePlanV1Schema,
+  parseActorProfile,
   parseBusinessBlueprint,
   parseEnvironmentDefinition,
+  parseEnvironmentActorMap,
   runRecordV1Schema,
+  type ActorPersona,
+  type ActorProfileV1,
   type BusinessBlueprintV1,
   type EnvironmentDefinitionV1,
+  type EnvironmentActorMapV1,
   type EvidenceManifestV1,
   type ExecutablePlanV1,
   type RunRecordV1,
 } from '@nvs/contracts';
 import type {
+  ActorProfileRepository,
+  ActorProfileSet,
   EnvironmentRepository,
   RunBundle,
   RunBundleRepository,
@@ -136,6 +145,66 @@ export class FilesystemScenarioRepository implements ScenarioRepository {
   async get(id: string): Promise<BusinessBlueprintV1 | undefined> {
     assertSafeId(id);
     return (await this.list()).find((scenario) => scenario.id === id);
+  }
+}
+
+const ACTOR_PERSONA_ORDER: ActorPersona[] = [
+  'requester',
+  'service-desk-agent',
+  'incident-manager',
+  'tenant-admin',
+  'cross-tenant-agent',
+];
+
+export class FilesystemActorProfileRepository implements ActorProfileRepository {
+  constructor(private readonly root: string) {}
+
+  async getForEnvironment(environmentId: string): Promise<ActorProfileSet> {
+    assertSafeId(environmentId);
+    const mappingRoot = safeChild(this.root, 'mappings');
+    const profileRoot = safeChild(this.root, 'profiles');
+    const mappings: Array<{ file: string; value: EnvironmentActorMapV1 }> = [];
+    for (const file of await yamlFiles(mappingRoot, false)) {
+      try {
+        mappings.push({ file, value: parseEnvironmentActorMap(await readYaml(file)) });
+      } catch {
+        throw new StorageCorruptionError('Actor mapping', file);
+      }
+    }
+    const mappingEntry = mappings.find(({ value }) => value.environmentId === environmentId);
+    if (!mappingEntry) {
+      throw new Error(`Actor mapping for environment "${environmentId}" was not found.`);
+    }
+
+    const profiles: ActorProfileV1[] = [];
+    for (const file of await yamlFiles(profileRoot, false)) {
+      try {
+        profiles.push(parseActorProfile(await readYaml(file)));
+      } catch {
+        throw new StorageCorruptionError('Actor profile', file);
+      }
+    }
+    const profilesById = new Map(profiles.map((profile) => [profile.id, profile]));
+    const orderedProfiles = ACTOR_PERSONA_ORDER.map((persona) => {
+      const profileId = mappingEntry.value.actors[persona];
+      const profile = profilesById.get(profileId);
+      if (
+        !profile ||
+        profile.persona !== persona ||
+        profile.environmentId !== mappingEntry.value.environmentId
+      ) {
+        throw new StorageCorruptionError('Actor mapping', mappingEntry.file);
+      }
+      return profile;
+    });
+    if (new Set(orderedProfiles.map((profile) => profile.id)).size !== orderedProfiles.length) {
+      throw new StorageCorruptionError('Actor mapping', mappingEntry.file);
+    }
+
+    return {
+      mapping: mappingEntry.value,
+      profiles: orderedProfiles,
+    };
   }
 }
 
@@ -420,6 +489,8 @@ export class FilesystemRunBundleRepository implements RunBundleRepository {
 }
 
 export const storageSchemas = {
+  actorProfile: actorProfileV1Schema,
+  environmentActorMap: environmentActorMapV1Schema,
   environment: environmentDefinitionV1Schema,
   scenario: businessBlueprintV1Schema,
 };

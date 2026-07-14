@@ -1,0 +1,15 @@
+schemaVersion: nvs.actor-profile/v1
+id: local-cross-tenant-agent
+displayName: Local synthetic cross-tenant agent
+persona: cross-tenant-agent
+environmentId: local-example
+tenantId: 22222222-2222-4222-8222-222222222222
+credentialRef: niles.local.cross-tenant-agent
+expectedDomains: [itsm]
+expectedRoles: [service-desk-agent]
+capabilityNotes:
+  - Dedicated synthetic identity bound to a different approved test tenant.
+enabled: true
+mfa: NOT_EXPECTED
+provenance:
+  source: Sanitized M1-02A example profile.

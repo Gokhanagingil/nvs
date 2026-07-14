@@ -1,13 +1,24 @@
+import { randomUUID } from 'node:crypto';
 import {
+  actorListV1Schema,
+  actorReadinessV1Schema,
+  authPreflightV1Schema,
   evidenceManifestV1Schema,
   runRecordV1Schema,
+  type ActorCredentialConfiguration,
+  type ActorListV1,
+  type ActorProfileV1,
+  type ActorReadinessV1,
+  type AuthPreflightV1,
   type BusinessBlueprintV1,
   type CoverageCell,
   type EnvironmentDefinitionV1,
+  type EnvironmentActorMapV1,
   type EvidenceManifestV1,
   type ExecutablePlanV1,
   type ProbeResultV1,
   type RunRecordV1,
+  type TypedError,
 } from '@nvs/contracts';
 import { compileBlueprint, enforceEnvironmentOperationPolicy } from '@nvs/domain';
 
@@ -19,6 +30,69 @@ export interface EnvironmentRepository {
 export interface ScenarioRepository {
   list(): Promise<BusinessBlueprintV1[]>;
   get(id: string): Promise<BusinessBlueprintV1 | undefined>;
+}
+
+export interface ActorProfileSet {
+  mapping: EnvironmentActorMapV1;
+  profiles: ActorProfileV1[];
+}
+
+export interface ActorProfileRepository {
+  getForEnvironment(environmentId: string): Promise<ActorProfileSet>;
+}
+
+export type SecretConfigurationStatus = 'MISSING' | 'CONFIGURED' | 'INVALID';
+
+export interface AuthenticationCredential {
+  use<T>(operation: (email: string, password: string) => Promise<T>): Promise<T>;
+  destroy(): void;
+  toJSON(): string;
+}
+
+export interface SecretProvider {
+  configurationStatus(reference: string): Promise<SecretConfigurationStatus>;
+  resolve(reference: string): Promise<AuthenticationCredential>;
+}
+
+export interface ActorSession {
+  readonly actorProfileId: string;
+  readonly userId: string;
+  readonly tenantId: string | undefined;
+  readonly correlationId: string;
+  readonly destroyed: boolean;
+  withAuthorization<T>(operation: (authorization: string) => Promise<T>): Promise<T>;
+  destroy(): void;
+  toJSON(): unknown;
+}
+
+export interface ActorAuthenticator {
+  authenticate(input: {
+    environment: EnvironmentDefinitionV1;
+    profile: ActorProfileV1;
+    credential: AuthenticationCredential;
+    correlationId: string;
+  }): Promise<ActorSession>;
+}
+
+export class AuthenticationBlockedError extends Error {
+  constructor(
+    readonly code: string,
+    message: string,
+    readonly retryable: boolean,
+    readonly category: 'ADAPTER' | 'ENVIRONMENT' = 'ADAPTER',
+  ) {
+    super(message);
+    this.name = 'AuthenticationBlockedError';
+  }
+}
+
+export interface ActorReadinessDependencies {
+  profiles: ActorProfileRepository;
+  secrets: SecretProvider;
+  authenticator: ActorAuthenticator;
+  clock?: () => string;
+  monotonicClock?: () => number;
+  correlationIdFactory?: () => string;
 }
 
 export interface RunBundle {
@@ -48,12 +122,70 @@ export interface CompileOnlyRunInput {
   target?: { version?: string; commit?: string };
 }
 
+class PreflightSessionCache {
+  private readonly sessions = new Map<string, ActorSession>();
+
+  add(session: ActorSession): void {
+    const existing = this.sessions.get(session.actorProfileId);
+    existing?.destroy();
+    this.sessions.set(session.actorProfileId, session);
+  }
+
+  clear(): void {
+    for (const session of this.sessions.values()) {
+      session.destroy();
+    }
+    this.sessions.clear();
+  }
+}
+
+function publicConfigurationState(
+  environment: EnvironmentDefinitionV1,
+  profile: ActorProfileV1,
+  status: SecretConfigurationStatus,
+): ActorCredentialConfiguration {
+  if (!environment.enabled || !profile.enabled) {
+    return 'DISABLED';
+  }
+  if (status === 'MISSING') {
+    return 'NOT_CONFIGURED';
+  }
+  return status === 'CONFIGURED' ? 'CONFIGURED' : 'INVALID';
+}
+
+function blockedError(
+  code: string,
+  message: string,
+  retryable = false,
+  category: 'ADAPTER' | 'ENVIRONMENT' = 'ENVIRONMENT',
+): TypedError {
+  return { category, code, message, retryable };
+}
+
+function safeAuthenticationError(error: unknown): TypedError {
+  if (error instanceof AuthenticationBlockedError) {
+    return {
+      category: error.category,
+      code: error.code,
+      message: error.message,
+      retryable: error.retryable,
+    };
+  }
+  return blockedError(
+    'AUTHENTICATION_ADAPTER_FAILURE',
+    'Actor authentication could not be completed safely.',
+    false,
+    'ADAPTER',
+  );
+}
+
 export class NvsCore {
   constructor(
     private readonly environments: EnvironmentRepository,
     private readonly scenarios: ScenarioRepository,
     private readonly bundles: RunBundleRepository,
     private readonly probeAdapter: EnvironmentProbe,
+    private readonly actorReadiness?: ActorReadinessDependencies,
   ) {}
 
   listEnvironments(): Promise<EnvironmentDefinitionV1[]> {
@@ -88,6 +220,202 @@ export class NvsCore {
       };
     }
     return this.probeAdapter.probe(environment);
+  }
+
+  private actorDependencies(): Required<
+    Pick<ActorReadinessDependencies, 'profiles' | 'secrets' | 'authenticator'>
+  > &
+    Pick<ActorReadinessDependencies, 'clock' | 'monotonicClock' | 'correlationIdFactory'> {
+    if (!this.actorReadiness) {
+      throw new AuthenticationBlockedError(
+        'ACTOR_READINESS_NOT_CONFIGURED',
+        'Actor readiness is not configured for this NVS instance.',
+        false,
+        'ENVIRONMENT',
+      );
+    }
+    return this.actorReadiness;
+  }
+
+  async listActorReadiness(environmentId: string): Promise<ActorListV1> {
+    const environment = await this.getEnvironment(environmentId);
+    const dependencies = this.actorDependencies();
+    const profileSet = await dependencies.profiles.getForEnvironment(environment.id);
+    const actors = await Promise.all(
+      profileSet.profiles.map(async (profile): Promise<ActorReadinessV1> => {
+        const configurationStatus = await dependencies.secrets.configurationStatus(
+          profile.credentialRef,
+        );
+        const credentialConfiguration = publicConfigurationState(
+          environment,
+          profile,
+          configurationStatus,
+        );
+        return actorReadinessV1Schema.parse({
+          actorProfileId: profile.id,
+          displayName: profile.displayName,
+          persona: profile.persona,
+          credentialConfiguration,
+          authenticationState:
+            credentialConfiguration === 'DISABLED' ? 'DISABLED' : 'NOT_ATTEMPTED',
+          ...(profile.tenantId ? { expectedTenantId: profile.tenantId } : {}),
+        });
+      }),
+    );
+    return actorListV1Schema.parse({
+      schemaVersion: 'nvs.actor-list/v1',
+      environmentId: environment.id,
+      gateEligible: false,
+      actors,
+    });
+  }
+
+  async runAuthenticationPreflight(environmentId: string): Promise<AuthPreflightV1> {
+    const environment = await this.getEnvironment(environmentId);
+    if (environment.kind === 'production') {
+      throw new AuthenticationBlockedError(
+        'PRODUCTION_AUTH_PREFLIGHT_FORBIDDEN',
+        'Authentication preflight is forbidden for production environments.',
+        false,
+        'ENVIRONMENT',
+      );
+    }
+    const dependencies = this.actorDependencies();
+    const profileSet = await dependencies.profiles.getForEnvironment(environment.id);
+    const clock = dependencies.clock ?? (() => new Date().toISOString());
+    const monotonicClock = dependencies.monotonicClock ?? (() => performance.now());
+    const correlationIdFactory =
+      dependencies.correlationIdFactory ??
+      (() => `auth_${randomUUID().toLowerCase().replaceAll('-', '')}`);
+    const startedAt = clock();
+    const cache = new PreflightSessionCache();
+    const actors: ActorReadinessV1[] = [];
+
+    try {
+      for (const profile of profileSet.profiles) {
+        const started = monotonicClock();
+        const correlationId = correlationIdFactory();
+        const configurationStatus = await dependencies.secrets.configurationStatus(
+          profile.credentialRef,
+        );
+        const credentialConfiguration = publicConfigurationState(
+          environment,
+          profile,
+          configurationStatus,
+        );
+        const common = {
+          actorProfileId: profile.id,
+          displayName: profile.displayName,
+          persona: profile.persona,
+          credentialConfiguration,
+          correlationId,
+          ...(profile.tenantId ? { expectedTenantId: profile.tenantId } : {}),
+        };
+
+        if (!environment.enabled || !profile.enabled) {
+          actors.push(
+            actorReadinessV1Schema.parse({
+              ...common,
+              authenticationState: 'DISABLED',
+              durationMs: Math.max(0, Math.round(monotonicClock() - started)),
+              timestamp: clock(),
+            }),
+          );
+          continue;
+        }
+
+        let policyError: TypedError | undefined;
+        if (configurationStatus === 'MISSING') {
+          policyError = blockedError(
+            'CREDENTIAL_MISSING',
+            'The actor credential reference is not configured.',
+          );
+        } else if (configurationStatus === 'INVALID') {
+          policyError = blockedError(
+            'CREDENTIAL_INVALID',
+            'The actor credential configuration is invalid.',
+          );
+        } else if (profile.mfa !== 'NOT_EXPECTED') {
+          policyError = blockedError(
+            'MFA_NOT_AUTOMATABLE',
+            'The actor profile requires an unsupported automated MFA flow.',
+          );
+        }
+
+        if (policyError) {
+          actors.push(
+            actorReadinessV1Schema.parse({
+              ...common,
+              authenticationState: 'BLOCKED',
+              durationMs: Math.max(0, Math.round(monotonicClock() - started)),
+              timestamp: clock(),
+              error: policyError,
+            }),
+          );
+          continue;
+        }
+
+        let credential: AuthenticationCredential | undefined;
+        let session: ActorSession | undefined;
+        try {
+          credential = await dependencies.secrets.resolve(profile.credentialRef);
+          session = await dependencies.authenticator.authenticate({
+            environment,
+            profile,
+            credential,
+            correlationId,
+          });
+          cache.add(session);
+          if (profile.tenantId && session.tenantId !== profile.tenantId) {
+            throw new AuthenticationBlockedError(
+              session.tenantId ? 'TENANT_MISMATCH' : 'TENANT_CONTEXT_MISSING',
+              session.tenantId
+                ? 'The authenticated actor tenant does not match the configured tenant.'
+                : 'The authenticated actor response did not include the configured tenant context.',
+              false,
+            );
+          }
+          actors.push(
+            actorReadinessV1Schema.parse({
+              ...common,
+              authenticationState: 'AUTHENTICATED',
+              userId: session.userId,
+              ...(session.tenantId ? { observedTenantId: session.tenantId } : {}),
+              durationMs: Math.max(0, Math.round(monotonicClock() - started)),
+              timestamp: clock(),
+            }),
+          );
+        } catch (error) {
+          actors.push(
+            actorReadinessV1Schema.parse({
+              ...common,
+              authenticationState: 'BLOCKED',
+              ...(session?.tenantId ? { observedTenantId: session.tenantId } : {}),
+              durationMs: Math.max(0, Math.round(monotonicClock() - started)),
+              timestamp: clock(),
+              error: safeAuthenticationError(error),
+            }),
+          );
+        } finally {
+          credential?.destroy();
+        }
+      }
+    } finally {
+      cache.clear();
+    }
+
+    return authPreflightV1Schema.parse({
+      schemaVersion: 'nvs.auth-preflight/v1',
+      environmentId: environment.id,
+      verdict: actors.every((actor) => actor.authenticationState === 'AUTHENTICATED')
+        ? 'PASS'
+        : 'BLOCKED',
+      gateEligible: false,
+      assuranceScope: 'AUTHENTICATION_READINESS_ONLY',
+      startedAt,
+      completedAt: clock(),
+      actors,
+    });
   }
 
   listScenarios(): Promise<BusinessBlueprintV1[]> {

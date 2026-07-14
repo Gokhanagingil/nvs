@@ -1,0 +1,10 @@
+schemaVersion: nvs.environment-actor-map/v1
+environmentId: staging-example
+actors:
+  requester: staging-requester
+  service-desk-agent: staging-service-desk-agent
+  incident-manager: staging-incident-manager
+  tenant-admin: staging-tenant-admin
+  cross-tenant-agent: staging-cross-tenant-agent
+provenance:
+  source: Sanitized M1-02A example mapping; bind only approved synthetic users at runtime.

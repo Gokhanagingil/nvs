@@ -1,0 +1,15 @@
+schemaVersion: nvs.actor-profile/v1
+id: staging-service-desk-agent
+displayName: Staging synthetic Service Desk agent
+persona: service-desk-agent
+environmentId: staging-example
+tenantId: 33333333-3333-4333-8333-333333333333
+credentialRef: niles.staging.service-desk-agent
+expectedDomains: [itsm]
+expectedRoles: [service-desk-agent]
+capabilityNotes:
+  - Bind only an approved dedicated synthetic staging identity.
+enabled: true
+mfa: NOT_EXPECTED
+provenance:
+  source: Sanitized M1-02A example profile.

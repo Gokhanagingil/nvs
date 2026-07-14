@@ -239,4 +239,70 @@ describe('authenticated NILES adapter', () => {
     expect(fetchMock).not.toHaveBeenCalled();
     actorCredential.destroy();
   });
+
+  it.each([
+    [
+      'direct passwordChangeRequired',
+      {
+        accessToken: 'confidential-access-token',
+        passwordChangeRequired: true,
+        passwordPolicy: 'must rotate immediately',
+        user: { id: requesterUserId, tenantId, email: 'actor@example.invalid' },
+      },
+    ],
+    [
+      'wrapped passwordChangeRequired',
+      {
+        success: true,
+        data: {
+          accessToken: 'confidential-access-token',
+          passwordChangeRequired: true,
+          user: { id: requesterUserId, tenantId },
+        },
+      },
+    ],
+    [
+      'user.mustChangePassword',
+      {
+        accessToken: 'confidential-access-token',
+        user: {
+          id: requesterUserId,
+          tenantId,
+          mustChangePassword: true,
+          email: 'actor@example.invalid',
+        },
+      },
+    ],
+  ])('blocks %s without creating a usable session', async (_name, body) => {
+    const fetchMock = vi
+      .fn<FetchImplementation>()
+      .mockResolvedValue(new Response(JSON.stringify(body), { status: 200 }));
+    const actorCredential = await credential(profile.credentialRef, 'actor@example.invalid');
+    const adapter = new NilesAuthenticationAdapter(fetchMock);
+
+    await expect(
+      adapter.authenticate({
+        environment,
+        profile,
+        credential: actorCredential,
+        correlationId: 'auth_password_change',
+      }),
+    ).rejects.toMatchObject({
+      code: 'PASSWORD_CHANGE_REQUIRED',
+      message: 'NILES requires a password change before authenticated actor use is allowed.',
+    });
+
+    const serialized = await adapter
+      .authenticate({
+        environment,
+        profile,
+        credential: actorCredential,
+        correlationId: 'auth_password_change_redaction',
+      })
+      .catch((error: unknown) => JSON.stringify(error));
+    expect(serialized).not.toMatch(
+      /confidential-access-token|actor@example|synthetic-test-value|must rotate|passwordPolicy|mustChangePassword/i,
+    );
+    actorCredential.destroy();
+  });
 });

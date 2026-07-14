@@ -6,6 +6,7 @@ import type {
   EnvironmentDefinitionV1,
 } from '@nvs/contracts';
 import {
+  AuthenticationBlockedError,
   NvsCore,
   type ActorAuthenticator,
   type ActorProfileRepository,
@@ -229,6 +230,33 @@ describe('actor authentication preflight', () => {
     expect(sessions.every((session) => session.destroyed)).toBe(true);
     expect(JSON.stringify(result)).not.toMatch(
       /token-|@example|synthetic-test-value|authorization/i,
+    );
+  });
+
+  it('surfaces PASSWORD_CHANGE_REQUIRED as BLOCKED and destroys no usable sessions', async () => {
+    const authenticator = {
+      async authenticate() {
+        throw new AuthenticationBlockedError(
+          'PASSWORD_CHANGE_REQUIRED',
+          'NILES requires a password change before authenticated actor use is allowed.',
+          false,
+        );
+      },
+    } satisfies ActorAuthenticator;
+    const { core, sessions } = buildCore({ authenticator });
+
+    const result = await core.runAuthenticationPreflight('preflight-test');
+    expect(result.verdict).toBe('BLOCKED');
+    expect(
+      result.actors.every(
+        (actor) =>
+          actor.authenticationState === 'BLOCKED' &&
+          actor.error?.code === 'PASSWORD_CHANGE_REQUIRED',
+      ),
+    ).toBe(true);
+    expect(sessions).toHaveLength(0);
+    expect(JSON.stringify(result)).not.toMatch(
+      /token-|@example|synthetic-test-value|passwordPolicy|mustChangePassword/i,
     );
   });
 

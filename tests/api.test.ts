@@ -8,7 +8,10 @@ import {
   type FetchImplementation,
 } from '@nvs/adapter-niles';
 import { NvsCore } from '@nvs/core';
-import { EnvironmentVariableSecretProvider } from '@nvs/secret-provider-environment';
+import {
+  EnvironmentVariableSecretProvider,
+  credentialEnvironmentVariable,
+} from '@nvs/secret-provider-environment';
 import {
   FilesystemActorProfileRepository,
   FilesystemEnvironmentRepository,
@@ -253,6 +256,95 @@ describe('versioned control-plane API', () => {
     const missingApi = await app.inject({ method: 'GET', url: '/api/not-real' });
     expect(missingApi.statusCode).toBe(404);
     expect(missingApi.json().error.code).toBe('NOT_FOUND');
+  });
+
+  it('blocks auth-preflight with PASSWORD_CHANGE_REQUIRED without leaking secrets', async () => {
+    const webRoot = path.join(temporaryRoot, 'web-password-change');
+    await mkdir(webRoot, { recursive: true });
+    await writeFile(
+      path.join(webRoot, 'index.html'),
+      '<!doctype html><html><body>NVS production console</body></html>',
+      'utf8',
+    );
+    const loginFetch = vi.fn<FetchImplementation>(
+      async () =>
+        new Response(
+          JSON.stringify({
+            accessToken: 'confidential-access-token',
+            passwordChangeRequired: true,
+            passwordPolicy: 'must rotate immediately',
+            user: {
+              id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+              tenantId: '11111111-1111-4111-8111-111111111111',
+              email: 'requester@example.invalid',
+              mustChangePassword: true,
+            },
+          }),
+          { status: 200 },
+        ),
+    );
+    const secretSource = Object.fromEntries(
+      [
+        'niles.local.requester',
+        'niles.local.service-desk-agent',
+        'niles.local.incident-manager',
+        'niles.local.tenant-admin',
+        'niles.local.cross-tenant-agent',
+      ].map((reference, index) => [
+        credentialEnvironmentVariable(reference),
+        JSON.stringify({
+          email: `actor${index}@example.invalid`,
+          password: 'synthetic-test-value',
+        }),
+      ]),
+    );
+    const passwordChangeCore = new NvsCore(
+      new FilesystemEnvironmentRepository(path.join(repositoryRoot, 'environments')),
+      new FilesystemScenarioRepository(path.join(repositoryRoot, 'scenarios')),
+      new FilesystemRunBundleRepository(temporaryRoot),
+      new NilesReadOnlyAdapter(vi.fn<FetchImplementation>()),
+      {
+        profiles: new FilesystemActorProfileRepository(path.join(repositoryRoot, 'actors')),
+        secrets: new EnvironmentVariableSecretProvider(secretSource),
+        authenticator: new NilesAuthenticationAdapter(loginFetch),
+      },
+    );
+    const passwordChangeApp = buildApp({
+      core: passwordChangeCore,
+      runtimePaths: {
+        configDir: repositoryRoot,
+        dataDir: temporaryRoot,
+        webDir: webRoot,
+      },
+      logger: false,
+    });
+    try {
+      const response = await passwordChangeApp.inject({
+        method: 'POST',
+        url: '/api/environments/local-example/auth-preflight',
+        payload: {},
+      });
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toMatchObject({
+        schemaVersion: 'nvs.auth-preflight/v1',
+        verdict: 'BLOCKED',
+        gateEligible: false,
+      });
+      expect(
+        response
+          .json()
+          .actors.every(
+            (actor: { authenticationState: string; error?: { code?: string } }) =>
+              actor.authenticationState === 'BLOCKED' &&
+              actor.error?.code === 'PASSWORD_CHANGE_REQUIRED',
+          ),
+      ).toBe(true);
+      expect(JSON.stringify(response.json())).not.toMatch(
+        /confidential-access-token|@example|synthetic-test-value|must rotate|passwordPolicy|mustChangePassword/i,
+      );
+    } finally {
+      await passwordChangeApp.close();
+    }
   });
 
   it('returns typed 503 BLOCKED readiness for unusable configuration', async () => {

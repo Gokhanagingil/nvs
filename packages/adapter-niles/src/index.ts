@@ -518,6 +518,13 @@ export class NilesAuthenticationAdapter implements ActorAuthenticator {
         false,
       );
     }
+    if (payload['passwordChangeRequired'] === true) {
+      throw new AuthenticationBlockedError(
+        'PASSWORD_CHANGE_REQUIRED',
+        'NILES requires a password change before authenticated actor use is allowed.',
+        false,
+      );
+    }
 
     const accessToken =
       typeof payload['accessToken'] === 'string' ? payload['accessToken'].trim() : '';
@@ -537,6 +544,14 @@ export class NilesAuthenticationAdapter implements ActorAuthenticator {
     }
 
     const user = asRecord(payload['user']);
+    if (user?.['mustChangePassword'] === true) {
+      throw new AuthenticationBlockedError(
+        'PASSWORD_CHANGE_REQUIRED',
+        'NILES requires a password change before authenticated actor use is allowed.',
+        false,
+      );
+    }
+
     const userId =
       typeof user?.['id'] === 'string' && user['id'].trim() ? user['id'].trim() : undefined;
     if (!userId || !UUID_PATTERN.test(userId)) {

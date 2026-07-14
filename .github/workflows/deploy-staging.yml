@@ -95,7 +95,7 @@ jobs:
           [[ "$DEPLOY_PATH" =~ ^/[A-Za-z0-9._/-]+$ && "$DEPLOY_PATH" != *".."* ]]
           [[ "$HOST_PORT" =~ ^[0-9]{1,5}$ ]] && (( HOST_PORT >= 1 && HOST_PORT <= 65535 ))
           if [[ -n "$HEALTH_URL" ]]; then
-            [[ "$HEALTH_URL" =~ ^https?://[A-Za-z0-9._:\[\]-]+$ ]]
+            [[ "$HEALTH_URL" =~ ^https?://[A-Za-z0-9._:-]+$ ]]
           fi
           test -n "$SSH_KEY_B64"
           test -n "$SSH_KNOWN_HOSTS"

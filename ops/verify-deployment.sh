@@ -5,7 +5,7 @@ BASE_URL="${1:-}"
 EXPECTED_SHA="${2:-}"
 TIMEOUT_SECONDS="${3:-90}"
 
-if [[ ! "$BASE_URL" =~ ^https?://[A-Za-z0-9._:\[\]-]+$ ]]; then
+if [[ ! "$BASE_URL" =~ ^https?://[A-Za-z0-9._:-]+$ ]]; then
   echo "Invalid NVS health URL." >&2
   exit 2
 fi

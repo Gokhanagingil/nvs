@@ -144,6 +144,28 @@ const expectationSchema = z
 
 const inputValueSchema = z.union([z.string().max(500), z.number().finite(), z.boolean(), z.null()]);
 export type InputValue = z.infer<typeof inputValueSchema>;
+const SYMBOLIC_INPUT_PATTERN = /^\$\{([a-z0-9._-]+)\}$/;
+
+function validateSymbolicInputs(
+  inputs: Record<string, InputValue>,
+  refIds: ReadonlySet<string>,
+  context: z.RefinementCtx,
+  path: PropertyKey[],
+): void {
+  Object.entries(inputs).forEach(([key, input]) => {
+    if (typeof input !== 'string') {
+      return;
+    }
+    const match = SYMBOLIC_INPUT_PATTERN.exec(input);
+    if (match?.[1] && !refIds.has(match[1])) {
+      context.addIssue({
+        code: 'custom',
+        path: [...path, key],
+        message: `unknown symbolic reference: ${match[1]}`,
+      });
+    }
+  });
+}
 
 const businessStepSchema = z
   .object({
@@ -280,18 +302,7 @@ export const businessBlueprintV1Schema = z
           message: 'step actor must reference a declared actor',
         });
       }
-      Object.values(step.inputs).forEach((input) => {
-        if (typeof input === 'string') {
-          const match = /^\$\{([a-z0-9._-]+)\}$/.exec(input);
-          if (match?.[1] && !refIds.has(match[1])) {
-            context.addIssue({
-              code: 'custom',
-              path: ['steps', index, 'inputs'],
-              message: `unknown symbolic reference: ${match[1]}`,
-            });
-          }
-        }
-      });
+      validateSymbolicInputs(step.inputs, refIds, context, ['steps', index, 'inputs']);
     });
 
     blueprint.variationDimensions.forEach((dimension, dimensionIndex) => {
@@ -345,6 +356,17 @@ export const businessBlueprintV1Schema = z
             message: 'stepOrder must contain every step exactly once',
           });
         }
+        Object.entries(override.inputOverrides ?? {}).forEach(([stepId, inputs]) => {
+          validateSymbolicInputs(inputs, refIds, context, [
+            'variationDimensions',
+            dimensionIndex,
+            'values',
+            valueIndex,
+            'overrides',
+            'inputOverrides',
+            stepId,
+          ]);
+        });
       });
     });
   });
@@ -456,7 +478,7 @@ const sanitizationSchema = z
 export const evidenceEntryV1Schema = z
   .object({
     id: safeIdSchema,
-    kind: z.enum(['PLAN', 'MANIFEST', 'LOG', 'REQUEST', 'RESPONSE', 'OBSERVATION']),
+    kind: z.enum(['RUN', 'PLAN', 'MANIFEST', 'LOG', 'REQUEST', 'RESPONSE', 'OBSERVATION']),
     path: artifactRelativePathSchema,
     mediaType: z.string().min(1).max(100),
     sha256: z
@@ -467,6 +489,29 @@ export const evidenceEntryV1Schema = z
   .strict();
 export type EvidenceEntryV1 = z.infer<typeof evidenceEntryV1Schema>;
 
+function validateBundleIndex(
+  runId: string,
+  entries: EvidenceEntryV1[],
+  context: z.RefinementCtx,
+  path: PropertyKey[],
+): void {
+  const required = [
+    { id: 'run-record', kind: 'RUN', path: `runs/${runId}/run.json` },
+    { id: 'compiled-plan', kind: 'PLAN', path: `runs/${runId}/plan.json` },
+    { id: 'evidence-manifest', kind: 'MANIFEST', path: `runs/${runId}/evidence.json` },
+  ] as const;
+  required.forEach((expected) => {
+    const entry = entries.find((candidate) => candidate.id === expected.id);
+    if (!entry || entry.kind !== expected.kind || entry.path !== expected.path) {
+      context.addIssue({
+        code: 'custom',
+        path,
+        message: `bundle index must include ${expected.path}`,
+      });
+    }
+  });
+}
+
 export const evidenceManifestV1Schema = z
   .object({
     schemaVersion: z.literal('nvs.evidence/v1'),
@@ -475,8 +520,36 @@ export const evidenceManifestV1Schema = z
     sanitization: sanitizationSchema,
     createdAt: z.iso.datetime({ offset: true }),
   })
-  .strict();
+  .strict()
+  .superRefine((manifest, context) => {
+    validateBundleIndex(manifest.runId, manifest.entries, context, ['entries']);
+  });
 export type EvidenceManifestV1 = z.infer<typeof evidenceManifestV1Schema>;
+
+export const compileOnlyStepResultV1Schema = z
+  .object({
+    stepId: safeIdSchema,
+    compilationStatus: verdictSchema,
+    executionStatus: z.literal('NOT_EXECUTED'),
+    error: typedErrorSchema.optional(),
+  })
+  .strict()
+  .superRefine((step, context) => {
+    if (step.compilationStatus === 'PASS' && step.error) {
+      context.addIssue({
+        code: 'custom',
+        path: ['error'],
+        message: 'a passed compilation step cannot include an error',
+      });
+    }
+    if (step.compilationStatus !== 'PASS' && !step.error) {
+      context.addIssue({
+        code: 'custom',
+        path: ['error'],
+        message: 'a failed or blocked compilation step requires an error',
+      });
+    }
+  });
 
 export const runRecordV1Schema = z
   .object({
@@ -511,15 +584,7 @@ export const runRecordV1Schema = z
         completedAt: z.iso.datetime({ offset: true }),
       })
       .strict(),
-    stepResults: z.array(
-      z
-        .object({
-          stepId: safeIdSchema,
-          status: z.enum(['PASS', 'FAIL', 'BLOCKED']),
-          error: typedErrorSchema.optional(),
-        })
-        .strict(),
-    ),
+    stepResults: z.array(compileOnlyStepResultV1Schema),
     error: typedErrorSchema.optional(),
     evidence: z.array(evidenceEntryV1Schema),
     sanitization: sanitizationSchema,
@@ -546,6 +611,17 @@ export const runRecordV1Schema = z
         message: 'PASS cannot include an error',
       });
     }
+    if (
+      run.verdict === 'PASS' &&
+      run.stepResults.some((step) => step.compilationStatus !== 'PASS')
+    ) {
+      context.addIssue({
+        code: 'custom',
+        path: ['stepResults'],
+        message: 'a PASS run requires every compilation step to pass',
+      });
+    }
+    validateBundleIndex(run.runId, run.evidence, context, ['evidence']);
   });
 
 export type RunRecordV1 = z.infer<typeof runRecordV1Schema>;
@@ -598,8 +674,30 @@ export interface CoverageCell {
   status: 'DECLARED_COMPILED_NOT_EXECUTED';
 }
 
+export function isSecretBearingFieldName(key: string): boolean {
+  const tokens = key
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .replace(/([A-Z])([A-Z][a-z])/g, '$1_$2')
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
+  const sensitiveTokens = new Set([
+    'authorization',
+    'cookie',
+    'credential',
+    'credentials',
+    'password',
+    'secret',
+    'token',
+  ]);
+  if (tokens.some((token) => sensitiveTokens.has(token))) {
+    return true;
+  }
+  const compact = tokens.join('');
+  return compact === 'apikey' || compact === 'privatekey';
+}
+
 export function assertNoObviousSecretFields(value: unknown): void {
-  const secretKey = /^(?:password|secret|token|api[-_]?key|authorization|cookie)$/i;
   const visit = (node: unknown): void => {
     if (Array.isArray(node)) {
       node.forEach(visit);
@@ -607,7 +705,7 @@ export function assertNoObviousSecretFields(value: unknown): void {
     }
     if (node && typeof node === 'object') {
       for (const [key, child] of Object.entries(node)) {
-        if (secretKey.test(key)) {
+        if (isSecretBearingFieldName(key)) {
           throw new Error(`secret-bearing field "${key}" is forbidden in versioned input`);
         }
         visit(child);

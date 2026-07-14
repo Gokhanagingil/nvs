@@ -43,12 +43,16 @@ try {
   } else {
     throw new Error('Unsupported CLI command.');
   }
-} catch {
+} catch (error) {
+  const duplicateRunId =
+    error instanceof Error && 'code' in error && error.code === 'RUN_ID_ALREADY_EXISTS';
   process.stderr.write(
     `${JSON.stringify({
       error: {
-        code: 'CLI_COMMAND_FAILED',
-        message: 'The requested NVS command could not be completed.',
+        code: duplicateRunId ? 'RUN_ID_ALREADY_EXISTS' : 'CLI_COMMAND_FAILED',
+        message: duplicateRunId
+          ? 'A run with this identifier already exists.'
+          : 'The requested NVS command could not be completed.',
       },
     })}\n`,
   );

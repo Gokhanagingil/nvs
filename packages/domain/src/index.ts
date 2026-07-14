@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import {
   businessBlueprintV1Schema,
   executablePlanV1Schema,
+  isSecretBearingFieldName,
   type BusinessBlueprintV1,
   type EnvironmentDefinitionV1,
   type ErrorCategory,
@@ -48,7 +49,6 @@ export function stableJson(value: unknown): string {
 }
 
 export function sanitizeForPersistence(value: unknown): unknown {
-  const sensitiveKey = /(?:authorization|cookie|password|secret|token|api[-_]?key)/i;
   const sanitizeString = (input: string): string =>
     input
       .replace(/\bBearer\s+[A-Za-z0-9._~+/-]+=*/gi, 'Bearer [REDACTED]')
@@ -61,11 +61,15 @@ export function sanitizeForPersistence(value: unknown): unknown {
     return Object.fromEntries(
       Object.entries(value).map(([key, child]) => [
         key,
-        sensitiveKey.test(key) ? '[REDACTED]' : sanitizeForPersistence(child),
+        isSecretBearingFieldName(key) ? '[REDACTED]' : sanitizeForPersistence(child),
       ]),
     );
   }
   return typeof value === 'string' ? sanitizeString(value) : value;
+}
+
+export function serializeForPersistence(value: unknown): string {
+  return stableJson(sanitizeForPersistence(value));
 }
 
 export function sha256(value: string): string {

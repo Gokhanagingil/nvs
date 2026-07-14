@@ -9,12 +9,7 @@ import {
   type ProbeResultV1,
   type RunRecordV1,
 } from '@nvs/contracts';
-import {
-  compileBlueprint,
-  enforceEnvironmentOperationPolicy,
-  sha256,
-  stableJson,
-} from '@nvs/domain';
+import { compileBlueprint, enforceEnvironmentOperationPolicy } from '@nvs/domain';
 
 export interface EnvironmentRepository {
   list(): Promise<EnvironmentDefinitionV1[]>;
@@ -26,16 +21,18 @@ export interface ScenarioRepository {
   get(id: string): Promise<BusinessBlueprintV1 | undefined>;
 }
 
-export interface RunRepository {
-  save(run: RunRecordV1, plan: ExecutablePlanV1): Promise<void>;
+export interface RunBundle {
+  run: RunRecordV1;
+  plan: ExecutablePlanV1;
+  evidenceManifest: EvidenceManifestV1;
+}
+
+export interface RunBundleRepository {
+  saveBundle(bundle: RunBundle): Promise<RunRecordV1>;
   list(): Promise<RunRecordV1[]>;
   get(id: string): Promise<RunRecordV1 | undefined>;
   getPlan(id: string): Promise<ExecutablePlanV1 | undefined>;
-}
-
-export interface EvidenceRepository {
-  save(manifest: EvidenceManifestV1): Promise<void>;
-  get(runId: string): Promise<EvidenceManifestV1 | undefined>;
+  getEvidence(runId: string): Promise<EvidenceManifestV1 | undefined>;
 }
 
 export interface EnvironmentProbe {
@@ -55,8 +52,7 @@ export class NvsCore {
   constructor(
     private readonly environments: EnvironmentRepository,
     private readonly scenarios: ScenarioRepository,
-    private readonly runs: RunRepository,
-    private readonly evidence: EvidenceRepository,
+    private readonly bundles: RunBundleRepository,
     private readonly probeAdapter: EnvironmentProbe,
   ) {}
 
@@ -119,11 +115,16 @@ export class NvsCore {
     const plan = await this.compileScenario(input.scenarioId, input.variationValues ?? {});
     const evidenceEntries = [
       {
+        id: 'run-record',
+        kind: 'RUN' as const,
+        path: `runs/${input.runId}/run.json`,
+        mediaType: 'application/json',
+      },
+      {
         id: 'compiled-plan',
         kind: 'PLAN' as const,
         path: `runs/${input.runId}/plan.json`,
         mediaType: 'application/json',
-        sha256: sha256(stableJson(plan)),
       },
       {
         id: 'evidence-manifest',
@@ -166,23 +167,25 @@ export class NvsCore {
         createdAt: input.now,
         completedAt: input.now,
       },
-      stepResults: plan.steps.map((step) => ({ stepId: step.id, status: 'PASS' })),
+      stepResults: plan.steps.map((step) => ({
+        stepId: step.id,
+        compilationStatus: 'PASS' as const,
+        executionStatus: 'NOT_EXECUTED' as const,
+      })),
       evidence: evidenceEntries,
       sanitization,
       cleanup: { status: 'NOT_REQUIRED', details: 'Compile-only runs create no NILES records.' },
     });
 
-    await this.runs.save(run, plan);
-    await this.evidence.save(manifest);
-    return run;
+    return this.bundles.saveBundle({ run, plan, evidenceManifest: manifest });
   }
 
   listRuns(): Promise<RunRecordV1[]> {
-    return this.runs.list();
+    return this.bundles.list();
   }
 
   async getRun(id: string): Promise<RunRecordV1> {
-    const run = await this.runs.get(id);
+    const run = await this.bundles.get(id);
     if (!run) {
       throw new Error(`Run "${id}" was not found.`);
     }
@@ -190,7 +193,7 @@ export class NvsCore {
   }
 
   async getPlan(runId: string): Promise<ExecutablePlanV1> {
-    const plan = await this.runs.getPlan(runId);
+    const plan = await this.bundles.getPlan(runId);
     if (!plan) {
       throw new Error(`Plan for run "${runId}" was not found.`);
     }
@@ -198,7 +201,7 @@ export class NvsCore {
   }
 
   async getEvidence(runId: string): Promise<EvidenceManifestV1> {
-    const evidence = await this.evidence.get(runId);
+    const evidence = await this.bundles.getEvidence(runId);
     if (!evidence) {
       throw new Error(`Evidence for run "${runId}" was not found.`);
     }

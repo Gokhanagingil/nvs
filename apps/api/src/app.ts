@@ -5,9 +5,9 @@ import { NvsCore } from '@nvs/core';
 import { DomainPolicyError } from '@nvs/domain';
 import {
   FilesystemEnvironmentRepository,
-  FilesystemEvidenceRepository,
-  FilesystemRunRepository,
+  FilesystemRunBundleRepository,
   FilesystemScenarioRepository,
+  RunIdAlreadyExistsError,
   StorageCorruptionError,
   UnsafeIdentifierError,
 } from '@nvs/storage-filesystem';
@@ -50,8 +50,7 @@ export function createCore(rootDir: string, fetchImplementation?: FetchImplement
   return new NvsCore(
     new FilesystemEnvironmentRepository(path.join(rootDir, 'environments')),
     new FilesystemScenarioRepository(path.join(rootDir, 'scenarios')),
-    new FilesystemRunRepository(artifactRoot),
-    new FilesystemEvidenceRepository(artifactRoot),
+    new FilesystemRunBundleRepository(artifactRoot),
     new NilesReadOnlyAdapter(fetchImplementation),
   );
 }
@@ -91,6 +90,18 @@ function safeError(error: unknown): {
         error: {
           code: 'STORAGE_CORRUPTION',
           category: 'PERSISTENCE',
+          message: error.message,
+        },
+      },
+    };
+  }
+  if (error instanceof RunIdAlreadyExistsError) {
+    return {
+      statusCode: 409,
+      body: {
+        error: {
+          code: error.code,
+          category: error.category,
           message: error.message,
         },
       },

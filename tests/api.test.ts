@@ -6,8 +6,7 @@ import { NilesReadOnlyAdapter, type FetchImplementation } from '@nvs/adapter-nil
 import { NvsCore } from '@nvs/core';
 import {
   FilesystemEnvironmentRepository,
-  FilesystemEvidenceRepository,
-  FilesystemRunRepository,
+  FilesystemRunBundleRepository,
   FilesystemScenarioRepository,
 } from '@nvs/storage-filesystem';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -27,8 +26,7 @@ beforeEach(async () => {
   const core = new NvsCore(
     new FilesystemEnvironmentRepository(path.join(repositoryRoot, 'environments')),
     new FilesystemScenarioRepository(path.join(repositoryRoot, 'scenarios')),
-    new FilesystemRunRepository(temporaryRoot),
-    new FilesystemEvidenceRepository(temporaryRoot),
+    new FilesystemRunBundleRepository(temporaryRoot),
     new NilesReadOnlyAdapter(fetchMock),
   );
   app = buildApp({
@@ -92,12 +90,19 @@ describe('versioned control-plane API', () => {
       },
     });
     expect(creation.statusCode).toBe(201);
-    expect(creation.json()).toMatchObject({
+    const creationBody = creation.json();
+    expect(creationBody).toMatchObject({
       runId: 'api-test-run',
       verdict: 'PASS',
       gateEligible: false,
       assuranceScope: 'COMPILATION_ONLY',
     });
+    expect(
+      creationBody.stepResults.every(
+        (step: { compilationStatus: string; executionStatus: string }) =>
+          step.compilationStatus === 'PASS' && step.executionStatus === 'NOT_EXECUTED',
+      ),
+    ).toBe(true);
 
     const runs = await app.inject({ method: 'GET', url: '/api/runs' });
     expect(runs.json().items).toHaveLength(1);
@@ -121,7 +126,13 @@ describe('versioned control-plane API', () => {
       url: '/api/runs/api-test-run/evidence',
     });
     expect(evidence.statusCode).toBe(200);
-    expect(evidence.json().entries).toHaveLength(2);
+    expect(evidence.json().entries).toHaveLength(3);
+    expect(evidence.json().entries).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ kind: 'RUN', path: 'runs/api-test-run/run.json' }),
+        expect.objectContaining({ kind: 'PLAN', path: 'runs/api-test-run/plan.json' }),
+      ]),
+    );
 
     const coverage = await app.inject({ method: 'GET', url: '/api/coverage' });
     expect(coverage.statusCode).toBe(200);
@@ -146,5 +157,29 @@ describe('versioned control-plane API', () => {
     });
     expect(JSON.stringify(body)).not.toContain('C:\\private');
     expect(JSON.stringify(body).toLowerCase()).not.toContain('stack');
+  });
+
+  it('maps a duplicate run ID to a typed HTTP 409 conflict', async () => {
+    const payload = {
+      runType: 'COMPILE_ONLY',
+      runId: 'duplicate-api-run',
+      environmentId: 'local-example',
+      scenarioId: 'payment-api-service-degradation',
+      variationValues: { journey: 'normal' },
+    };
+    expect((await app.inject({ method: 'POST', url: '/api/runs', payload })).statusCode).toBe(201);
+
+    const duplicate = await app.inject({ method: 'POST', url: '/api/runs', payload });
+    expect(duplicate.statusCode).toBe(409);
+    expect(duplicate.json()).toEqual({
+      error: {
+        code: 'RUN_ID_ALREADY_EXISTS',
+        category: 'PERSISTENCE',
+        message: 'A run with this identifier already exists.',
+      },
+    });
+
+    const runs = await app.inject({ method: 'GET', url: '/api/runs' });
+    expect(runs.json().items).toHaveLength(1);
   });
 });

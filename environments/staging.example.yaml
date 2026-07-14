@@ -1,0 +1,16 @@
+schemaVersion: nvs.environment/v1
+id: staging-example
+displayName: Sanitized staging NILES example
+baseUrl: https://niles-staging.invalid
+kind: staging
+healthPath: /health/live
+readinessPath: /health/ready
+openApiPath: /api/docs-json
+versionPath: /health/version
+capabilities:
+  health: true
+  readiness: true
+  openApi: true
+  version: true
+authProfileRef: niles.staging-readonly
+enabled: false

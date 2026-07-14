@@ -1,0 +1,342 @@
+schemaVersion: nvs.blueprint/v1
+id: payment-api-service-degradation
+version: 1.0.0
+title: Payment API service degradation through restoration and closure
+narrative: >-
+  A customer-facing payment/API service suffers severe degradation during an active support
+  window. A requester reports the impact. Service Desk triages the incident, establishes
+  operational ownership, relates the affected service and CI context where supported, observes
+  the applicable response and resolution SLA, places the incident on hold while waiting for an
+  external provider, resumes work, restores service, records resolution evidence, resolves the
+  incident, and closes it under the correct authority.
+objective: >-
+  Demonstrate the approved Incident, SLA, authorization, tenant-isolation, evidence, and cleanup
+  intent as a deterministic semantic plan without executing any NILES mutation in M1-01.
+domain: itsm
+process: incident
+riskTags:
+  - customer-impact
+  - payment
+  - sla
+  - authorization
+  - tenant-isolation
+reviewState: approved
+provenance:
+  source: NVS M1-01 approved vertical-slice narrative
+  approvedBy: Product Owner
+  reviewedAt: 2026-07-14T12:00:00+00:00
+actors:
+  - id: requester
+    name: Payment operations requester
+    persona: Reports the customer-facing degradation and can inspect the permitted incident.
+    authProfileRef: actor.requester
+  - id: service-desk-agent
+    name: Service Desk agent
+    persona: Triages, assigns, owns, holds, resumes, and resolves incidents within assigned scope.
+    authProfileRef: actor.service-desk
+  - id: incident-manager
+    name: Incident manager
+    persona: Reviews restoration evidence and closes the resolved incident under approved authority.
+    authProfileRef: actor.incident-manager
+  - id: insufficient-role-user
+    name: Insufficiently privileged user
+    persona: Exercises denial of an agent-only business action without side effects.
+    authProfileRef: actor.requester-limited
+  - id: unauthenticated
+    name: Unauthenticated actor
+    persona: Exercises the public boundary with no credential profile.
+  - id: cross-tenant-actor
+    name: Different-tenant actor
+    persona: Exercises tenant isolation and must not observe or change the incident.
+    authProfileRef: actor.other-tenant
+preconditions:
+  - The selected support window is active for the configured tenant.
+  - The payment API service, offering, CI, assignment group, and SLA policy references are resolvable.
+  - Actor profiles are least-privilege symbolic references; credentials are supplied only at runtime.
+fixtureRequirements:
+  - id: incident-namespace
+    ref: fixture.incident-payment
+    description: Isolated deterministic run namespace for payment API incident records.
+  - id: tenant-context
+    ref: fixture.tenant-primary
+    description: Non-production tenant context with a distinct cross-tenant actor.
+symbolicRefs:
+  - id: tenant
+    description: Primary test tenant.
+    required: true
+  - id: service
+    description: Customer-facing payment API service.
+    required: true
+  - id: offering
+    description: Payment transaction service offering.
+    required: true
+  - id: ci
+    description: Payment API configuration item.
+    required: true
+  - id: assignment-group
+    description: Service Desk assignment group.
+    required: true
+  - id: impact
+    description: Approved business impact value.
+    required: true
+  - id: urgency
+    description: Approved business urgency value.
+    required: true
+  - id: hold-reason
+    description: Waiting for external payment provider.
+    required: true
+  - id: sla-policy
+    description: Applicable response and resolution SLA policy.
+    required: true
+  - id: closure-authority
+    description: Authority allowed to close a resolved incident.
+    required: true
+  - id: resolution-evidence
+    description: Sanitized restoration and resolution evidence reference.
+    required: true
+steps:
+  - id: report-degradation
+    title: Report severe payment API degradation
+    narrative: The requester reports customer impact while the support window is active.
+    actor: requester
+    action: incident.report
+    inputs:
+      tenant: ${tenant}
+      service: ${service}
+      impact: ${impact}
+      urgency: ${urgency}
+      description: Customers experience payment authorization timeouts.
+    expectations:
+      - kind: STATE
+        statement: A new incident represents the reported customer impact.
+      - kind: AUTHORIZATION
+        statement: The requester can report the incident only within the permitted tenant.
+    evidence:
+      - Sanitized report input and resulting incident identity.
+  - id: triage-impact
+    title: Classify impact, urgency, and applicable support context
+    narrative: Service Desk validates severity and determines the intended priority and SLA policy.
+    actor: service-desk-agent
+    action: incident.triage
+    inputs:
+      impact: ${impact}
+      urgency: ${urgency}
+      slaPolicy: ${sla-policy}
+    expectations:
+      - kind: STATE
+        statement: Impact and urgency produce the approved incident priority.
+      - kind: SLA
+        statement: The configured policy is selected for the resulting priority.
+    evidence:
+      - Priority derivation and SLA-policy selection observations.
+  - id: assign-service-desk
+    title: Assign the incident to the responsible Service Desk group
+    narrative: Service Desk establishes an accountable assignment group for restoration work.
+    actor: service-desk-agent
+    action: incident.assign
+    inputs:
+      assignmentGroup: ${assignment-group}
+    expectations:
+      - kind: STATE
+        statement: The incident is assigned to the configured Service Desk group.
+      - kind: AUDIT
+        statement: Assignment is attributable to the acting Service Desk agent.
+    evidence:
+      - Assignment state and audit evidence.
+  - id: take-ownership
+    title: Take operational ownership
+    narrative: An authorized Service Desk agent accepts ownership of the incident.
+    actor: service-desk-agent
+    action: incident.take_ownership
+    inputs:
+      assignmentGroup: ${assignment-group}
+    expectations:
+      - kind: AUTHORIZATION
+        statement: Only an actor with the required operational scope can take ownership.
+      - kind: STATE
+        statement: Operational ownership is visible on the incident.
+    evidence:
+      - Ownership state and authorization decision.
+  - id: link-service-context
+    title: Relate service, offering, and configuration item context
+    narrative: Service Desk links the affected business and technical service context where supported.
+    actor: service-desk-agent
+    action: incident.link_service_context
+    inputs:
+      service: ${service}
+      offering: ${offering}
+      ci: ${ci}
+    expectations:
+      - kind: RELATIONSHIP
+        statement: Supported service, offering, and CI relationships point to the configured references.
+    evidence:
+      - Relationship observations for service, offering, and CI.
+  - id: observe-active-sla
+    title: Observe active response and resolution commitments
+    narrative: Service Desk confirms the selected SLA is active before placing work on hold.
+    actor: service-desk-agent
+    action: sla.read_summary
+    inputs:
+      slaPolicy: ${sla-policy}
+    expectations:
+      - kind: SLA
+        statement: Applicable response and resolution commitments are observable and running.
+    evidence:
+      - SLA summary before hold.
+  - id: hold-for-provider
+    title: Place the incident on hold for the external provider
+    narrative: Work pauses while the external payment provider supplies required diagnostics.
+    actor: service-desk-agent
+    action: incident.hold
+    inputs:
+      reason: ${hold-reason}
+    expectations:
+      - kind: STATE
+        statement: The incident records the approved hold reason.
+      - kind: SLA
+        statement: The resolution clock follows the configured pause policy while on hold.
+    evidence:
+      - Hold transition and SLA pause evidence.
+  - id: observe-held-sla
+    title: Verify the SLA while work remains on hold
+    narrative: Service Desk observes that SLA accounting reflects the approved hold behavior.
+    actor: service-desk-agent
+    action: sla.read_summary
+    inputs:
+      slaPolicy: ${sla-policy}
+    expectations:
+      - kind: SLA
+        statement: SLA elapsed and remaining time reflect the configured hold policy.
+    evidence:
+      - SLA summary during hold.
+  - id: resume-restoration
+    title: Resume restoration work
+    narrative: Service Desk resumes the incident after the external provider responds.
+    actor: service-desk-agent
+    action: incident.resume
+    inputs:
+      reason: Provider diagnostics received.
+    expectations:
+      - kind: STATE
+        statement: The incident leaves hold and restoration work resumes.
+      - kind: SLA
+        statement: The resolution clock resumes according to policy.
+    evidence:
+      - Resume transition and SLA resume evidence.
+  - id: resolve-with-evidence
+    title: Record restoration evidence and resolve the incident
+    narrative: Service Desk confirms service restoration and records the required resolution evidence.
+    actor: service-desk-agent
+    action: incident.resolve
+    inputs:
+      resolutionEvidence: ${resolution-evidence}
+    expectations:
+      - kind: STATE
+        statement: The incident reaches resolved only when required restoration evidence is present.
+      - kind: SLA
+        statement: The resolution commitment stops or completes according to the selected policy.
+      - kind: EVIDENCE
+        statement: Sanitized restoration evidence is linked to the resolution.
+    evidence:
+      - Resolution state, SLA completion, and restoration evidence.
+  - id: inspect-resolution-audit
+    title: Review resolution and authorization audit
+    narrative: The incident manager verifies who restored and resolved the incident before closure.
+    actor: incident-manager
+    action: evidence.read_audit
+    inputs:
+      closureAuthority: ${closure-authority}
+    expectations:
+      - kind: AUDIT
+        statement: Hold, resume, restoration, and resolution actions are attributable to approved actors.
+      - kind: EVENT
+        statement: Required lifecycle events correlate with the incident journey.
+    evidence:
+      - Correlated lifecycle audit and event observations.
+  - id: close-resolved-incident
+    title: Close the resolved incident under the correct authority
+    narrative: The authorized incident manager closes the incident after reviewing resolution evidence.
+    actor: incident-manager
+    action: incident.close
+    inputs:
+      closureAuthority: ${closure-authority}
+    expectations:
+      - kind: AUTHORIZATION
+        statement: Closure is allowed only for the configured authority after resolution.
+      - kind: STATE
+        statement: The resolved incident reaches the closed state.
+      - kind: SIDE_EFFECT
+        statement: Denied closure attempts create no success-side effects.
+    evidence:
+      - Closure decision, final state, and absence of unauthorized side effects.
+variationDimensions:
+  - id: journey
+    description: Approved positive, lifecycle, SLA, and access-control variants for the M1 scenario.
+    values:
+      - id: normal
+        description: Normal successful journey from report through authorized closure.
+        overrides:
+          expectedOutcome: SUCCESS
+      - id: missing-resolution-evidence
+        description: Resolution is attempted without the required restoration evidence.
+        overrides:
+          inputOverrides:
+            resolve-with-evidence:
+              resolutionEvidence: null
+          expectedOutcome: MISSING_EVIDENCE
+      - id: close-before-resolve
+        description: Closure is attempted before resolution and must be rejected as an invalid transition.
+        overrides:
+          stepOrder:
+            - report-degradation
+            - triage-impact
+            - assign-service-desk
+            - take-ownership
+            - link-service-context
+            - observe-active-sla
+            - hold-for-provider
+            - observe-held-sla
+            - resume-restoration
+            - close-resolved-incident
+            - resolve-with-evidence
+            - inspect-resolution-audit
+          expectedOutcome: INVALID_TRANSITION
+      - id: insufficient-role
+        description: A requester-level actor attempts an agent-only assignment action.
+        overrides:
+          stepActorOverrides:
+            assign-service-desk: insufficient-role-user
+          expectedOutcome: ACCESS_DENIED
+      - id: unauthenticated
+        description: An unauthenticated actor attempts to report the incident.
+        overrides:
+          stepActorOverrides:
+            report-degradation: unauthenticated
+          expectedOutcome: ACCESS_DENIED
+      - id: cross-tenant
+        description: A different-tenant actor attempts to inspect the incident lifecycle evidence.
+        overrides:
+          stepActorOverrides:
+            inspect-resolution-audit: cross-tenant-actor
+          expectedOutcome: ACCESS_DENIED
+      - id: hold-resume-sla
+        description: The plan emphasizes hold, paused accounting, resume, and SLA continuation checks.
+        overrides:
+          expectedOutcome: SLA_VALIDATION
+      - id: priority-sla-matching
+        description: High impact and urgency values must select the configured priority and SLA policy.
+        overrides:
+          inputOverrides:
+            triage-impact:
+              impact: high
+              urgency: high
+          expectedOutcome: SLA_VALIDATION
+evidenceRequirements:
+  - Compiled plan with stable source links and no runner mechanics.
+  - Actor, variation, semantic action, assertion, and evidence-request declarations.
+  - Sanitization metadata proving secret-bearing fields are excluded from persisted artifacts.
+  - Cleanup intent and explicit compile-only assurance scope.
+cleanup:
+  isolation: RUN_NAMESPACE
+  intent: Remove only records owned by the deterministic run namespace after executable slices are introduced.
+  retainOnFailure: true

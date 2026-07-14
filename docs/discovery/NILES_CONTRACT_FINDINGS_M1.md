@@ -50,7 +50,7 @@ The M1-01 adapter uses only GET requests and configurable paths. The committed l
 | `CONFIRMED` | `x-correlation-id` is accepted and otherwise generated in tenant context. | `backend-nest/src/tenants/guards/tenant.guard.ts` |
 | `UNKNOWN` | A least-privilege, read-only NVS service identity and its issuance/rotation procedure are not defined. | No dedicated NVS identity contract found. |
 
-Authentication is inspected for M1-02 planning only. M1-01 performs no NILES login and stores only symbolic authentication-profile references.
+M1-01 performed no NILES login. M1-02A uses these confirmed contracts only for an explicit authentication-readiness preflight: it submits each dedicated synthetic actor independently, accepts direct or globally wrapped login responses, validates the optional tenant UUID, destroys every in-memory session, and returns only sanitized status. Production preflight is denied before secret resolution or network access. No authenticated NILES business route is called.
 
 ## Incident API and lifecycle
 

@@ -4,6 +4,12 @@ This is the one-time contract for a single-node M1-02A staging host. Deployment 
 
 NVS is independent from NILES/GRC. Use a dedicated deploy user and paths; never stop, recreate, inspect, or otherwise alter NILES/GRC containers while following this runbook.
 
+## Runtime identity
+
+The production image always runs as fixed unprivileged numeric identity `10001:10001`.
+
+Host bind mounts must use those numbers. Do not depend on a deploy username accidentally matching the container user name or an unrelated host UID.
+
 ## 1. Host prerequisites
 
 Install a supported Docker Engine and Docker Compose v2 from the operating-system or Docker package channel. Confirm:
@@ -19,42 +25,70 @@ Create an unprivileged deployment account with Docker access according to the ho
 ```bash
 sudo install -d -m 0750 -o nvsdeploy -g nvsdeploy /opt/nvs
 sudo install -d -m 0750 -o nvsdeploy -g nvsdeploy \
+  /opt/nvs/config \
+  /opt/nvs/ops \
+  /opt/nvs/releases
+sudo install -d -m 0750 -o 10001 -g 10001 /opt/nvs/data
+sudo install -d -m 0750 -o nvsdeploy -g nvsdeploy \
   /opt/nvs/config/actors/mappings \
   /opt/nvs/config/actors/profiles \
   /opt/nvs/config/environments \
-  /opt/nvs/config/scenarios \
-  /opt/nvs/data \
-  /opt/nvs/ops \
-  /opt/nvs/releases
+  /opt/nvs/config/scenarios
 ```
 
-The deploy account must own `/opt/nvs`; no workflow step uses `sudo`. Keep SSH access key-only and scoped to this host.
+Ownership contract:
 
-## 2. Server-owned configuration
+- `/opt/nvs`, `/opt/nvs/ops`, `/opt/nvs/releases`, and `/opt/nvs/config` are owned by the deploy user for updates;
+- configuration files under `/opt/nvs/config` must be world-/group-readable by the runtime identity (`mode 0640` or `0644` for files, `0750`/`0755` for directories) and never writable by UID `10001`;
+- `/opt/nvs/data` must be owned by `10001:10001` with mode `0750` and is the only writable application path;
+- `/opt/nvs/.env` is mode `0600` and owned by the deploy user.
 
-Transfer `.env.example` from a reviewed NVS commit to `/opt/nvs/.env`, then set mode `0600`. Populate it only on the server or through an approved secret-delivery process:
+The deploy workflow never uses `sudo` and never overwrites `/opt/nvs/.env`, `/opt/nvs/config`, or `/opt/nvs/data`. Keep SSH access key-only and scoped to this host.
+
+## 2. Server-owned configuration and synthetic actors
+
+Transfer `.env.example` from a reviewed NVS commit to `/opt/nvs/.env`, then set mode `0600`:
 
 ```bash
 install -m 0600 .env.example /opt/nvs/.env
 ```
 
-The credential entries are JSON values with exactly `email` and `password`, for example:
+Credential entries are JSON values with exactly `email` and `password`. Use dedicated synthetic non-production users only. Never reuse employee, customer, administrator, or production accounts.
 
-```dotenv
-NVS_CREDENTIAL_NILES_DOT_STAGING_DOT_REQUESTER={"email":"synthetic-requester@approved.invalid","password":"replace-through-approved-secret-process"}
+Bootstrap non-secret configuration from reviewed templates, then replace every sanitized value before enabling the target:
+
+1. Copy `scenarios/` into `/opt/nvs/config/scenarios/`.
+2. Copy only the `staging-*` actor profiles into `/opt/nvs/config/actors/profiles/`.
+3. Copy `actors/mappings/staging-example.yaml` into `/opt/nvs/config/actors/mappings/staging.yaml` (or an equivalent staging environment id mapping).
+4. Copy `environments/staging.example.yaml` to `/opt/nvs/config/environments/staging.yaml`.
+5. Replace the `.invalid` base URL with the operator-approved staging NILES URL.
+6. Replace all sanitized tenant UUIDs. Do not leave template tenant IDs unchanged.
+7. Enable the environment only after review.
+
+Required tenant assignment for staging actors:
+
+- primary validation tenant UUID: used by requester, service desk, incident manager, and tenant admin;
+- separate cross-tenant validation tenant UUID: used only by the cross-tenant agent;
+- all five actors are dedicated synthetic non-production users in the approved staging NILES environment.
+
+After writing files, restore runtime-readable modes without handing write access to UID `10001`:
+
+```bash
+sudo chown -R nvsdeploy:nvsdeploy /opt/nvs/config
+sudo find /opt/nvs/config -type d -exec chmod 0750 {} +
+sudo find /opt/nvs/config -type f -exec chmod 0640 {} +
+sudo chown -R 10001:10001 /opt/nvs/data
+sudo chmod 0750 /opt/nvs/data
 ```
 
-Do not copy that illustrative value. Use separate, dedicated synthetic users in the approved non-production tenant. Never reuse employee, customer, administrator, or production accounts. The workflow does not read or overwrite `/opt/nvs/.env`.
+Validate configuration against the transferred image before a cutover attempt:
 
-Bootstrap non-secret reviewed configuration out of band:
+```bash
+export NVS_VALIDATE_IMAGE=nvs:<full-git-sha>
+/opt/nvs/ops/validate-staging-config.sh /opt/nvs/config /opt/nvs/data
+```
 
-- copy `scenarios/` into `/opt/nvs/config/scenarios/`;
-- copy only the `staging-*` actor profiles into `/opt/nvs/config/actors/profiles/`;
-- copy `actors/mappings/staging-example.yaml` into `/opt/nvs/config/actors/mappings/`;
-- copy `environments/staging.example.yaml` to `/opt/nvs/config/environments/staging.yaml`;
-- replace the `.invalid` base URL with the operator-approved staging NILES URL and enable it only after review.
-
-Actor YAML stores symbolic credential references, never credential values. Restrict config writes to the deploy/operations group. The deployment workflow retains this entire directory.
+The command must report readiness `ready`. Empty, malformed, inconsistent, or wrongly owned configuration returns typed `BLOCKED` / exit status `2`.
 
 ## 3. Pinned SSH trust and GitHub environment
 
@@ -82,9 +116,16 @@ Optional GitHub environment variables:
 
 The workflow validates these values before use.
 
-## 4. Network exposure
+## 4. Control-plane exposure
 
-Compose binds NVS to host loopback by default. Permit SSH from the GitHub-hosted runner strategy approved by operations. For external access, place an approved TLS reverse proxy in front of `127.0.0.1:4100`; do not open the container port publicly merely for convenience.
+Compose binds NVS to host loopback only (`127.0.0.1:<port>`). Keep that default.
+
+External access requires either:
+
+- an SSH tunnel restricted to authorized operators; or
+- an approved TLS reverse proxy that also enforces authentication and authorization for the NVS control plane.
+
+TLS alone is not sufficient. Do not expose the unauthenticated NVS control plane to a public or broad internal network. Permit SSH only from the GitHub-hosted runner strategy approved by operations and from the operator network that needs tunnel access.
 
 ## 5. First and subsequent deployments
 
@@ -94,7 +135,9 @@ From an authorized workstation:
 gh workflow run deploy-staging.yml --ref main -f ref=main
 ```
 
-The workflow resolves the ref to a full commit SHA, runs `pnpm run ci`, builds one labeled image, saves and transfers that exact image archive, and deploys only the `nvs` Compose service. It succeeds only when liveness, readiness, and `/api/version` report the requested SHA.
+The workflow resolves the ref to a full commit SHA, runs `pnpm run ci`, builds one labeled image, saves that exact image archive with a SHA-256 digest, transfers both, verifies the digest on the server before `docker load`, and deploys only the `nvs` Compose service. Deployment succeeds only when liveness, readiness, and `/api/version` report the requested SHA.
+
+Before replacing the active container, the deploy script records the running container's immutable image ID and tags a unique `nvs-rollback:*` reference. Redeploying the same Git SHA cannot erase that rollback reference. On failure the previous image ID is restored and re-verified. Successful deploys prune older rollback tags while retaining the newest five (`NVS_ROLLBACK_RETENTION`, max 20).
 
 Inspect from the host:
 
@@ -110,16 +153,16 @@ Do not paste logs into tickets until reviewed for identifiers. NVS intentionally
 
 ## 6. Failure and rollback
 
-Failed deployment health automatically triggers restoration and verification of the previously active labeled image when available. The workflow then remains failed.
+Failed deployment health automatically restores and verifies the previously active immutable image ID when available. The workflow then remains failed.
 
-For a reviewed manual rollback, choose a full SHA already present in the local Docker image store:
+For a reviewed manual rollback to a still-local exact SHA tag:
 
 ```bash
 docker image ls nvs --no-trunc
 /opt/nvs/ops/rollback-staging.sh <full-previous-sha>
 ```
 
-The script refuses a tag whose OCI revision label differs from the requested SHA and verifies health/version after replacement. Do not retag an unverified image. If the previous image has been pruned, rerun the deployment workflow for that Git commit to transfer the exact archive again.
+Prefer the automatic immutable image-ID rollback created by `deploy-staging.sh`. Manual SHA rollback refuses a tag whose OCI revision label differs from the requested SHA. If neither a rollback tag nor previous image remains, rerun the deployment workflow for that Git commit to transfer the exact archive again. Do not use `docker compose down`.
 
 ## 7. Evidence backup and credential updates
 
@@ -127,7 +170,7 @@ Create an application-consistent evidence backup during an approved maintenance 
 
 ```bash
 docker stop nvs
-tar --create --gzip --file "/opt/nvs-backup-$(date -u +%Y%m%dT%H%M%SZ).tar.gz" \
+tar --create --gzip --file "/opt/nvs-backup-$(date -u +%Y%m%dT%H:%M:%SZ).tar.gz" \
   --directory /opt/nvs data
 docker start nvs
 /opt/nvs/ops/verify-deployment.sh http://127.0.0.1:4100 \

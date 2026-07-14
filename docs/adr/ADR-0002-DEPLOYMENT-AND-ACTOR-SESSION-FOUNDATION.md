@@ -16,16 +16,16 @@ The NILES reference repository was inspected read-only at commit `33af470e10fa75
 
 - Build one immutable, multi-stage Node 24 container.
 - Serve the compiled React SPA and versioned `/api` routes from one Fastify process on port 4100.
-- Run as the unprivileged `node` user with Tini, dropped Linux capabilities, a health check, and graceful signal handling.
-- Mount reviewed configuration read-only at `/app/config` and persistent run/evidence data at `/var/lib/nvs`.
+- Run as fixed unprivileged numeric identity `10001:10001` with Tini, a read-only root filesystem, bounded `/tmp` tmpfs, dropped Linux capabilities, a health check, and graceful signal handling.
+- Keep application code and static assets root-owned and non-writable. Only `/var/lib/nvs` is writable by the runtime identity; `/app/config` is readable and bind-mounted read-only in Compose.
 - Keep filesystem repositories behind existing ports. This remains a single-node persistence model.
 
 ### Deployment
 
 - Use manual `workflow_dispatch`; do not deploy automatically from `main`.
-- Resolve the requested Git ref to one full commit SHA, pass that SHA into image metadata, transfer that exact saved image archive, and load it on staging. Never rebuild source on the server.
-- Keep `/opt/nvs/.env`, `/opt/nvs/config`, and `/opt/nvs/data` server-owned and non-versioned. Deployment replaces only NVS image/Compose/operations resources and never touches NILES or GRC containers.
-- Verify bounded liveness, readiness, and reported build SHA. If replacement fails, restore and verify the previously active labeled image when available.
+- Resolve the requested Git ref to one full commit SHA, pass that SHA into image metadata, transfer that exact saved image archive with a SHA-256 digest, verify the digest before load, then load it on staging. Never rebuild source on the server.
+- Keep `/opt/nvs/.env`, `/opt/nvs/config`, and `/opt/nvs/data` server-owned and non-versioned with explicit numeric ownership for bind mounts. Deployment replaces only NVS image/Compose/operations resources and never touches NILES or GRC containers.
+- Before replacement, capture the running container's immutable image ID under a unique temporary rollback tag. Verify bounded liveness, readiness, and reported build SHA. If replacement fails, restore and verify that immutable image ID. Successful deploys retain a bounded set of rollback tags.
 
 ### Actors, secrets, and sessions
 
@@ -35,7 +35,9 @@ The NILES reference repository was inspected read-only at commit `33af470e10fa75
 - Keep credentials and resulting bearer sessions in private in-memory fields for the duration of one preflight. Destroy each credential and session independently on success or failure.
 - Return only configuration state, authenticated/blocking state, safe typed errors, and non-secret actor metadata to the API and browser.
 - Deny authentication preflight for every production-classified environment before secret resolution or network access.
+- Require NILES login `user.id` to be a UUID; missing or non-UUID identities are typed `LOGIN_RESPONSE_MALFORMED`.
 - Treat MFA, invalid credentials, malformed responses, timeouts, network failures, and tenant mismatch as `BLOCKED`, never as product `FAIL`.
+- Local readiness validates usable configuration: readable trees, at least one valid environment and scenario, required actor mappings/profiles for enabled non-production environments, contract parsing, and writable persistent storage.
 
 ## Consequences
 

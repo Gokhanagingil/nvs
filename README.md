@@ -32,7 +32,7 @@ It includes:
 - Environments, Scenario Library, Run Center, Evidence Explorer, and Coverage UI routes;
 - unit, integration, API, and Playwright smoke coverage;
 - deterministic GitHub Actions CI with no live NILES dependency;
-- one immutable non-root production image serving the SPA and API on port 4100;
+- one immutable production image running as UID/GID `10001:10001` with a read-only root filesystem on port 4100;
 - versioned local liveness, readiness, and build-information endpoints;
 - manual exact-SHA staging deployment with health verification and rollback;
 - sanitized actor profiles and strict environment mappings for five synthetic personas;

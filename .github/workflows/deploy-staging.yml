@@ -1,0 +1,156 @@
+name: deploy staging
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to resolve and deploy
+        required: false
+        default: main
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nvs-staging-deployment
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: staging
+    steps:
+      - name: Check out requested ref
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ inputs.ref || 'main' }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Resolve immutable source
+        id: source
+        shell: bash
+        env:
+          REQUESTED_REF: ${{ inputs.ref || 'main' }}
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain)"
+          sha="$(git rev-parse --verify 'HEAD^{commit}')"
+          test "${#sha}" -eq 40
+          timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          version="$(node -p "require('./package.json').version")"
+          [[ "$version" =~ ^[A-Za-z0-9._+-]{1,64}$ ]]
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "timestamp=$timestamp" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Resolved ${REQUESTED_REF} to $sha"
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa
+        with:
+          version: 11.13.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.18.0
+          cache: pnpm
+      - name: Run required quality gate
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm exec playwright install --with-deps chromium
+          pnpm run ci
+          bash -n ops/*.sh
+      - name: Build immutable deployment archive
+        id: image
+        env:
+          BUILD_SHA: ${{ steps.source.outputs.sha }}
+          BUILD_TIMESTAMP: ${{ steps.source.outputs.timestamp }}
+          RELEASE_VERSION: ${{ steps.source.outputs.version }}
+        run: |
+          set -euo pipefail
+          image="nvs:${BUILD_SHA}"
+          archive="nvs-${BUILD_SHA}.tar.gz"
+          docker build \
+            --build-arg "NVS_BUILD_SHA=${BUILD_SHA}" \
+            --build-arg "NVS_BUILD_TIMESTAMP=${BUILD_TIMESTAMP}" \
+            --build-arg "NVS_RELEASE_VERSION=${RELEASE_VERSION}" \
+            --tag "$image" \
+            .
+          test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$image")" = "$BUILD_SHA"
+          docker save "$image" | gzip -9 > "$archive"
+          archive_digest="$(sha256sum "$archive" | cut -d ' ' -f 1)"
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+          echo "archive_digest=$archive_digest" >> "$GITHUB_OUTPUT"
+      - name: Configure pinned SSH trust
+        env:
+          SSH_HOST: ${{ secrets.NVS_STAGING_SSH_HOST }}
+          SSH_USER: ${{ secrets.NVS_STAGING_SSH_USER }}
+          SSH_KEY_B64: ${{ secrets.NVS_STAGING_SSH_KEY_B64 }}
+          SSH_KNOWN_HOSTS: ${{ secrets.NVS_STAGING_SSH_KNOWN_HOSTS }}
+          DEPLOY_PATH: ${{ vars.NVS_STAGING_DEPLOY_PATH || '/opt/nvs' }}
+          HOST_PORT: ${{ vars.NVS_STAGING_HOST_PORT || '4100' }}
+          HEALTH_URL: ${{ vars.NVS_STAGING_HEALTH_URL }}
+        run: |
+          set -euo pipefail
+          [[ "$SSH_HOST" =~ ^[A-Za-z0-9.-]+$ ]]
+          [[ "$SSH_USER" =~ ^[A-Za-z_][A-Za-z0-9_-]{0,31}$ ]]
+          [[ "$DEPLOY_PATH" =~ ^/[A-Za-z0-9._/-]+$ && "$DEPLOY_PATH" != *".."* ]]
+          [[ "$HOST_PORT" =~ ^[0-9]{1,5}$ ]] && (( HOST_PORT >= 1 && HOST_PORT <= 65535 ))
+          if [[ -n "$HEALTH_URL" ]]; then
+            [[ "$HEALTH_URL" =~ ^https?://[A-Za-z0-9._:\[\]-]+$ ]]
+          fi
+          test -n "$SSH_KEY_B64"
+          test -n "$SSH_KNOWN_HOSTS"
+          install -d -m 0700 "$HOME/.ssh"
+          printf '%s' "$SSH_KEY_B64" | base64 --decode > "$HOME/.ssh/id_nvs_staging"
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 0600 "$HOME/.ssh/id_nvs_staging" "$HOME/.ssh/known_hosts"
+      - name: Transfer and deploy exact image
+        env:
+          SSH_HOST: ${{ secrets.NVS_STAGING_SSH_HOST }}
+          SSH_USER: ${{ secrets.NVS_STAGING_SSH_USER }}
+          DEPLOY_PATH: ${{ vars.NVS_STAGING_DEPLOY_PATH || '/opt/nvs' }}
+          HOST_PORT: ${{ vars.NVS_STAGING_HOST_PORT || '4100' }}
+          HEALTH_URL: ${{ vars.NVS_STAGING_HEALTH_URL }}
+          BUILD_SHA: ${{ steps.source.outputs.sha }}
+          BUILD_TIMESTAMP: ${{ steps.source.outputs.timestamp }}
+          RELEASE_VERSION: ${{ steps.source.outputs.version }}
+          ARCHIVE: ${{ steps.image.outputs.archive }}
+        run: |
+          set -euo pipefail
+          ssh_options=(
+            -i "$HOME/.ssh/id_nvs_staging"
+            -o BatchMode=yes
+            -o IdentitiesOnly=yes
+            -o StrictHostKeyChecking=yes
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts"
+          )
+          remote="${SSH_USER}@${SSH_HOST}"
+          release_path="${DEPLOY_PATH}/releases/${BUILD_SHA}"
+          ssh "${ssh_options[@]}" "$remote" \
+            "install -d -m 0750 '$release_path' '$DEPLOY_PATH/ops'"
+          scp "${ssh_options[@]}" \
+            "$ARCHIVE" docker-compose.staging.yml ops/deploy-staging.sh \
+            ops/rollback-staging.sh ops/verify-deployment.sh \
+            "${remote}:${release_path}/"
+          ssh "${ssh_options[@]}" "$remote" \
+            "install -m 0644 '$release_path/docker-compose.staging.yml' '$DEPLOY_PATH/docker-compose.staging.yml' && install -m 0750 '$release_path/deploy-staging.sh' '$DEPLOY_PATH/ops/deploy-staging.sh' && install -m 0750 '$release_path/rollback-staging.sh' '$DEPLOY_PATH/ops/rollback-staging.sh' && install -m 0750 '$release_path/verify-deployment.sh' '$DEPLOY_PATH/ops/verify-deployment.sh'"
+          ssh "${ssh_options[@]}" "$remote" \
+            "NVS_DEPLOY_SHA='$BUILD_SHA' NVS_IMAGE_ARCHIVE='$release_path/$ARCHIVE' NVS_DEPLOY_PATH='$DEPLOY_PATH' NVS_HOST_PORT='$HOST_PORT' NVS_BUILD_TIMESTAMP='$BUILD_TIMESTAMP' NVS_RELEASE_VERSION='$RELEASE_VERSION' NVS_HEALTH_URL='$HEALTH_URL' '$DEPLOY_PATH/ops/deploy-staging.sh'"
+      - name: Record deployment metadata
+        env:
+          BUILD_SHA: ${{ steps.source.outputs.sha }}
+          ARCHIVE_DIGEST: ${{ steps.image.outputs.archive_digest }}
+        run: |
+          {
+            echo "## NVS staging deployment"
+            echo "- Build SHA: \`$BUILD_SHA\`"
+            echo "- Image archive SHA-256: \`$ARCHIVE_DIGEST\`"
+            echo "- Verification: liveness, readiness, and version SHA matched"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload safe deployment diagnostics
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: staging-browser-diagnostics
+          path: artifacts/playwright
+          if-no-files-found: ignore
+          retention-days: 7

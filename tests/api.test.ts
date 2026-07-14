@@ -18,6 +18,7 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 let app: ReturnType<typeof buildApp>;
+let core: NvsCore;
 let temporaryRoot: string;
 const repositoryRoot = process.cwd();
 
@@ -36,7 +37,7 @@ beforeEach(async () => {
     .mockResolvedValueOnce(new Response(JSON.stringify({ status: 'ok' }), { status: 200 }))
     .mockResolvedValueOnce(new Response(null, { status: 404 }))
     .mockResolvedValueOnce(new Response(null, { status: 404 }));
-  const core = new NvsCore(
+  core = new NvsCore(
     new FilesystemEnvironmentRepository(path.join(repositoryRoot, 'environments')),
     new FilesystemScenarioRepository(path.join(repositoryRoot, 'scenarios')),
     new FilesystemRunBundleRepository(temporaryRoot),
@@ -252,6 +253,40 @@ describe('versioned control-plane API', () => {
     const missingApi = await app.inject({ method: 'GET', url: '/api/not-real' });
     expect(missingApi.statusCode).toBe(404);
     expect(missingApi.json().error.code).toBe('NOT_FOUND');
+  });
+
+  it('returns typed 503 BLOCKED readiness for unusable configuration', async () => {
+    const emptyConfig = path.join(temporaryRoot, 'empty-config');
+    await Promise.all(
+      ['actors', 'environments', 'scenarios'].map((directory) =>
+        mkdir(path.join(emptyConfig, directory), { recursive: true }),
+      ),
+    );
+    const blockedApp = buildApp({
+      core,
+      runtimePaths: {
+        configDir: emptyConfig,
+        dataDir: temporaryRoot,
+        webDir: path.join(temporaryRoot, 'web'),
+      },
+      logger: false,
+    });
+    try {
+      const response = await blockedApp.inject({ method: 'GET', url: '/api/health/ready' });
+      expect(response.statusCode).toBe(503);
+      expect(response.json()).toMatchObject({
+        schemaVersion: 'nvs.readiness/v1',
+        status: 'blocked',
+        checks: { configuration: 'blocked', storage: 'ok' },
+        error: {
+          category: 'ENVIRONMENT',
+          code: 'LOCAL_CONFIGURATION_INVALID',
+          retryable: false,
+        },
+      });
+    } finally {
+      await blockedApp.close();
+    }
   });
 
   it('rejects unknown fields with a safe consistent error envelope', async () => {

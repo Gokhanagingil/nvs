@@ -156,11 +156,15 @@ const ACTOR_PERSONA_ORDER: ActorPersona[] = [
   'cross-tenant-agent',
 ];
 
+interface ActorConfiguration {
+  mappings: Array<{ file: string; value: EnvironmentActorMapV1 }>;
+  profiles: ActorProfileV1[];
+}
+
 export class FilesystemActorProfileRepository implements ActorProfileRepository {
   constructor(private readonly root: string) {}
 
-  async getForEnvironment(environmentId: string): Promise<ActorProfileSet> {
-    assertSafeId(environmentId);
+  private async loadConfiguration(): Promise<ActorConfiguration> {
     const mappingRoot = safeChild(this.root, 'mappings');
     const profileRoot = safeChild(this.root, 'profiles');
     const mappings: Array<{ file: string; value: EnvironmentActorMapV1 }> = [];
@@ -171,10 +175,6 @@ export class FilesystemActorProfileRepository implements ActorProfileRepository 
         throw new StorageCorruptionError('Actor mapping', file);
       }
     }
-    const mappingEntry = mappings.find(({ value }) => value.environmentId === environmentId);
-    if (!mappingEntry) {
-      throw new Error(`Actor mapping for environment "${environmentId}" was not found.`);
-    }
 
     const profiles: ActorProfileV1[] = [];
     for (const file of await yamlFiles(profileRoot, false)) {
@@ -184,6 +184,19 @@ export class FilesystemActorProfileRepository implements ActorProfileRepository 
         throw new StorageCorruptionError('Actor profile', file);
       }
     }
+    if (new Set(mappings.map(({ value }) => value.environmentId)).size !== mappings.length) {
+      throw new StorageCorruptionError('Actor mapping', mappingRoot);
+    }
+    if (new Set(profiles.map((profile) => profile.id)).size !== profiles.length) {
+      throw new StorageCorruptionError('Actor profile', profileRoot);
+    }
+    return { mappings, profiles };
+  }
+
+  private profilesForMapping(
+    mappingEntry: { file: string; value: EnvironmentActorMapV1 },
+    profiles: ActorProfileV1[],
+  ): ActorProfileV1[] {
     const profilesById = new Map(profiles.map((profile) => [profile.id, profile]));
     const orderedProfiles = ACTOR_PERSONA_ORDER.map((persona) => {
       const profileId = mappingEntry.value.actors[persona];
@@ -200,6 +213,42 @@ export class FilesystemActorProfileRepository implements ActorProfileRepository 
     if (new Set(orderedProfiles.map((profile) => profile.id)).size !== orderedProfiles.length) {
       throw new StorageCorruptionError('Actor mapping', mappingEntry.file);
     }
+
+    return orderedProfiles;
+  }
+
+  async validateConfiguration(
+    knownEnvironmentIds: readonly string[],
+    requiredEnvironmentIds: readonly string[],
+  ): Promise<void> {
+    const { mappings, profiles } = await this.loadConfiguration();
+    const knownIds = new Set(knownEnvironmentIds);
+    for (const mapping of mappings) {
+      if (!knownIds.has(mapping.value.environmentId)) {
+        throw new StorageCorruptionError('Actor mapping', mapping.file);
+      }
+      this.profilesForMapping(mapping, profiles);
+    }
+    const mappedEnvironmentIds = new Set(mappings.map(({ value }) => value.environmentId));
+    for (const environmentId of requiredEnvironmentIds) {
+      assertSafeId(environmentId);
+      if (!mappedEnvironmentIds.has(environmentId)) {
+        throw new StorageCorruptionError(
+          'Actor mapping',
+          safeChild(this.root, 'mappings', `${environmentId}.yaml`),
+        );
+      }
+    }
+  }
+
+  async getForEnvironment(environmentId: string): Promise<ActorProfileSet> {
+    assertSafeId(environmentId);
+    const { mappings, profiles } = await this.loadConfiguration();
+    const mappingEntry = mappings.find(({ value }) => value.environmentId === environmentId);
+    if (!mappingEntry) {
+      throw new Error(`Actor mapping for environment "${environmentId}" was not found.`);
+    }
+    const orderedProfiles = this.profilesForMapping(mappingEntry, profiles);
 
     return {
       mapping: mappingEntry.value,

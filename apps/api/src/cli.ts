@@ -1,5 +1,6 @@
 import path from 'node:path';
 import { createCore } from './app.js';
+import { checkLocalReadiness, resolveRuntimePaths } from './operations.js';
 
 function option(name: string, fallback: string): string {
   const index = process.argv.indexOf(`--${name}`);
@@ -8,17 +9,24 @@ function option(name: string, fallback: string): string {
 }
 
 const rootDir = process.cwd();
-const core = createCore(rootDir);
 const command = process.argv[2] ?? 'compile-run';
 
 try {
-  if (command === 'probe') {
+  if (command === 'ready-check') {
+    const readiness = await checkLocalReadiness(resolveRuntimePaths(rootDir));
+    process.stdout.write(`${JSON.stringify(readiness, null, 2)}\n`);
+    if (readiness.status !== 'ready') {
+      process.exitCode = 2;
+    }
+  } else if (command === 'probe') {
+    const core = createCore(rootDir);
     const result = await core.probeEnvironment(option('environment', 'local-example'));
     process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
     if (result.verdict === 'BLOCKED') {
       process.exitCode = 2;
     }
   } else if (command === 'compile-run') {
+    const core = createCore(rootDir);
     const run = await core.createCompileOnlyRun({
       runId: option('run-id', 'example-compile-only'),
       environmentId: option('environment', 'local-example'),

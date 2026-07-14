@@ -1,6 +1,11 @@
 import { constants } from 'node:fs';
 import { access, mkdir, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import {
+  FilesystemActorProfileRepository,
+  FilesystemEnvironmentRepository,
+  FilesystemScenarioRepository,
+} from '@nvs/storage-filesystem';
 
 export const NVS_OPERATIONAL_CONTRACT_VERSION = 'nvs.operational/v1';
 
@@ -17,6 +22,25 @@ export interface BuildInformation {
   releaseVersion: string;
   nodeVersion: string;
   contractVersion: string;
+}
+
+type ReadinessCheck = 'ok' | 'blocked';
+type ReadinessErrorCode =
+  'LOCAL_CONFIGURATION_UNAVAILABLE' | 'LOCAL_CONFIGURATION_INVALID' | 'LOCAL_STORAGE_UNAVAILABLE';
+
+export interface ReadinessResult {
+  schemaVersion: 'nvs.readiness/v1';
+  status: 'ready' | 'blocked';
+  checks: {
+    configuration: ReadinessCheck;
+    storage: ReadinessCheck;
+  };
+  error?: {
+    category: 'ENVIRONMENT';
+    code: ReadinessErrorCode;
+    message: string;
+    retryable: boolean;
+  };
 }
 
 export function resolveRuntimePaths(rootDir: string): RuntimePaths {
@@ -46,40 +70,74 @@ export function buildInformation(): BuildInformation {
   };
 }
 
-export async function checkLocalReadiness(paths: RuntimePaths): Promise<{
-  schemaVersion: 'nvs.readiness/v1';
-  status: 'ready' | 'blocked';
-  checks: {
-    configuration: 'ok' | 'blocked';
-    storage: 'ok' | 'blocked';
+function blockedReadiness(
+  code: ReadinessErrorCode,
+  configuration: ReadinessCheck,
+  storage: ReadinessCheck,
+): ReadinessResult {
+  const message =
+    code === 'LOCAL_STORAGE_UNAVAILABLE'
+      ? 'Required local NVS storage is unavailable.'
+      : code === 'LOCAL_CONFIGURATION_INVALID'
+        ? 'Required local NVS configuration is invalid or incomplete.'
+        : 'Required local NVS configuration is unavailable.';
+  return {
+    schemaVersion: 'nvs.readiness/v1',
+    status: 'blocked',
+    checks: { configuration, storage },
+    error: {
+      category: 'ENVIRONMENT',
+      code,
+      message,
+      retryable: false,
+    },
   };
-  error?: {
-    category: 'ENVIRONMENT';
-    code: 'LOCAL_CONFIGURATION_UNAVAILABLE' | 'LOCAL_STORAGE_UNAVAILABLE';
-    message: string;
-    retryable: boolean;
-  };
-}> {
+}
+
+async function configurationError(paths: RuntimePaths): Promise<ReadinessErrorCode | undefined> {
+  const actorsRoot = path.join(paths.configDir, 'actors');
+  const environmentsRoot = path.join(paths.configDir, 'environments');
+  const scenariosRoot = path.join(paths.configDir, 'scenarios');
   try {
     await Promise.all([
-      access(path.join(paths.configDir, 'actors'), constants.R_OK),
-      access(path.join(paths.configDir, 'environments'), constants.R_OK),
-      access(path.join(paths.configDir, 'scenarios'), constants.R_OK),
+      access(actorsRoot, constants.R_OK),
+      access(environmentsRoot, constants.R_OK),
+      access(scenariosRoot, constants.R_OK),
     ]);
   } catch {
-    return {
-      schemaVersion: 'nvs.readiness/v1',
-      status: 'blocked',
-      checks: { configuration: 'blocked', storage: 'blocked' },
-      error: {
-        category: 'ENVIRONMENT',
-        code: 'LOCAL_CONFIGURATION_UNAVAILABLE',
-        message: 'Required local NVS configuration is unavailable.',
-        retryable: false,
-      },
-    };
+    return 'LOCAL_CONFIGURATION_UNAVAILABLE';
   }
 
+  try {
+    const environmentRepository = new FilesystemEnvironmentRepository(environmentsRoot);
+    const scenarioRepository = new FilesystemScenarioRepository(scenariosRoot);
+    const actorRepository = new FilesystemActorProfileRepository(actorsRoot);
+    const [environments, scenarios] = await Promise.all([
+      environmentRepository.list(),
+      scenarioRepository.list(),
+    ]);
+    if (environments.length === 0 || scenarios.length === 0) {
+      return 'LOCAL_CONFIGURATION_INVALID';
+    }
+    if (new Set(environments.map(({ id }) => id)).size !== environments.length) {
+      return 'LOCAL_CONFIGURATION_INVALID';
+    }
+    if (new Set(scenarios.map(({ id }) => id)).size !== scenarios.length) {
+      return 'LOCAL_CONFIGURATION_INVALID';
+    }
+    await actorRepository.validateConfiguration(
+      environments.map(({ id }) => id),
+      environments
+        .filter(({ enabled, kind }) => enabled && kind !== 'production')
+        .map(({ id }) => id),
+    );
+  } catch {
+    return 'LOCAL_CONFIGURATION_INVALID';
+  }
+  return undefined;
+}
+
+async function storageIsWritable(paths: RuntimePaths): Promise<boolean> {
   const readinessFile = path.join(paths.dataDir, `.nvs-readiness-${process.pid}`);
   try {
     await mkdir(paths.dataDir, { recursive: true });
@@ -88,19 +146,22 @@ export async function checkLocalReadiness(paths: RuntimePaths): Promise<{
     await rm(readinessFile, { force: true });
   } catch {
     await rm(readinessFile, { force: true }).catch(() => undefined);
-    return {
-      schemaVersion: 'nvs.readiness/v1',
-      status: 'blocked',
-      checks: { configuration: 'ok', storage: 'blocked' },
-      error: {
-        category: 'ENVIRONMENT',
-        code: 'LOCAL_STORAGE_UNAVAILABLE',
-        message: 'Required local NVS storage is unavailable.',
-        retryable: false,
-      },
-    };
+    return false;
   }
+  return true;
+}
 
+export async function checkLocalReadiness(paths: RuntimePaths): Promise<ReadinessResult> {
+  const [configError, storageWritable] = await Promise.all([
+    configurationError(paths),
+    storageIsWritable(paths),
+  ]);
+  if (configError) {
+    return blockedReadiness(configError, 'blocked', storageWritable ? 'ok' : 'blocked');
+  }
+  if (!storageWritable) {
+    return blockedReadiness('LOCAL_STORAGE_UNAVAILABLE', 'ok', 'blocked');
+  }
   return {
     schemaVersion: 'nvs.readiness/v1',
     status: 'ready',

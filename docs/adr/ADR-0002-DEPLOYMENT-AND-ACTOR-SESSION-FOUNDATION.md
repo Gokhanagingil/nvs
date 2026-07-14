@@ -1,7 +1,7 @@
 # ADR-0002 — Deployment and Actor Session Foundation
 
-> **Status:** Accepted for M1-02A  
-> **Date:** 2026-07-14  
+> **Status:** Accepted for M1-02A
+> **Date:** 2026-07-14
 > **Scope:** Deployable NVS runtime and authentication readiness only
 
 ## Context

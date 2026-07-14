@@ -4,6 +4,9 @@ import type { IncomingMessage } from 'node:http';
 const port = Number(process.env['NVS_MOCK_NILES_PORT'] ?? '4310');
 const host = '127.0.0.1';
 const primaryTenant = '11111111-1111-4111-8111-111111111111';
+const requesterUserId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+const serviceDeskUserId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+const crossTenantUserId = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
 
 async function requestBody(request: IncomingMessage): Promise<string> {
   const chunks: Buffer[] = [];
@@ -41,7 +44,7 @@ const server = createServer(async (request, response) => {
     response.end(
       JSON.stringify({
         accessToken: 'mock-requester-token',
-        user: { id: 'mock-requester-id', tenantId: primaryTenant },
+        user: { id: requesterUserId, tenantId: primaryTenant },
       }),
     );
     return;
@@ -53,7 +56,7 @@ const server = createServer(async (request, response) => {
         success: true,
         data: {
           accessToken: 'mock-service-desk-token',
-          user: { id: 'mock-service-desk-id', tenantId: primaryTenant },
+          user: { id: serviceDeskUserId, tenantId: primaryTenant },
         },
       }),
     );
@@ -74,7 +77,7 @@ const server = createServer(async (request, response) => {
     response.end(
       JSON.stringify({
         accessToken: 'mock-cross-tenant-token',
-        user: { id: 'mock-cross-tenant-id', tenantId: primaryTenant },
+        user: { id: crossTenantUserId, tenantId: primaryTenant },
       }),
     );
     return;

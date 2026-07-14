@@ -539,10 +539,10 @@ export class NilesAuthenticationAdapter implements ActorAuthenticator {
     const user = asRecord(payload['user']);
     const userId =
       typeof user?.['id'] === 'string' && user['id'].trim() ? user['id'].trim() : undefined;
-    if (!userId || userId.length > 160) {
+    if (!userId || !UUID_PATTERN.test(userId)) {
       throw new AuthenticationBlockedError(
-        'USER_IDENTITY_MISSING',
-        'NILES login succeeded without a usable user identity.',
+        'LOGIN_RESPONSE_MALFORMED',
+        'NILES returned an invalid login response.',
         false,
       );
     }

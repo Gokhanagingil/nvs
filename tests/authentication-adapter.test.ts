@@ -7,6 +7,8 @@ import {
 import { describe, expect, it, vi } from 'vitest';
 
 const tenantId = '11111111-1111-4111-8111-111111111111';
+const requesterUserId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+const agentUserId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
 const environment: EnvironmentDefinitionV1 = {
   schemaVersion: 'nvs.environment/v1',
   id: 'auth-test',
@@ -48,7 +50,7 @@ describe('authenticated NILES adapter', () => {
       const result = {
         accessToken: body.email.startsWith('requester') ? 'token-requester' : 'token-agent',
         user: {
-          id: body.email.startsWith('requester') ? 'user-requester' : 'user-agent',
+          id: body.email.startsWith('requester') ? requesterUserId : agentUserId,
           tenantId,
         },
       };
@@ -87,6 +89,8 @@ describe('authenticated NILES adapter', () => {
     });
 
     expect(requesterSession).not.toBe(agentSession);
+    expect(requesterSession.userId).toBe(requesterUserId);
+    expect(agentSession.userId).toBe(agentUserId);
     await expect(requesterSession.withAuthorization(async (value) => value)).resolves.toBe(
       'Bearer token-requester',
     );
@@ -127,13 +131,24 @@ describe('authenticated NILES adapter', () => {
     ],
     [
       'missing access token',
-      new Response(JSON.stringify({ user: { id: 'user-id', tenantId } }), { status: 200 }),
+      new Response(JSON.stringify({ user: { id: requesterUserId, tenantId } }), { status: 200 }),
       'ACCESS_TOKEN_MISSING',
     ],
     [
       'missing user identity',
       new Response(JSON.stringify({ accessToken: 'confidential-access-token' }), { status: 200 }),
-      'USER_IDENTITY_MISSING',
+      'LOGIN_RESPONSE_MALFORMED',
+    ],
+    [
+      'non-UUID user identity',
+      new Response(
+        JSON.stringify({
+          accessToken: 'confidential-access-token',
+          user: { id: 'not-a-uuid', tenantId },
+        }),
+        { status: 200 },
+      ),
+      'LOGIN_RESPONSE_MALFORMED',
     ],
   ])('classifies %s as typed BLOCKED behavior', async (_name, response, code) => {
     const fetchMock = vi.fn<FetchImplementation>().mockResolvedValue(response);
@@ -156,7 +171,7 @@ describe('authenticated NILES adapter', () => {
           correlationId: 'auth_failure_repeat',
         })
         .catch((error: unknown) => JSON.stringify(error)),
-    ).resolves.not.toMatch(/confidential|synthetic-test-value|actor@example/i);
+    ).resolves.not.toMatch(/confidential|synthetic-test-value|actor@example|not-a-uuid/i);
     actorCredential.destroy();
   });
 

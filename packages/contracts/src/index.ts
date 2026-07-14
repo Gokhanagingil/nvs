@@ -548,7 +548,7 @@ export const actorReadinessV1Schema = z
     authenticationState: actorAuthenticationStateSchema,
     expectedTenantId: z.uuid().optional(),
     observedTenantId: z.uuid().optional(),
-    userId: z.string().min(1).max(160).optional(),
+    userId: z.uuid().optional(),
     durationMs: z.number().int().nonnegative().optional(),
     correlationId: safeIdSchema.optional(),
     timestamp: z.iso.datetime({ offset: true }).optional(),

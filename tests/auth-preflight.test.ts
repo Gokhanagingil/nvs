@@ -29,6 +29,13 @@ const personas: ActorPersona[] = [
   'tenant-admin',
   'cross-tenant-agent',
 ];
+const personaUserIds: Record<ActorPersona, string> = {
+  requester: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+  'service-desk-agent': 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+  'incident-manager': 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+  'tenant-admin': 'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
+  'cross-tenant-agent': 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee',
+};
 
 function environment(kind: EnvironmentDefinitionV1['kind'] = 'test'): EnvironmentDefinitionV1 {
   return {
@@ -136,7 +143,7 @@ function buildCore(input: {
       async authenticate({ profile, correlationId }) {
         const session = new NilesActorSession(
           profile.id,
-          `user-${profile.persona}`,
+          personaUserIds[profile.persona],
           profile.tenantId,
           correlationId,
           `token-${profile.id}`,

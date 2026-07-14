@@ -1,10 +1,11 @@
 import { createServer } from 'node:http';
+import type { IncomingMessage } from 'node:http';
 
 const port = Number(process.env['NVS_MOCK_NILES_PORT'] ?? '4310');
 const host = '127.0.0.1';
 const primaryTenant = '11111111-1111-4111-8111-111111111111';
 
-async function requestBody(request: import('node:http').IncomingMessage): Promise<string> {
+async function requestBody(request: IncomingMessage): Promise<string> {
   const chunks: Buffer[] = [];
   for await (const chunk of request) {
     chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));

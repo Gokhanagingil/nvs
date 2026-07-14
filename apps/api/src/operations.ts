@@ -62,6 +62,7 @@ export async function checkLocalReadiness(paths: RuntimePaths): Promise<{
 }> {
   try {
     await Promise.all([
+      access(path.join(paths.configDir, 'actors'), constants.R_OK),
       access(path.join(paths.configDir, 'environments'), constants.R_OK),
       access(path.join(paths.configDir, 'scenarios'), constants.R_OK),
     ]);

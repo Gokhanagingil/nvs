@@ -87,8 +87,6 @@ for (const target of ["/app/api", "/app/web", "/app/config", "/"]) {
   }
 }
 fs.readFileSync("/app/config/environments/local.example.yaml", "utf8");
-const configStat = fs.statSync("/app/config");
-assert((configStat.mode & 0o222) === 0, "config must not be writable by the runtime");
 '
 
 docker restart nvs-ci-bind

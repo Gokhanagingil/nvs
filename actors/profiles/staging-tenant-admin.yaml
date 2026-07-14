@@ -1,0 +1,15 @@
+schemaVersion: nvs.actor-profile/v1
+id: staging-tenant-admin
+displayName: Staging synthetic tenant administrator
+persona: tenant-admin
+environmentId: staging-example
+tenantId: 33333333-3333-4333-8333-333333333333
+credentialRef: niles.staging.tenant-admin
+expectedDomains: [itsm]
+expectedRoles: [tenant-admin]
+capabilityNotes:
+  - Bind only an approved least-privilege synthetic staging identity.
+enabled: true
+mfa: NOT_EXPECTED
+provenance:
+  source: Sanitized M1-02A example profile.

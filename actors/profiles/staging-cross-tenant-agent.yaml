@@ -1,0 +1,15 @@
+schemaVersion: nvs.actor-profile/v1
+id: staging-cross-tenant-agent
+displayName: Staging synthetic cross-tenant agent
+persona: cross-tenant-agent
+environmentId: staging-example
+tenantId: 44444444-4444-4444-8444-444444444444
+credentialRef: niles.staging.cross-tenant-agent
+expectedDomains: [itsm]
+expectedRoles: [service-desk-agent]
+capabilityNotes:
+  - Bind only an approved synthetic identity from a different test tenant.
+enabled: true
+mfa: NOT_EXPECTED
+provenance:
+  source: Sanitized M1-02A example profile.

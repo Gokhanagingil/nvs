@@ -39,3 +39,44 @@ test('reviews the payment narrative and inspects compile-only evidence', async (
   await expect(page.getByText(/runs\/.+\/run\.json/)).toBeVisible();
   await expect(page.getByText(/runs\/.+\/plan\.json/)).toBeVisible();
 });
+
+test('runs safe multi-actor authentication preflight and denies production', async ({ page }) => {
+  await page.goto('/environments');
+
+  await expect(page.getByRole('heading', { name: 'Environments' })).toBeVisible();
+  await expect(page.getByText(/0\.1\.0 · unknown SHA/i)).toBeVisible();
+
+  const localEnvironment = page
+    .getByRole('article')
+    .filter({ has: page.getByRole('heading', { name: 'Sanitized local NILES example' }) });
+  await expect(localEnvironment.getByText('5/5 configured')).toBeVisible();
+  await expect(localEnvironment.getByText(/creates no Incident records/i)).toBeVisible();
+  await localEnvironment.getByRole('button', { name: 'Run authentication preflight' }).click();
+
+  await expect(
+    localEnvironment.getByText('Authentication readiness only · not release-gate eligible'),
+  ).toBeVisible();
+  await expect(localEnvironment.getByText('AUTHENTICATED', { exact: true })).toHaveCount(2);
+  await expect(localEnvironment.getByText('MFA_REQUIRED')).toBeVisible();
+  await expect(localEnvironment.getByText('LOGIN_RESPONSE_MALFORMED')).toBeVisible();
+  await expect(localEnvironment.getByText('TENANT_MISMATCH')).toBeVisible();
+  await expect(localEnvironment.getByText('gateEligible: false')).toBeVisible();
+
+  const renderedText = await page.locator('body').innerText();
+  expect(renderedText).not.toMatch(
+    /mock-requester-token|mock-service-desk-token|mock-mfa-token|synthetic-e2e-value|@example\.invalid/i,
+  );
+
+  const productionEnvironment = page
+    .getByRole('article')
+    .filter({ has: page.getByRole('heading', { name: 'Sanitized production NILES example' }) });
+  await expect(
+    productionEnvironment.getByText(
+      'Authentication preflight is forbidden for production environments.',
+      { exact: false },
+    ),
+  ).toBeVisible();
+  await expect(
+    productionEnvironment.getByRole('button', { name: 'Run authentication preflight' }),
+  ).toBeDisabled();
+});

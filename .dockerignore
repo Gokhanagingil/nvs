@@ -1,0 +1,17 @@
+.git
+.github
+.cursor
+node_modules
+**/node_modules
+**/dist
+artifacts
+playwright-report
+test-results
+coverage
+.pnpm-store
+.env
+.env.*
+!.env.example
+*.local.yaml
+*.log
+docs/assets/*.png

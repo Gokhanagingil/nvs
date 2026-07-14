@@ -2,20 +2,29 @@ import { mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promise
 import path from 'node:path';
 import {
   SAFE_ID_PATTERN,
+  actorProfileV1Schema,
   businessBlueprintV1Schema,
   environmentDefinitionV1Schema,
+  environmentActorMapV1Schema,
   evidenceManifestV1Schema,
   executablePlanV1Schema,
+  parseActorProfile,
   parseBusinessBlueprint,
   parseEnvironmentDefinition,
+  parseEnvironmentActorMap,
   runRecordV1Schema,
+  type ActorPersona,
+  type ActorProfileV1,
   type BusinessBlueprintV1,
   type EnvironmentDefinitionV1,
+  type EnvironmentActorMapV1,
   type EvidenceManifestV1,
   type ExecutablePlanV1,
   type RunRecordV1,
 } from '@nvs/contracts';
 import type {
+  ActorProfileRepository,
+  ActorProfileSet,
   EnvironmentRepository,
   RunBundle,
   RunBundleRepository,
@@ -136,6 +145,115 @@ export class FilesystemScenarioRepository implements ScenarioRepository {
   async get(id: string): Promise<BusinessBlueprintV1 | undefined> {
     assertSafeId(id);
     return (await this.list()).find((scenario) => scenario.id === id);
+  }
+}
+
+const ACTOR_PERSONA_ORDER: ActorPersona[] = [
+  'requester',
+  'service-desk-agent',
+  'incident-manager',
+  'tenant-admin',
+  'cross-tenant-agent',
+];
+
+interface ActorConfiguration {
+  mappings: Array<{ file: string; value: EnvironmentActorMapV1 }>;
+  profiles: ActorProfileV1[];
+}
+
+export class FilesystemActorProfileRepository implements ActorProfileRepository {
+  constructor(private readonly root: string) {}
+
+  private async loadConfiguration(): Promise<ActorConfiguration> {
+    const mappingRoot = safeChild(this.root, 'mappings');
+    const profileRoot = safeChild(this.root, 'profiles');
+    const mappings: Array<{ file: string; value: EnvironmentActorMapV1 }> = [];
+    for (const file of await yamlFiles(mappingRoot, false)) {
+      try {
+        mappings.push({ file, value: parseEnvironmentActorMap(await readYaml(file)) });
+      } catch {
+        throw new StorageCorruptionError('Actor mapping', file);
+      }
+    }
+
+    const profiles: ActorProfileV1[] = [];
+    for (const file of await yamlFiles(profileRoot, false)) {
+      try {
+        profiles.push(parseActorProfile(await readYaml(file)));
+      } catch {
+        throw new StorageCorruptionError('Actor profile', file);
+      }
+    }
+    if (new Set(mappings.map(({ value }) => value.environmentId)).size !== mappings.length) {
+      throw new StorageCorruptionError('Actor mapping', mappingRoot);
+    }
+    if (new Set(profiles.map((profile) => profile.id)).size !== profiles.length) {
+      throw new StorageCorruptionError('Actor profile', profileRoot);
+    }
+    return { mappings, profiles };
+  }
+
+  private profilesForMapping(
+    mappingEntry: { file: string; value: EnvironmentActorMapV1 },
+    profiles: ActorProfileV1[],
+  ): ActorProfileV1[] {
+    const profilesById = new Map(profiles.map((profile) => [profile.id, profile]));
+    const orderedProfiles = ACTOR_PERSONA_ORDER.map((persona) => {
+      const profileId = mappingEntry.value.actors[persona];
+      const profile = profilesById.get(profileId);
+      if (
+        !profile ||
+        profile.persona !== persona ||
+        profile.environmentId !== mappingEntry.value.environmentId
+      ) {
+        throw new StorageCorruptionError('Actor mapping', mappingEntry.file);
+      }
+      return profile;
+    });
+    if (new Set(orderedProfiles.map((profile) => profile.id)).size !== orderedProfiles.length) {
+      throw new StorageCorruptionError('Actor mapping', mappingEntry.file);
+    }
+
+    return orderedProfiles;
+  }
+
+  async validateConfiguration(
+    knownEnvironmentIds: readonly string[],
+    requiredEnvironmentIds: readonly string[],
+  ): Promise<void> {
+    const { mappings, profiles } = await this.loadConfiguration();
+    const knownIds = new Set(knownEnvironmentIds);
+    for (const mapping of mappings) {
+      if (!knownIds.has(mapping.value.environmentId)) {
+        throw new StorageCorruptionError('Actor mapping', mapping.file);
+      }
+      this.profilesForMapping(mapping, profiles);
+    }
+    const mappedEnvironmentIds = new Set(mappings.map(({ value }) => value.environmentId));
+    for (const environmentId of requiredEnvironmentIds) {
+      assertSafeId(environmentId);
+      if (!mappedEnvironmentIds.has(environmentId)) {
+        throw new StorageCorruptionError(
+          'Actor mapping',
+          safeChild(this.root, 'mappings', `${environmentId}.yaml`),
+        );
+      }
+    }
+  }
+
+  async getForEnvironment(environmentId: string): Promise<ActorProfileSet> {
+    assertSafeId(environmentId);
+    const { mappings, profiles } = await this.loadConfiguration();
+    const mappingEntry = mappings.find(({ value }) => value.environmentId === environmentId);
+    if (!mappingEntry) {
+      throw new Error(`Actor mapping for environment "${environmentId}" was not found.`);
+    }
+    const orderedProfiles = this.profilesForMapping(mappingEntry, profiles);
+
+    return {
+      mapping: mappingEntry.value,
+      profiles: orderedProfiles,
+    };
   }
 }
 
@@ -420,6 +538,8 @@ export class FilesystemRunBundleRepository implements RunBundleRepository {
 }
 
 export const storageSchemas = {
+  actorProfile: actorProfileV1Schema,
+  environmentActorMap: environmentActorMapV1Schema,
   environment: environmentDefinitionV1Schema,
   scenario: businessBlueprintV1Schema,
 };

@@ -1,0 +1,15 @@
+schemaVersion: nvs.actor-profile/v1
+id: local-tenant-admin
+displayName: Local synthetic tenant administrator
+persona: tenant-admin
+environmentId: local-example
+tenantId: 11111111-1111-4111-8111-111111111111
+credentialRef: niles.local.tenant-admin
+expectedDomains: [itsm]
+expectedRoles: [tenant-admin]
+capabilityNotes:
+  - Dedicated synthetic identity; least privilege remains required.
+enabled: true
+mfa: NOT_EXPECTED
+provenance:
+  source: Sanitized M1-02A example profile.

@@ -5,18 +5,59 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   foundation:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa
         with:
           version: 11.13.0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: 24.18.0
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm exec playwright install --with-deps chromium
       - run: pnpm run ci
+      - name: Validate deployment shell
+        run: bash -n ops/*.sh ops/ci/*.sh
+      - name: Build exact production image
+        env:
+          BUILD_SHA: ${{ github.sha }}
+        run: |
+          docker build \
+            --build-arg "NVS_BUILD_SHA=${BUILD_SHA}" \
+            --build-arg "NVS_BUILD_TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --build-arg "NVS_RELEASE_VERSION=0.1.0" \
+            --tag "nvs:${BUILD_SHA}" \
+            .
+      - name: Prove bind mounts, read-only root, and ownership readiness
+        env:
+          BUILD_SHA: ${{ github.sha }}
+        run: bash ops/ci/proof-container-hardening.sh "$BUILD_SHA"
+      - name: Prove deploy rollback, same-SHA reference, and archive checksum
+        env:
+          BUILD_SHA: ${{ github.sha }}
+        run: bash ops/ci/proof-deploy-rollback.sh "$BUILD_SHA"
+      - name: Upload browser diagnostics
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: playwright-diagnostics
+          path: |
+            artifacts/playwright
+            playwright-report
+            test-results
+          if-no-files-found: ignore
+          retention-days: 7

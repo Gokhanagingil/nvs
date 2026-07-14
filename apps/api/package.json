@@ -9,10 +9,12 @@
     "build": "tsup --config tsup.config.ts"
   },
   "dependencies": {
+    "@fastify/static": "10.1.0",
     "@nvs/adapter-niles": "workspace:*",
     "@nvs/contracts": "workspace:*",
     "@nvs/core": "workspace:*",
     "@nvs/domain": "workspace:*",
+    "@nvs/secret-provider-environment": "workspace:*",
     "@nvs/storage-filesystem": "workspace:*",
     "fastify": "5.10.0",
     "yaml": "2.9.0",

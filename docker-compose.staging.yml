@@ -1,0 +1,42 @@
+name: nvs
+
+services:
+  nvs:
+    image: ${NVS_IMAGE:?Set NVS_IMAGE to the exact loaded image tag}
+    container_name: nvs
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=64m,mode=1777
+    env_file:
+      - .env
+    environment:
+      NVS_API_HOST: 0.0.0.0
+      NVS_API_PORT: 4100
+      NVS_CONFIG_DIR: /app/config
+      NVS_DATA_DIR: /var/lib/nvs
+      NVS_WEB_DIR: /app/web
+      NVS_BUILD_SHA: ${NVS_BUILD_SHA:?Set NVS_BUILD_SHA to the deployed commit}
+      NVS_BUILD_TIMESTAMP: ${NVS_BUILD_TIMESTAMP:?Set NVS_BUILD_TIMESTAMP}
+      NVS_RELEASE_VERSION: ${NVS_RELEASE_VERSION:-0.1.0}
+    ports:
+      - 127.0.0.1:${NVS_HOST_PORT:-4100}:4100
+    volumes:
+      - ./config:/app/config:ro
+      - ./data:/var/lib/nvs
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'node',
+          '-e',
+          "fetch('http://127.0.0.1:4100/api/health/ready',{signal:AbortSignal.timeout(2000)}).then(async r=>{const b=await r.json();if(!r.ok||b.status!=='ready')process.exit(1)}).catch(()=>process.exit(1))",
+        ]
+      interval: 15s
+      timeout: 3s
+      start_period: 10s
+      retries: 4
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL

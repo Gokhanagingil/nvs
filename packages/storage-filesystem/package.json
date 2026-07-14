@@ -1,0 +1,13 @@
+{
+  "name": "@nvs/storage-filesystem",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": "./src/index.ts",
+  "dependencies": {
+    "@nvs/contracts": "workspace:*",
+    "@nvs/core": "workspace:*",
+    "@nvs/domain": "workspace:*",
+    "yaml": "2.9.0"
+  }
+}

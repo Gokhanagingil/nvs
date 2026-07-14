@@ -1,0 +1,1094 @@
+import { useEffect, useState } from 'react';
+import type { FormEvent } from 'react';
+import {
+  Link,
+  NavLink,
+  Navigate,
+  Route,
+  Routes,
+  useNavigate,
+  useParams,
+  useSearchParams,
+} from 'react-router-dom';
+import { ApiError, apiRequest, errorMessage } from './api.js';
+import type {
+  CoverageResult,
+  EnvironmentDefinition,
+  EvidenceManifest,
+  ExecutablePlan,
+  ProbeResult,
+  RunRecord,
+  Scenario,
+} from './types.js';
+
+type Loadable<T> =
+  | { status: 'loading' }
+  | { status: 'empty' }
+  | { status: 'error'; message: string; code?: string }
+  | { status: 'ready'; data: T };
+
+const navItems = [
+  { to: '/environments', label: 'Environments' },
+  { to: '/scenarios', label: 'Scenario Library' },
+  { to: '/runs', label: 'Run Center' },
+  { to: '/evidence', label: 'Evidence Explorer' },
+  { to: '/coverage', label: 'Coverage' },
+];
+
+function StatusBadge({ value }: { value: string }) {
+  return (
+    <span className={`status status-${value.toLowerCase().replaceAll('_', '-')}`}>{value}</span>
+  );
+}
+
+function ErrorPanel({ title = 'Unable to load', message }: { title?: string; message: string }) {
+  return (
+    <section className="state-panel state-error" role="alert">
+      <strong>{title}</strong>
+      <p>{message}</p>
+    </section>
+  );
+}
+
+function LoadingPanel({ label }: { label: string }) {
+  return (
+    <section className="state-panel" aria-live="polite" aria-busy="true">
+      <span className="spinner" aria-hidden="true" />
+      <p>{label}</p>
+    </section>
+  );
+}
+
+function EmptyPanel({ message }: { message: string }) {
+  return (
+    <section className="state-panel">
+      <strong>Nothing here yet</strong>
+      <p>{message}</p>
+    </section>
+  );
+}
+
+function PageHeader({
+  eyebrow,
+  title,
+  description,
+}: {
+  eyebrow: string;
+  title: string;
+  description: string;
+}) {
+  return (
+    <header className="page-header">
+      <p className="eyebrow">{eyebrow}</p>
+      <h1>{title}</h1>
+      <p>{description}</p>
+    </header>
+  );
+}
+
+function Shell() {
+  return (
+    <div className="app-shell">
+      <a className="skip-link" href="#main-content">
+        Skip to content
+      </a>
+      <header className="masthead">
+        <Link className="brand" to="/scenarios" aria-label="NVS console home">
+          <span className="brand-mark" aria-hidden="true">
+            NV
+          </span>
+          <span>
+            <strong>NVS</strong>
+            <small>Validation Console</small>
+          </span>
+        </Link>
+        <div className="scope-chip">
+          <span aria-hidden="true" />
+          Local control plane
+        </div>
+      </header>
+      <nav className="primary-nav" aria-label="Primary navigation">
+        {navItems.map((item) => (
+          <NavLink
+            key={item.to}
+            to={item.to}
+            className={({ isActive }) => (isActive ? 'active' : undefined)}
+          >
+            {item.label}
+          </NavLink>
+        ))}
+      </nav>
+      <main id="main-content">
+        <Routes>
+          <Route path="/" element={<Navigate replace to="/scenarios" />} />
+          <Route path="/environments" element={<EnvironmentsPage />} />
+          <Route path="/scenarios" element={<ScenarioLibraryPage />} />
+          <Route path="/scenarios/:scenarioId" element={<ScenarioLibraryPage />} />
+          <Route path="/runs" element={<RunCenterPage />} />
+          <Route path="/evidence" element={<EvidenceExplorerPage />} />
+          <Route path="/coverage" element={<CoveragePage />} />
+          <Route path="*" element={<NotFoundPage />} />
+        </Routes>
+      </main>
+      <footer>
+        M1-01 validates NVS compilation plumbing. It does not validate NILES runtime behavior.
+      </footer>
+    </div>
+  );
+}
+
+type ProbeState =
+  | { status: 'loading' }
+  | { status: 'error'; message: string; code?: string }
+  | { status: 'ready'; result: ProbeResult };
+
+function EnvironmentsPage() {
+  const [environments, setEnvironments] = useState<Loadable<EnvironmentDefinition[]>>({
+    status: 'loading',
+  });
+  const [probes, setProbes] = useState<Record<string, ProbeState | undefined>>({});
+
+  useEffect(() => {
+    void apiRequest<{ items: EnvironmentDefinition[] }>('/api/environments')
+      .then(({ items }) =>
+        setEnvironments(
+          items.length === 0 ? { status: 'empty' } : { status: 'ready', data: items },
+        ),
+      )
+      .catch((error: unknown) =>
+        setEnvironments({ status: 'error', message: errorMessage(error) }),
+      );
+  }, []);
+
+  const probe = async (environmentId: string) => {
+    setProbes((current) => ({ ...current, [environmentId]: { status: 'loading' } }));
+    try {
+      const result = await apiRequest<ProbeResult>(
+        `/api/environments/${encodeURIComponent(environmentId)}/probe`,
+        { method: 'POST', body: '{}' },
+      );
+      setProbes((current) => ({ ...current, [environmentId]: { status: 'ready', result } }));
+    } catch (error) {
+      setProbes((current) => ({
+        ...current,
+        [environmentId]: {
+          status: 'error',
+          message: errorMessage(error),
+          ...(error instanceof ApiError ? { code: error.code } : {}),
+        },
+      }));
+    }
+  };
+
+  return (
+    <>
+      <PageHeader
+        eyebrow="Target inventory"
+        title="Environments"
+        description="Review non-sensitive definitions. A read-only target probe is sent only when you explicitly request it."
+      />
+      {environments.status === 'loading' && (
+        <LoadingPanel label="Loading environment definitions…" />
+      )}
+      {environments.status === 'empty' && (
+        <EmptyPanel message="Add a versioned environment definition to make it available here." />
+      )}
+      {environments.status === 'error' && <ErrorPanel message={environments.message} />}
+      {environments.status === 'ready' && (
+        <div className="card-grid">
+          {environments.data.map((environment) => {
+            const probeState = probes[environment.id];
+            return (
+              <article className="card environment-card" key={environment.id}>
+                <header className="card-heading">
+                  <div>
+                    <p className="eyebrow">{environment.id}</p>
+                    <h2>{environment.displayName}</h2>
+                  </div>
+                  <div className="status-pair">
+                    <StatusBadge value={environment.kind} />
+                    <StatusBadge value={environment.enabled ? 'enabled' : 'disabled'} />
+                  </div>
+                </header>
+                <dl className="definition-list">
+                  <div>
+                    <dt>Health</dt>
+                    <dd>{environment.capabilities.health ? 'Declared' : 'Unavailable'}</dd>
+                  </div>
+                  <div>
+                    <dt>Readiness</dt>
+                    <dd>{environment.capabilities.readiness ? 'Declared' : 'Not declared'}</dd>
+                  </div>
+                  <div>
+                    <dt>OpenAPI</dt>
+                    <dd>{environment.capabilities.openApi ? 'Declared' : 'Not declared'}</dd>
+                  </div>
+                  <div>
+                    <dt>Build fingerprint</dt>
+                    <dd>{environment.capabilities.version ? 'Declared' : 'Not declared'}</dd>
+                  </div>
+                </dl>
+                <button
+                  className="button button-secondary"
+                  type="button"
+                  disabled={probeState?.status === 'loading'}
+                  onClick={() => void probe(environment.id)}
+                >
+                  {probeState?.status === 'loading' ? 'Probing read-only…' : 'Run read-only probe'}
+                </button>
+                {!probeState && (
+                  <p className="muted probe-placeholder">
+                    Not probed — no target request has been sent.
+                  </p>
+                )}
+                {probeState?.status === 'error' && (
+                  <ErrorPanel
+                    title={`Probe error${probeState.code ? ` · ${probeState.code}` : ''}`}
+                    message={probeState.message}
+                  />
+                )}
+                {probeState?.status === 'ready' && (
+                  <section
+                    className={`probe-result ${probeState.result.verdict === 'BLOCKED' ? 'blocked' : ''}`}
+                    aria-live="polite"
+                  >
+                    <header>
+                      <h3>Probe result</h3>
+                      <StatusBadge value={probeState.result.verdict} />
+                    </header>
+                    <dl className="definition-list">
+                      <div>
+                        <dt>Health</dt>
+                        <dd>
+                          {probeState.result.health.available ? 'Available' : 'Unavailable'}
+                          {probeState.result.health.status
+                            ? ` · HTTP ${probeState.result.health.status}`
+                            : ''}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>Readiness</dt>
+                        <dd>
+                          {probeState.result.readiness.available ? 'Available' : 'Unavailable'}
+                          {probeState.result.readiness.status
+                            ? ` · HTTP ${probeState.result.readiness.status}`
+                            : ''}
+                          {probeState.result.readiness.state
+                            ? ` · ${probeState.result.readiness.state}`
+                            : ''}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>OpenAPI</dt>
+                        <dd>
+                          {probeState.result.openApi.available ? 'Available' : 'Unavailable'}
+                          {probeState.result.openApi.status
+                            ? ` · HTTP ${probeState.result.openApi.status}`
+                            : ''}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>Build fingerprint</dt>
+                        <dd>
+                          {probeState.result.version.available
+                            ? [
+                                probeState.result.version.commit,
+                                probeState.result.version.buildTimestamp,
+                              ]
+                                .filter(Boolean)
+                                .join(' · ')
+                            : 'Unavailable'}
+                        </dd>
+                      </div>
+                    </dl>
+                    {probeState.result.error && (
+                      <div className="typed-error" role="alert">
+                        <strong>
+                          {probeState.result.error.category} · {probeState.result.error.code}
+                        </strong>
+                        <p>{probeState.result.error.message}</p>
+                      </div>
+                    )}
+                  </section>
+                )}
+              </article>
+            );
+          })}
+        </div>
+      )}
+    </>
+  );
+}
+
+function ScenarioLibraryPage() {
+  const { scenarioId } = useParams();
+  const navigate = useNavigate();
+  const [scenarios, setScenarios] = useState<Loadable<Scenario[]>>({ status: 'loading' });
+  const [detail, setDetail] = useState<Loadable<Scenario>>({ status: 'loading' });
+
+  useEffect(() => {
+    void apiRequest<{ items: Scenario[] }>('/api/scenarios')
+      .then(({ items }) =>
+        setScenarios(items.length === 0 ? { status: 'empty' } : { status: 'ready', data: items }),
+      )
+      .catch((error: unknown) => setScenarios({ status: 'error', message: errorMessage(error) }));
+  }, []);
+
+  const selectedId =
+    scenarioId ?? (scenarios.status === 'ready' ? scenarios.data[0]?.id : undefined);
+
+  useEffect(() => {
+    if (!selectedId) return;
+    setDetail({ status: 'loading' });
+    void apiRequest<Scenario>(`/api/scenarios/${encodeURIComponent(selectedId)}`)
+      .then((scenario) => setDetail({ status: 'ready', data: scenario }))
+      .catch((error: unknown) => setDetail({ status: 'error', message: errorMessage(error) }));
+  }, [selectedId]);
+
+  return (
+    <>
+      <PageHeader
+        eyebrow="Approved business blueprints"
+        title="Scenario Library"
+        description="Business intent stays primary. Compiled action primitives are available only as supporting technical detail."
+      />
+      {scenarios.status === 'loading' && <LoadingPanel label="Loading scenario library…" />}
+      {scenarios.status === 'empty' && (
+        <EmptyPanel message="No approved or generated scenario blueprints were found." />
+      )}
+      {scenarios.status === 'error' && <ErrorPanel message={scenarios.message} />}
+      {scenarios.status === 'ready' && (
+        <div className="library-layout">
+          <aside className="scenario-list" aria-label="Scenarios">
+            <h2>Blueprints</h2>
+            {scenarios.data.map((scenario) => (
+              <button
+                type="button"
+                className={selectedId === scenario.id ? 'selected' : undefined}
+                key={scenario.id}
+                aria-pressed={selectedId === scenario.id}
+                onClick={() => void navigate(`/scenarios/${scenario.id}`)}
+              >
+                <span>{scenario.title}</span>
+                <small>
+                  {scenario.domain} · v{scenario.version}
+                </small>
+              </button>
+            ))}
+          </aside>
+          <section className="scenario-detail" aria-live="polite">
+            {detail.status === 'loading' && <LoadingPanel label="Loading scenario detail…" />}
+            {detail.status === 'empty' && <EmptyPanel message="No scenario detail is available." />}
+            {detail.status === 'error' && <ErrorPanel message={detail.message} />}
+            {detail.status === 'ready' && <ScenarioDetail scenario={detail.data} />}
+          </section>
+        </div>
+      )}
+    </>
+  );
+}
+
+function ScenarioDetail({ scenario }: { scenario: Scenario }) {
+  const actorNames = new Map(scenario.actors.map((actor) => [actor.id, actor.name]));
+  return (
+    <>
+      <article className="narrative-hero">
+        <div className="status-pair">
+          <StatusBadge value={scenario.reviewState} />
+          <span className="schema-label">{scenario.schemaVersion}</span>
+        </div>
+        <h2>{scenario.title}</h2>
+        <p className="narrative">{scenario.narrative}</p>
+        <div className="objective">
+          <strong>Objective</strong>
+          <p>{scenario.objective}</p>
+        </div>
+        <ul className="tag-list" aria-label="Risk tags">
+          {scenario.riskTags.map((risk) => (
+            <li key={risk}>{risk}</li>
+          ))}
+        </ul>
+      </article>
+
+      <section className="detail-section">
+        <div className="section-heading">
+          <div>
+            <p className="eyebrow">Business sequence</p>
+            <h2>Human-readable journey</h2>
+          </div>
+          <span>{scenario.steps.length} steps</span>
+        </div>
+        <ol className="business-steps">
+          {scenario.steps.map((step) => (
+            <li key={step.id}>
+              <article>
+                <p className="step-actor">{actorNames.get(step.actor) ?? step.actor}</p>
+                <h3>{step.title}</h3>
+                <p>{step.narrative}</p>
+                <div className="expectation-list">
+                  {step.expectations.map((expectation) => (
+                    <p key={`${step.id}-${expectation.kind}-${expectation.statement}`}>
+                      <StatusBadge value={expectation.kind} />
+                      {expectation.statement}
+                    </p>
+                  ))}
+                </div>
+                <details>
+                  <summary>Secondary technical detail</summary>
+                  <p>
+                    Primitive: <code>{step.action}</code>
+                  </p>
+                  <p>Source step: {step.id}</p>
+                </details>
+              </article>
+            </li>
+          ))}
+        </ol>
+      </section>
+
+      <div className="two-column">
+        <section className="detail-section">
+          <p className="eyebrow">Personas</p>
+          <h2>Actors</h2>
+          <div className="stack-list">
+            {scenario.actors.map((actor) => (
+              <article key={actor.id}>
+                <h3>{actor.name}</h3>
+                <p>{actor.persona}</p>
+              </article>
+            ))}
+          </div>
+        </section>
+        <section className="detail-section">
+          <p className="eyebrow">Risk expansion</p>
+          <h2>Variations</h2>
+          <div className="stack-list">
+            {scenario.variationDimensions.flatMap((dimension) =>
+              dimension.values.map((value) => (
+                <article key={`${dimension.id}-${value.id}`}>
+                  <h3>{value.id.replaceAll('-', ' ')}</h3>
+                  <p>{value.description}</p>
+                  {value.overrides.expectedOutcome && (
+                    <StatusBadge value={value.overrides.expectedOutcome} />
+                  )}
+                </article>
+              )),
+            )}
+          </div>
+        </section>
+      </div>
+
+      <section className="detail-section">
+        <p className="eyebrow">Required observations</p>
+        <h2>Evidence requirements</h2>
+        <ul className="check-list">
+          {scenario.evidenceRequirements.map((requirement) => (
+            <li key={requirement}>{requirement}</li>
+          ))}
+        </ul>
+      </section>
+    </>
+  );
+}
+
+interface RunFormData {
+  environments: EnvironmentDefinition[];
+  scenarios: Scenario[];
+}
+
+interface LaunchResult {
+  run: RunRecord;
+  plan: ExecutablePlan;
+  scenario: Scenario;
+}
+
+function RunCenterPage() {
+  const [data, setData] = useState<Loadable<RunFormData>>({ status: 'loading' });
+  const [environmentId, setEnvironmentId] = useState('');
+  const [scenarioId, setScenarioId] = useState('');
+  const [variationValues, setVariationValues] = useState<Record<string, string>>({});
+  const [launch, setLaunch] = useState<Loadable<LaunchResult> | undefined>();
+
+  useEffect(() => {
+    void Promise.all([
+      apiRequest<{ items: EnvironmentDefinition[] }>('/api/environments'),
+      apiRequest<{ items: Scenario[] }>('/api/scenarios'),
+    ])
+      .then(([environmentResponse, scenarioResponse]) => {
+        if (environmentResponse.items.length === 0 || scenarioResponse.items.length === 0) {
+          setData({ status: 'empty' });
+          return;
+        }
+        setData({
+          status: 'ready',
+          data: {
+            environments: environmentResponse.items,
+            scenarios: scenarioResponse.items,
+          },
+        });
+        setEnvironmentId(
+          environmentResponse.items.find((environment) => environment.enabled)?.id ??
+            environmentResponse.items[0]!.id,
+        );
+        setScenarioId(scenarioResponse.items[0]!.id);
+      })
+      .catch((error: unknown) => setData({ status: 'error', message: errorMessage(error) }));
+  }, []);
+
+  const selectedScenario =
+    data.status === 'ready'
+      ? data.data.scenarios.find((scenario) => scenario.id === scenarioId)
+      : undefined;
+
+  useEffect(() => {
+    if (!selectedScenario) return;
+    setVariationValues(
+      Object.fromEntries(
+        selectedScenario.variationDimensions
+          .filter((dimension) => dimension.values[0])
+          .map((dimension) => [dimension.id, dimension.values[0]!.id]),
+      ),
+    );
+  }, [selectedScenario]);
+
+  const submit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!environmentId || !scenarioId) return;
+    setLaunch({ status: 'loading' });
+    try {
+      const run = await apiRequest<RunRecord>('/api/runs', {
+        method: 'POST',
+        body: JSON.stringify({
+          runType: 'COMPILE_ONLY',
+          environmentId,
+          scenarioId,
+          variationValues,
+        }),
+      });
+      const [plan, scenario] = await Promise.all([
+        apiRequest<ExecutablePlan>(`/api/runs/${encodeURIComponent(run.runId)}/plan`),
+        apiRequest<Scenario>(`/api/scenarios/${encodeURIComponent(run.scenario.id)}`),
+      ]);
+      setLaunch({ status: 'ready', data: { run, plan, scenario } });
+    } catch (error) {
+      setLaunch({
+        status: 'error',
+        message: errorMessage(error),
+        ...(error instanceof ApiError ? { code: error.code } : {}),
+      });
+    }
+  };
+
+  return (
+    <>
+      <PageHeader
+        eyebrow="Compile-only orchestration"
+        title="Run Center"
+        description="Compile a selected business variation into a deterministic plan. M1-01 does not execute NILES mutations."
+      />
+      {data.status === 'loading' && <LoadingPanel label="Loading run configuration…" />}
+      {data.status === 'empty' && (
+        <EmptyPanel message="At least one environment and one scenario are required to create a run." />
+      )}
+      {data.status === 'error' && <ErrorPanel message={data.message} />}
+      {data.status === 'ready' && (
+        <div className="run-layout">
+          <form className="card run-form" onSubmit={(event) => void submit(event)}>
+            <h2>Compile a scenario</h2>
+            <p className="muted">No environment probe or NILES mutation is part of this action.</p>
+            <label htmlFor="run-environment">Environment</label>
+            <select
+              id="run-environment"
+              value={environmentId}
+              onChange={(event) => setEnvironmentId(event.target.value)}
+            >
+              {data.data.environments.map((environment) => (
+                <option value={environment.id} key={environment.id}>
+                  {environment.displayName} · {environment.kind}
+                  {!environment.enabled ? ' · disabled' : ''}
+                </option>
+              ))}
+            </select>
+            <label htmlFor="run-scenario">Scenario</label>
+            <select
+              id="run-scenario"
+              value={scenarioId}
+              onChange={(event) => setScenarioId(event.target.value)}
+            >
+              {data.data.scenarios.map((scenario) => (
+                <option value={scenario.id} key={scenario.id}>
+                  {scenario.title}
+                </option>
+              ))}
+            </select>
+            {selectedScenario?.variationDimensions.map((dimension) => (
+              <div className="form-field" key={dimension.id}>
+                <label htmlFor={`variation-${dimension.id}`}>{dimension.description}</label>
+                <select
+                  id={`variation-${dimension.id}`}
+                  value={variationValues[dimension.id] ?? ''}
+                  onChange={(event) =>
+                    setVariationValues((current) => ({
+                      ...current,
+                      [dimension.id]: event.target.value,
+                    }))
+                  }
+                >
+                  {dimension.values.map((value) => (
+                    <option value={value.id} key={value.id}>
+                      {value.id.replaceAll('-', ' ')} — {value.description}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            ))}
+            <button
+              className="button button-primary"
+              type="submit"
+              disabled={launch?.status === 'loading'}
+            >
+              {launch?.status === 'loading'
+                ? 'Compiling business plan…'
+                : 'Launch compile-only run'}
+            </button>
+          </form>
+
+          <section className="run-result" aria-live="polite">
+            {!launch && (
+              <section className="state-panel">
+                <strong>Ready to compile</strong>
+                <p>Select a variation and launch a local NVS compile-only run.</p>
+              </section>
+            )}
+            {launch?.status === 'loading' && <LoadingPanel label="Compiling deterministic plan…" />}
+            {launch?.status === 'empty' && <EmptyPanel message="No run result was returned." />}
+            {launch?.status === 'error' && (
+              <ErrorPanel
+                title={`Run BLOCKED or failed${launch.code ? ` · ${launch.code}` : ''}`}
+                message={launch.message}
+              />
+            )}
+            {launch?.status === 'ready' && <CompileOnlyResult result={launch.data} />}
+          </section>
+        </div>
+      )}
+    </>
+  );
+}
+
+function CompileOnlyResult({ result }: { result: LaunchResult }) {
+  const sourceSteps = new Map(result.scenario.steps.map((step) => [step.id, step]));
+  return (
+    <>
+      <section className="scope-warning" role="status">
+        <div>
+          <p className="eyebrow">Compilation scope only</p>
+          <h2>
+            <StatusBadge value={result.run.verdict} /> Plan generated
+          </h2>
+        </div>
+        <strong>Not release-gate eligible · gateEligible: false</strong>
+        <p>
+          This compile-only PASS is not a NILES release verdict. No NILES Incident, SLA,
+          authorization, or tenant behavior was executed.
+        </p>
+      </section>
+      <section className="detail-section">
+        <div className="section-heading">
+          <div>
+            <p className="eyebrow">Joined to blueprint source</p>
+            <h2>Business-step compilation progress</h2>
+          </div>
+          <span>{result.plan.steps.length} compiled</span>
+        </div>
+        <ol className="progress-list">
+          {result.plan.steps.map((planStep) => {
+            const businessStep = sourceSteps.get(planStep.source.blueprintStepId);
+            const resultStep = result.run.stepResults.find((step) => step.stepId === planStep.id);
+            return (
+              <li key={planStep.id}>
+                <span className="progress-dot" aria-hidden="true">
+                  {resultStep?.compilationStatus === 'PASS' ? '✓' : '—'}
+                </span>
+                <div>
+                  <h3>{businessStep?.title ?? planStep.source.blueprintStepId}</h3>
+                  <p>{businessStep?.narrative}</p>
+                  {resultStep ? (
+                    <div className="status-pair">
+                      <span>
+                        Compilation <StatusBadge value={resultStep.compilationStatus} />
+                      </span>
+                      <span>
+                        NILES execution <StatusBadge value={resultStep.executionStatus} />
+                      </span>
+                    </div>
+                  ) : (
+                    <small>Compilation result unavailable</small>
+                  )}
+                  <small>Source {planStep.source.blueprintStepId}</small>
+                </div>
+              </li>
+            );
+          })}
+        </ol>
+        <Link className="button button-secondary" to={`/evidence?runId=${result.run.runId}`}>
+          View evidence
+        </Link>
+      </section>
+    </>
+  );
+}
+
+interface EvidenceDetail {
+  run: RunRecord;
+  evidence: EvidenceManifest;
+  plan: ExecutablePlan;
+  scenario: Scenario;
+}
+
+function EvidenceExplorerPage() {
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [runs, setRuns] = useState<Loadable<RunRecord[]>>({ status: 'loading' });
+  const [detail, setDetail] = useState<Loadable<EvidenceDetail> | undefined>();
+
+  useEffect(() => {
+    void apiRequest<{ items: RunRecord[] }>('/api/runs')
+      .then(({ items }) => {
+        setRuns(items.length === 0 ? { status: 'empty' } : { status: 'ready', data: items });
+      })
+      .catch((error: unknown) => setRuns({ status: 'error', message: errorMessage(error) }));
+  }, []);
+
+  const requestedRunId = searchParams.get('runId');
+  const selectedRunId =
+    requestedRunId ?? (runs.status === 'ready' ? runs.data[0]?.runId : undefined);
+
+  useEffect(() => {
+    if (!selectedRunId) return;
+    setDetail({ status: 'loading' });
+    void Promise.all([
+      apiRequest<RunRecord>(`/api/runs/${encodeURIComponent(selectedRunId)}`),
+      apiRequest<EvidenceManifest>(`/api/runs/${encodeURIComponent(selectedRunId)}/evidence`),
+      apiRequest<ExecutablePlan>(`/api/runs/${encodeURIComponent(selectedRunId)}/plan`),
+    ])
+      .then(async ([run, evidence, plan]) => {
+        const scenario = await apiRequest<Scenario>(
+          `/api/scenarios/${encodeURIComponent(run.scenario.id)}`,
+        );
+        setDetail({ status: 'ready', data: { run, evidence, plan, scenario } });
+      })
+      .catch((error: unknown) => setDetail({ status: 'error', message: errorMessage(error) }));
+  }, [selectedRunId]);
+
+  return (
+    <>
+      <PageHeader
+        eyebrow="Sanitized run artifacts"
+        title="Evidence Explorer"
+        description="Inspect assurance scope, typed failures, compiled plan source links, and sanitized manifest entries."
+      />
+      {runs.status === 'loading' && <LoadingPanel label="Loading run evidence…" />}
+      {runs.status === 'empty' && (
+        <EmptyPanel message="Create a compile-only run in Run Center to produce evidence." />
+      )}
+      {runs.status === 'error' && <ErrorPanel message={runs.message} />}
+      {runs.status === 'ready' && (
+        <>
+          <label className="run-selector">
+            Run
+            <select
+              value={selectedRunId}
+              onChange={(event) => setSearchParams({ runId: event.target.value })}
+            >
+              {runs.data.map((run) => (
+                <option key={run.runId} value={run.runId}>
+                  {run.runId} · {run.verdict} · {run.assuranceScope}
+                </option>
+              ))}
+            </select>
+          </label>
+          {detail?.status === 'loading' && <LoadingPanel label="Loading selected run detail…" />}
+          {detail?.status === 'empty' && <EmptyPanel message="The selected run has no detail." />}
+          {detail?.status === 'error' && (
+            <ErrorPanel title="Evidence BLOCKED or unavailable" message={detail.message} />
+          )}
+          {detail?.status === 'ready' && <EvidenceDetailView detail={detail.data} />}
+        </>
+      )}
+    </>
+  );
+}
+
+function EvidenceDetailView({ detail }: { detail: EvidenceDetail }) {
+  const businessSteps = new Map(detail.scenario.steps.map((step) => [step.id, step]));
+  const typedErrors = [
+    ...(detail.run.error ? [detail.run.error] : []),
+    ...detail.run.stepResults.flatMap((step) => (step.error ? [step.error] : [])),
+  ];
+
+  return (
+    <div className="evidence-layout">
+      <section className="scope-warning">
+        <div className="status-pair">
+          <StatusBadge value={detail.run.verdict} />
+          <StatusBadge value={detail.run.assuranceScope} />
+        </div>
+        <h2>Compile-only evidence · not a NILES release verdict</h2>
+        <p>
+          Gate eligible: <strong>No (gateEligible: false)</strong>. PASS means the versioned
+          blueprint compiled and persisted within compilation scope only.
+        </p>
+        <dl className="id-list">
+          <div>
+            <dt>Run ID</dt>
+            <dd>
+              <code>{detail.run.runId}</code>
+            </dd>
+          </div>
+          <div>
+            <dt>Correlation ID</dt>
+            <dd>
+              <code>{detail.run.runId}</code> <small>(compile-only run scope)</small>
+            </dd>
+          </div>
+          <div>
+            <dt>Plan ID</dt>
+            <dd>
+              <code>{detail.run.planId}</code>
+            </dd>
+          </div>
+        </dl>
+      </section>
+
+      {typedErrors.length > 0 && (
+        <section className="detail-section typed-errors" aria-label="Typed errors">
+          <h2>Typed errors</h2>
+          {typedErrors.map((error, index) => (
+            <div className="typed-error" key={`${error.code}-${index}`}>
+              <strong>
+                {error.category} · {error.code}
+              </strong>
+              <p>{error.message}</p>
+              <small>{error.retryable ? 'Retryable' : 'Not retryable'}</small>
+            </div>
+          ))}
+        </section>
+      )}
+
+      <section className="detail-section">
+        <div className="section-heading">
+          <div>
+            <p className="eyebrow">Durable plan retrieval</p>
+            <h2>Compiled plan entries</h2>
+          </div>
+          <StatusBadge value="not executed" />
+        </div>
+        <ol className="plan-entry-list">
+          {detail.plan.steps.map((step) => {
+            const businessStep = businessSteps.get(step.source.blueprintStepId);
+            const resultStep = detail.run.stepResults.find((result) => result.stepId === step.id);
+            return (
+              <li key={step.id}>
+                <div>
+                  <h3>{businessStep?.title ?? step.source.blueprintStepId}</h3>
+                  <p>{businessStep?.narrative}</p>
+                </div>
+                <dl>
+                  <div>
+                    <dt>Actor</dt>
+                    <dd>{step.actorId}</dd>
+                  </div>
+                  <div>
+                    <dt>Source</dt>
+                    <dd>{step.source.blueprintStepId}</dd>
+                  </div>
+                  <div>
+                    <dt>Technical action</dt>
+                    <dd>
+                      <code>{step.action}</code>
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>Compilation</dt>
+                    <dd>
+                      {resultStep ? (
+                        <StatusBadge value={resultStep.compilationStatus} />
+                      ) : (
+                        'Unavailable'
+                      )}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>NILES execution</dt>
+                    <dd>
+                      {resultStep ? (
+                        <StatusBadge value={resultStep.executionStatus} />
+                      ) : (
+                        'Unavailable'
+                      )}
+                    </dd>
+                  </div>
+                </dl>
+              </li>
+            );
+          })}
+        </ol>
+      </section>
+
+      <section className="detail-section">
+        <div className="section-heading">
+          <div>
+            <p className="eyebrow">Sanitized artifact index</p>
+            <h2>Evidence manifest</h2>
+          </div>
+          <span>{detail.evidence.entries.length} entries</span>
+        </div>
+        <ul className="manifest-list">
+          {detail.evidence.entries.map((entry) => (
+            <li key={entry.id}>
+              <StatusBadge value={entry.kind} />
+              <div>
+                <strong>{entry.id}</strong>
+                <code>{entry.path}</code>
+                <small>{entry.mediaType}</small>
+                {entry.sha256 && (
+                  <small>
+                    SHA-256 <code>{entry.sha256}</code>
+                  </small>
+                )}
+              </div>
+            </li>
+          ))}
+        </ul>
+        <p className="sanitization-note">
+          Sanitization applied:{' '}
+          <strong>{detail.evidence.sanitization.applied ? 'Yes' : 'No'}</strong>. Confidential field
+          values are not displayed.
+        </p>
+      </section>
+    </div>
+  );
+}
+
+function CoveragePage() {
+  const [coverage, setCoverage] = useState<Loadable<CoverageResult>>({ status: 'loading' });
+
+  useEffect(() => {
+    void apiRequest<CoverageResult>('/api/coverage')
+      .then((result) =>
+        setCoverage(
+          result.cells.length === 0 ? { status: 'empty' } : { status: 'ready', data: result },
+        ),
+      )
+      .catch((error: unknown) => setCoverage({ status: 'error', message: errorMessage(error) }));
+  }, []);
+
+  return (
+    <>
+      <PageHeader
+        eyebrow="Semantic planning matrix"
+        title="Coverage"
+        description="Declared scenario intent and compiled plan reach are shown separately from runtime execution."
+      />
+      <section className="coverage-legend" aria-label="Coverage state definitions">
+        <div>
+          <StatusBadge value="declared" />
+          <p>Present in the reviewed business blueprint.</p>
+        </div>
+        <div>
+          <StatusBadge value="compiled" />
+          <p>Represented in a deterministic executable plan.</p>
+        </div>
+        <div>
+          <StatusBadge value="not executed" />
+          <p>No NILES runtime behavior has been exercised.</p>
+        </div>
+      </section>
+      {coverage.status === 'loading' && <LoadingPanel label="Deriving semantic coverage…" />}
+      {coverage.status === 'empty' && (
+        <EmptyPanel message="No scenario coverage cells could be derived." />
+      )}
+      {coverage.status === 'error' && <ErrorPanel message={coverage.message} />}
+      {coverage.status === 'ready' && (
+        <>
+          <section className="coverage-summary" aria-label="Coverage summary">
+            <div>
+              <strong>{coverage.data.summary.cells}</strong>
+              <span>declared + compiled cells</span>
+            </div>
+            <div>
+              <strong>{coverage.data.summary.executed}</strong>
+              <span>runtime-executed cells</span>
+            </div>
+            <p>
+              Runtime coverage is <strong>not claimed</strong> in M1-01.
+            </p>
+          </section>
+          <div className="coverage-grid">
+            {coverage.data.cells.map((cell) => {
+              const hasSla = cell.assertionKinds.includes('SLA');
+              const negativeAccess = cell.expectedOutcome === 'ACCESS_DENIED';
+              return (
+                <article className="coverage-cell" key={`${cell.scenarioId}-${cell.variation}`}>
+                  <header>
+                    <div>
+                      <p className="eyebrow">{cell.scenarioId}</p>
+                      <h2>{cell.variation.replace('=', ' · ').replaceAll('-', ' ')}</h2>
+                    </div>
+                    <StatusBadge value="not executed" />
+                  </header>
+                  <CoverageDimension label="Actors" values={cell.actors} />
+                  <CoverageDimension label="Actions / transitions" values={cell.actions} />
+                  <CoverageDimension label="Assertions" values={cell.assertionKinds} />
+                  <div className="coverage-binary">
+                    <span>SLA assertion</span>
+                    <strong>{hasSla ? 'Declared · compiled' : 'Not declared'}</strong>
+                  </div>
+                  <div className="coverage-binary">
+                    <span>Negative access</span>
+                    <strong>{negativeAccess ? 'Declared · compiled' : 'Not declared'}</strong>
+                  </div>
+                </article>
+              );
+            })}
+          </div>
+        </>
+      )}
+    </>
+  );
+}
+
+function CoverageDimension({ label, values }: { label: string; values: string[] }) {
+  return (
+    <div className="coverage-dimension">
+      <h3>{label}</h3>
+      <ul>
+        {values.map((value) => (
+          <li key={value}>
+            <span>{value}</span>
+            <small>Declared · compiled · not executed</small>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+function NotFoundPage() {
+  return (
+    <>
+      <PageHeader
+        eyebrow="Navigation error"
+        title="Page not found"
+        description="The requested console route does not exist."
+      />
+      <Link className="button button-primary" to="/scenarios">
+        Return to Scenario Library
+      </Link>
+    </>
+  );
+}
+
+export default function App() {
+  return <Shell />;
+}

@@ -1,0 +1,16 @@
+schemaVersion: nvs.environment/v1
+id: local-example
+displayName: Sanitized local NILES example
+baseUrl: http://127.0.0.1:3002
+kind: local
+healthPath: /health/live
+readinessPath: /health/ready
+openApiPath: /api/docs-json
+versionPath: /health/version
+capabilities:
+  health: true
+  readiness: true
+  openApi: true
+  version: true
+authProfileRef: niles.local-readonly
+enabled: true

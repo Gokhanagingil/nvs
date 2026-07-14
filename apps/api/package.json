@@ -1,0 +1,21 @@
+{
+  "name": "@nvs/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "start": "node dist/server.js",
+    "build": "tsup --config tsup.config.ts"
+  },
+  "dependencies": {
+    "@nvs/adapter-niles": "workspace:*",
+    "@nvs/contracts": "workspace:*",
+    "@nvs/core": "workspace:*",
+    "@nvs/domain": "workspace:*",
+    "@nvs/storage-filesystem": "workspace:*",
+    "fastify": "5.10.0",
+    "yaml": "2.9.0",
+    "zod": "4.4.3"
+  }
+}

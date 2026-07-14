@@ -1,104 +1,176 @@
 # NVS — NILES Validation Suite
 
-NVS is a proposed independent validation and release-assurance system for the NILES platform.
+NVS is an external, evidence-producing validation system for NILES. M1-01 delivers the first runnable walking skeleton for internal NILES release assurance.
 
-> **Project status:** Product discovery  
-> **Implementation status:** No production code  
-> **Initial scope:** Incident + SLA + authorization  
-> **Primary use:** Internal NILES release qualification before any commercial-product decision
+> **Current slice:** M1-01 walking skeleton
+> **Initial business scope:** Incident + SLA + authorization
+> **Assurance scope:** deterministic compilation and read-only NILES connectivity
+> **Release-gate status:** compile-only results are never release-gate eligible
 
-## Why NVS exists
+## What works in M1-01
 
-NILES is a metadata-driven enterprise platform. A release can appear healthy at the UI level while a hidden workflow, SLA timer, authorization rule, state transition, audit record, or tenant boundary behaves incorrectly.
+The application proves this complete path:
 
-NVS is intended to validate the business outcome—not only the click path.
+```text
+versioned business blueprint YAML
+  -> Zod runtime validation
+  -> deterministic semantic compilation
+  -> COMPILE_ONLY run orchestration
+  -> atomic immutable filesystem run bundle
+  -> Fastify control-plane API
+  -> React operations console
+```
 
-The central product hypothesis is:
+It includes:
 
-> NVS can compile NILES contracts, metadata, process models, and access policies into deterministic tests; execute them through proven API and browser engines; and produce evidence that explains whether a NILES release is safe to promote.
+- one approved payment/API service-degradation blueprint and eight risk variations;
+- versioned environment, blueprint, executable-plan, run, evidence, probe, error, and coverage contracts;
+- deterministic plan and step IDs with source links back to business steps;
+- committed-only filesystem bundles behind a single core persistence port;
+- a bounded read-only NILES probe for confirmed liveness, readiness, build, and validated OpenAPI routes;
+- a CLI and machine-readable artifacts;
+- Environments, Scenario Library, Run Center, Evidence Explorer, and Coverage UI routes;
+- unit, integration, API, and Playwright smoke coverage;
+- deterministic GitHub Actions CI with no live NILES dependency.
 
-This hypothesis is still under review. A decision not to build remains valid if discovery does not show a defensible gap.
+## What M1-01 does not prove
 
-## What NVS should be
+A compile-only `PASS` means only that the reviewed blueprint compiled and its artifacts persisted within `COMPILATION_ONLY` scope. Every such run has:
 
-- external to the NILES application boundary;
-- aware of NILES process semantics;
-- deterministic at the release-gate core;
-- generated from contracts and models wherever possible;
-- API-first, with selected critical UI journeys;
-- strong on negative paths, roles, ownership, and tenant isolation;
-- evidence-producing and reproducible;
-- composed from mature execution engines rather than rebuilding them.
+```json
+{
+  "runType": "COMPILE_ONLY",
+  "verdict": "PASS",
+  "assuranceScope": "COMPILATION_ONLY",
+  "gateEligible": false,
+  "stepResults": [
+    {
+      "compilationStatus": "PASS",
+      "executionStatus": "NOT_EXECUTED"
+    }
+  ]
+}
+```
 
-## What NVS should not be
+M1-01 does not claim that NILES Incident lifecycle, SLA behavior, authorization, tenant isolation, side effects, or release readiness passed. It does not authenticate to NILES or mutate NILES data. Those capabilities begin in M1-02 after the missing testability contracts are resolved.
 
-- another generic browser automation framework;
-- another API collection runner;
-- a broad no-code test designer in its first phase;
-- an LLM whose opinion determines pass or fail;
-- a silent self-healing layer that can hide product regressions;
-- a commercial product before it proves its value inside the NILES release process.
+## Repository layout
 
-## Current research conclusion
+```text
+apps/
+  api/                    Fastify composition root and CLI
+  web/                    React + Vite operations console
+packages/
+  contracts/              Versioned runtime contracts
+  domain/                 Compiler, policy, verdicts, canonical serialization
+  core/                   Use cases and ports
+  adapter-niles/          Confirmed read-only NILES transport
+  storage-filesystem/     YAML inputs and JSON run bundles
+scenarios/itsm/incident/  Reviewed business blueprints
+environments/             Non-sensitive target definitions
+artifacts/                Ignored local run and browser output
+docs/discovery/           Confirmed/partial/unknown/missing NILES facts
+docs/adr/                 Accepted implementation decisions
+```
 
-The market already contains mature solutions for browser automation, API testing, model-based path generation, contract testing, AI-assisted test authoring, and platform-native test automation.
+## Prerequisites
 
-The potential NVS differentiation is therefore narrower:
+- Node.js `24.18.0` LTS
+- pnpm `11.13.0`, invoked through Corepack
 
-1. compile NILES metadata and process definitions into an executable behavioral model;
-2. validate Incident, SLA, role, ownership, and tenant invariants across API, UI, and observable side effects;
-3. measure coverage in NILES terms—states, transitions, roles, policies, metadata rules, and SLA events;
-4. produce a release evidence bundle that connects an action to its API result, state change, audit/event trail, SLA ledger, and UI trace;
-5. remain externally operated so NILES does not certify itself.
+The selected versions are pinned in repository metadata and CI.
 
-## Documentation
+## Setup and commands
 
-- [Project Charter](PROJECT_CHARTER.md)
-- [Product Discovery](docs/PRODUCT_DISCOVERY.md)
-- [Market and Precedent Research](docs/MARKET_RESEARCH.md)
-- [Architecture Options and Recommendation](docs/ARCHITECTURE.md)
-- [NILES Testability Contract](docs/NILES_TESTABILITY_CONTRACT.md)
-- [Incident + SLA + Authorization MVP](docs/MVP.md)
-- [Decision Log](docs/DECISIONS.md)
+Install exactly from the lockfile:
 
-Documents beyond the charter are introduced through the product-discovery pull request and may change after review.
+```bash
+corepack pnpm install --frozen-lockfile
+```
 
-## Decision gates
+Start the API and web console together:
 
-Production implementation is blocked until the Product Owner approves:
+```bash
+corepack pnpm dev
+```
 
-- **D1:** the problem and NVS differentiation;
-- **D2:** the architecture and NILES testability contract;
-- **D3:** the MVP scope and measurable exit criteria.
+- Web console: `http://127.0.0.1:4173`
+- API health: `http://127.0.0.1:4100/api/health`
 
-See [PROJECT_CHARTER.md](PROJECT_CHARTER.md) for the full governance model.
+Common commands:
 
-## Proposed technical direction
+```bash
+corepack pnpm format:check
+corepack pnpm lint
+corepack pnpm typecheck
+corepack pnpm test
+corepack pnpm build
+corepack pnpm test:e2e
+corepack pnpm run ci
+```
 
-The working recommendation is a domain-aware orchestration layer, not a custom testing engine:
+`corepack pnpm run ci` is the single required local/CI validation command. Install the Chromium binary once before running browser tests on a fresh machine:
 
-- a TypeScript control plane and CLI;
-- Playwright for browser execution and UI/API traces;
-- Schemathesis for OpenAPI-derived property tests;
-- optional contract, performance, and security runners added behind adapters;
-- versioned YAML/JSON scenario definitions and generated instances;
-- file-based run artifacts first, with no database or web console in the MVP;
-- a small, security-reviewed NILES testability contract for metadata snapshots, deterministic fixtures, virtual SLA time, asynchronous-job synchronization, and correlated evidence.
+```bash
+corepack pnpm exec playwright install chromium
+```
 
-This direction is **proposed**, not yet accepted.
+## Deterministic example workflow
 
-## Repository rules
+Create a local compile-only run without starting the servers:
 
-- No secrets, tokens, customer data, production exports, or personal data.
-- No production code before D1–D3 approval.
-- Difficult-to-reverse choices require an ADR.
-- AI-generated work receives normal engineering review.
-- Tests may not convert uncertainty into a pass.
-- Any automated test repair must produce a reviewed diff; silent healing is prohibited.
+```bash
+corepack pnpm example:run
+```
 
-## Ownership
+The command:
 
-- **Product Owner:** Gökhan Ağıngil
-- **Architecture and research partner:** ChatGPT
-- **Implementation agent:** Codex or another approved engineering agent
-- **Final accountability:** Human Product Owner and designated reviewers
+1. loads `environments/local.example.yaml`;
+2. validates `payment-api-service-degradation.v1.yaml`;
+3. selects the normal journey;
+4. compiles a deterministic executable plan;
+5. writes run, plan, and evidence JSON under `artifacts/runs/example-compile-only/`;
+6. prints a machine-readable summary that includes `gateEligible: false`.
+
+In the console, open Scenario Library, review the business narrative, choose Run Center, select a variation, launch the compile-only run, and inspect the durable plan and evidence in Evidence Explorer.
+
+## Runtime configuration and secrets
+
+Environment definitions are strict `nvs.environment/v1` YAML files under `environments/`. They contain:
+
+- a non-secret base URL and target classification;
+- confirmed health/readiness/OpenAPI/build paths;
+- non-sensitive capability declarations;
+- an optional symbolic authentication-profile reference.
+
+Credential values are forbidden in URLs and versioned fields. M1-01 does not resolve auth profiles. Local overrides, evidence, logs, build output, and browser artifacts are ignored by Git.
+
+The API host and port may be changed with `NVS_API_HOST` and `NVS_API_PORT`. The web development proxy expects the default API port.
+
+## Optional live read-only probe
+
+CI never contacts NILES. A live probe is an explicit operator action and uses GET only.
+
+1. Review or add a non-sensitive environment definition.
+2. Keep it disabled until the URL and classification are approved.
+3. Enable it and run:
+
+```bash
+corepack pnpm probe:niles -- --environment local-example
+```
+
+Alternatively, use the Environments page and select **Run read-only probe**. A failed or degraded required health/readiness capability returns `BLOCKED`. Missing optional OpenAPI or build metadata is shown as unavailable.
+
+Do not place credentials in an environment file, and do not use this command to work around environment approval.
+
+## Architecture and NILES findings
+
+- [M1-01 stack ADR](docs/adr/ADR-0001-M1-WALKING-SKELETON-STACK.md)
+- [NILES contract findings at inspected GRC commit](docs/discovery/NILES_CONTRACT_FINDINGS_M1.md)
+- [Implementation authorization](docs/IMPLEMENTATION_AUTHORIZATION_2026-07-14.md)
+- [NILES testability contract](docs/NILES_TESTABILITY_CONTRACT.md)
+- [MVP contract](docs/MVP.md)
+
+## Next slice: M1-02
+
+M1-02 is expected to add authenticated Incident API execution, an isolated deterministic fixture namespace, lifecycle assertions, and correlated evidence. It must not infer the currently missing metadata, policy, fixture, event/job, cleanup, or virtual-time contracts.

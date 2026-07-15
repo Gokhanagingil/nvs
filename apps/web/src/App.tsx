@@ -545,12 +545,19 @@ const wait = (milliseconds: number) =>
     window.setTimeout(resolve, milliseconds);
   });
 
-async function pollLiveRunProgress(runId: string): Promise<RunProgress> {
+async function pollLiveRunProgress(
+  runId: string,
+  onProgress: (progress: RunProgress, inventory?: ResourceInventory) => void,
+): Promise<RunProgress> {
   for (let attempt = 0; attempt < 180; attempt += 1) {
     const progress = await apiRequest<RunProgress>(
       `/api/runs/${encodeURIComponent(runId)}/progress`,
     );
-    if (progress.status === 'COMPLETED' || progress.status === 'BLOCKED_REQUIRES_RECOVERY') {
+    const inventory = await apiRequest<ResourceInventory>(
+      `/api/runs/${encodeURIComponent(runId)}/inventory`,
+    ).catch(() => undefined);
+    onProgress(progress, inventory);
+    if (progress.status === 'COMPLETED' || progress.status === 'RECOVERY_REQUIRED') {
       return progress;
     }
     await wait(1000);
@@ -567,6 +574,9 @@ function RunCenterPage() {
   const [confirmLive, setConfirmLive] = useState(false);
   const [readiness, setReadiness] = useState<Loadable<ExecutionReadiness> | undefined>();
   const [launch, setLaunch] = useState<Loadable<LaunchResult> | undefined>();
+  const [pendingLive, setPendingLive] = useState<
+    { runId: string; progress?: RunProgress; inventory?: ResourceInventory } | undefined
+  >();
 
   useEffect(() => {
     void Promise.all([
@@ -637,6 +647,7 @@ function RunCenterPage() {
     event.preventDefault();
     if (!environmentId || !scenarioId) return;
     setLaunch({ status: 'loading' });
+    setPendingLive(undefined);
     try {
       if (runType === 'LIVE_API') {
         const accepted = await apiRequest<LiveRunAccepted>('/api/runs', {
@@ -649,9 +660,17 @@ function RunCenterPage() {
             confirmRealMutation: true,
           }),
         });
-        const progress = await pollLiveRunProgress(accepted.runId);
-        if (progress.status === 'BLOCKED_REQUIRES_RECOVERY') {
-          throw new Error('Live API run requires operator recovery before evidence can finalize.');
+        setPendingLive({ runId: accepted.runId });
+        const progress = await pollLiveRunProgress(accepted.runId, (nextProgress, inventory) => {
+          setPendingLive({
+            runId: accepted.runId,
+            progress: nextProgress,
+            ...(inventory ? { inventory } : {}),
+          });
+        });
+        if (progress.status === 'RECOVERY_REQUIRED') {
+          setLaunch(undefined);
+          return;
         }
         const [run, plan, scenario, inventory] = await Promise.all([
           apiRequest<RunRecord>(`/api/runs/${encodeURIComponent(accepted.runId)}`),
@@ -661,6 +680,7 @@ function RunCenterPage() {
             `/api/runs/${encodeURIComponent(accepted.runId)}/inventory`,
           ),
         ]);
+        setPendingLive(undefined);
         setLaunch({ status: 'ready', data: { run, plan, scenario, progress, inventory } });
         return;
       }
@@ -814,13 +834,14 @@ function RunCenterPage() {
           </form>
 
           <section className="run-result" aria-live="polite">
-            {!launch && (
+            {pendingLive && <LivePendingPanel pending={pendingLive} />}
+            {!launch && !pendingLive && (
               <section className="state-panel">
                 <strong>Ready to compile</strong>
                 <p>Select a variation and launch a local NVS compile-only run.</p>
               </section>
             )}
-            {launch?.status === 'loading' && (
+            {launch?.status === 'loading' && !pendingLive && (
               <LoadingPanel
                 label={
                   runType === 'LIVE_API'
@@ -889,6 +910,57 @@ function LiveReadinessPanel({
           </li>
         ))}
       </ul>
+    </section>
+  );
+}
+
+function LivePendingPanel({
+  pending,
+}: {
+  pending: { runId: string; progress?: RunProgress; inventory?: ResourceInventory };
+}) {
+  const currentObservation = pending.progress?.observations.at(-1);
+  const completedSteps = pending.progress?.checkpoint?.completedStepIds.length ?? 0;
+  return (
+    <section className="detail-section" role="status">
+      <div className="section-heading">
+        <div>
+          <p className="eyebrow">Live API progress</p>
+          <h2>
+            <StatusBadge value={pending.progress?.status ?? 'ACCEPTED'} /> Run{' '}
+            <code>{pending.runId}</code>
+          </h2>
+        </div>
+        <span>{completedSteps} completed</span>
+      </div>
+      <dl className="definition-list">
+        <div>
+          <dt>Verdict</dt>
+          <dd>{pending.progress?.verdict ?? 'PENDING'}</dd>
+        </div>
+        <div>
+          <dt>Current step</dt>
+          <dd>{currentObservation?.sourceStepId ?? 'Waiting for first observation'}</dd>
+        </div>
+        {pending.inventory?.incident && (
+          <div>
+            <dt>Incident</dt>
+            <dd>
+              <code>{pending.inventory.incident.number ?? pending.inventory.incident.id}</code>
+              {pending.inventory.incident.status ? ` - ${pending.inventory.incident.status}` : ''}
+            </dd>
+          </div>
+        )}
+      </dl>
+      {pending.progress?.status === 'RECOVERY_REQUIRED' && (
+        <div className="typed-error">
+          <strong>Operator recovery required</strong>
+          <p>
+            The durable in-flight checkpoint is still present. Use the run ID and inventory above to
+            inspect recovery before launching another live run.
+          </p>
+        </div>
+      )}
     </section>
   );
 }

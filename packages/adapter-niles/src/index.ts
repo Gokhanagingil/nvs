@@ -15,6 +15,7 @@ import {
   type NilesIncidentRecord,
   type NilesJournalSummary,
   type NilesSlaSummary,
+  type NilesTransportEvidence,
 } from '@nvs/core';
 
 export type FetchImplementation = (
@@ -590,12 +591,49 @@ export class NilesAuthenticationAdapter implements ActorAuthenticator {
 }
 
 class NilesLiveAdapterOperationError extends Error {
+  readonly code: string;
+  readonly category: 'PRODUCT' | 'ADAPTER' | 'ENVIRONMENT';
+  readonly retryable: boolean;
+
   constructor(
     readonly status: number,
     operation: string,
   ) {
     super(`NILES live API operation failed: ${operation}.`);
     this.name = 'NilesLiveAdapterOperationError';
+    if (status === 0) {
+      this.code = 'NILES_NETWORK_OR_TIMEOUT';
+      this.category = 'ADAPTER';
+      this.retryable = true;
+    } else if (status === 400) {
+      this.code = 'NILES_PRODUCT_RULE_REJECTED';
+      this.category = 'PRODUCT';
+      this.retryable = false;
+    } else if (status === 401 || status === 403) {
+      this.code = 'NILES_AUTHORIZATION_DENIED';
+      this.category = 'ENVIRONMENT';
+      this.retryable = false;
+    } else if (status === 404) {
+      this.code = 'NILES_RESOURCE_MISSING';
+      this.category = 'ENVIRONMENT';
+      this.retryable = false;
+    } else if (status === 409) {
+      this.code = 'NILES_CONFLICT';
+      this.category = 'PRODUCT';
+      this.retryable = false;
+    } else if (status === 429) {
+      this.code = 'NILES_RATE_LIMITED';
+      this.category = 'ADAPTER';
+      this.retryable = true;
+    } else if (status >= 500) {
+      this.code = status === 502 ? 'NILES_MALFORMED_RESPONSE' : 'NILES_UPSTREAM_FAILURE';
+      this.category = 'ADAPTER';
+      this.retryable = status !== 502;
+    } else {
+      this.code = 'NILES_LIVE_HTTP_FAILURE';
+      this.category = 'ADAPTER';
+      this.retryable = false;
+    }
   }
 }
 
@@ -640,7 +678,8 @@ function normalizeResource(
     throw new NilesLiveAdapterOperationError(502, operation);
   }
   const label = safeString(payload?.['name']) ?? safeString(payload?.['displayName']);
-  return { id, ...(label ? { label } : {}) };
+  const serviceId = safeString(payload?.['serviceId']);
+  return { id, ...(label ? { label } : {}), ...(serviceId ? { serviceId } : {}) };
 }
 
 function asArrayPayload(value: unknown): unknown[] {
@@ -668,10 +707,12 @@ export class NilesIncidentApiAdapter implements NilesIncidentLiveAdapter {
     correlationId: string;
     method: 'GET' | 'POST' | 'DELETE';
     path: string;
+    pathTemplate: string;
     operation: string;
     body?: unknown;
-  }): Promise<unknown> {
+  }): Promise<{ payload: unknown; transport: NilesTransportEvidence }> {
     let response: Response;
+    const startedAt = performance.now();
     try {
       response = await withAuthenticationTimeout(this.timeoutMs, (signal) =>
         input.session.withAuthorization((authorization) =>
@@ -695,7 +736,16 @@ export class NilesIncidentApiAdapter implements NilesIncidentLiveAdapter {
     if (!response.ok) {
       throw new NilesLiveAdapterOperationError(response.status, input.operation);
     }
-    return readJson(response);
+    return {
+      payload: await readJson(response),
+      transport: {
+        method: input.method,
+        pathTemplate: input.pathTemplate,
+        httpStatus: response.status,
+        durationMs: Math.max(0, Math.round(performance.now() - startedAt)),
+        correlationId: input.correlationId,
+      },
+    };
   }
 
   verifyResource(input: {
@@ -714,9 +764,24 @@ export class NilesIncidentApiAdapter implements NilesIncidentLiveAdapter {
           : input.kind === 'OFFERING'
             ? `/grc/cmdb/service-offerings/${input.id}`
             : `/grc/cmdb/cis/${input.id}`;
-    return this.request({ ...input, method: 'GET', path, operation: `verify ${input.kind}` }).then(
-      (payload) => normalizeResource(payload, input.id, `verify ${input.kind}`),
-    );
+    const pathTemplate =
+      input.kind === 'ASSIGNMENT_GROUP'
+        ? '/grc/groups/:id'
+        : input.kind === 'SERVICE'
+          ? '/grc/cmdb/services/:id'
+          : input.kind === 'OFFERING'
+            ? '/grc/cmdb/service-offerings/:id'
+            : '/grc/cmdb/cis/:id';
+    return this.request({
+      ...input,
+      method: 'GET',
+      path,
+      pathTemplate,
+      operation: `verify ${input.kind}`,
+    }).then((response) => ({
+      ...normalizeResource(response.payload, input.id, `verify ${input.kind}`),
+      transport: response.transport,
+    }));
   }
 
   createIncident(input: {
@@ -737,6 +802,7 @@ export class NilesIncidentApiAdapter implements NilesIncidentLiveAdapter {
       ...input,
       method: 'POST',
       path: '/grc/itsm/incidents',
+      pathTemplate: '/grc/itsm/incidents',
       operation: 'create incident',
       body: {
         shortDescription: `${input.runNamespacePrefix}-${input.runId} payment API degradation`,
@@ -759,7 +825,10 @@ export class NilesIncidentApiAdapter implements NilesIncidentLiveAdapter {
           },
         },
       },
-    }).then(normalizeIncident);
+    }).then((response) => ({
+      ...normalizeIncident(response.payload),
+      transport: response.transport,
+    }));
   }
 
   readIncident(input: {
@@ -773,8 +842,12 @@ export class NilesIncidentApiAdapter implements NilesIncidentLiveAdapter {
       ...input,
       method: 'GET',
       path: `/grc/itsm/incidents/${input.incidentId}`,
+      pathTemplate: '/grc/itsm/incidents/:incidentId',
       operation: 'read incident',
-    }).then(normalizeIncident);
+    }).then((response) => ({
+      ...normalizeIncident(response.payload),
+      transport: response.transport,
+    }));
   }
 
   assignIncident(input: {
@@ -789,9 +862,13 @@ export class NilesIncidentApiAdapter implements NilesIncidentLiveAdapter {
       ...input,
       method: 'POST',
       path: `/grc/itsm/incidents/${input.incidentId}/assign`,
+      pathTemplate: '/grc/itsm/incidents/:incidentId/assign',
       operation: 'assign incident',
       body: { assignmentGroupId: input.assignmentGroupId },
-    }).then(normalizeIncident);
+    }).then((response) => ({
+      ...normalizeIncident(response.payload),
+      transport: response.transport,
+    }));
   }
 
   takeOwnership(input: {
@@ -805,8 +882,12 @@ export class NilesIncidentApiAdapter implements NilesIncidentLiveAdapter {
       ...input,
       method: 'POST',
       path: `/grc/itsm/incidents/${input.incidentId}/take-ownership`,
+      pathTemplate: '/grc/itsm/incidents/:incidentId/take-ownership',
       operation: 'take ownership',
-    }).then(normalizeIncident);
+    }).then((response) => ({
+      ...normalizeIncident(response.payload),
+      transport: response.transport,
+    }));
   }
 
   startWork(input: {
@@ -820,8 +901,12 @@ export class NilesIncidentApiAdapter implements NilesIncidentLiveAdapter {
       ...input,
       method: 'POST',
       path: `/grc/itsm/incidents/${input.incidentId}/start-work`,
+      pathTemplate: '/grc/itsm/incidents/:incidentId/start-work',
       operation: 'start work',
-    }).then(normalizeIncident);
+    }).then((response) => ({
+      ...normalizeIncident(response.payload),
+      transport: response.transport,
+    }));
   }
 
   async addAffectedCi(input: {
@@ -830,15 +915,23 @@ export class NilesIncidentApiAdapter implements NilesIncidentLiveAdapter {
     tenantId: string;
     incidentId: string;
     ciId: string;
+    relationshipType: string;
+    impactScope?: string;
     correlationId: string;
-  }): Promise<void> {
-    await this.request({
+  }): Promise<NilesTransportEvidence> {
+    const response = await this.request({
       ...input,
       method: 'POST',
       path: `/grc/itsm/incidents/${input.incidentId}/affected-cis`,
+      pathTemplate: '/grc/itsm/incidents/:incidentId/affected-cis',
       operation: 'add affected CI',
-      body: { ciId: input.ciId, relationshipType: 'affected', impactScope: 'service-impact' },
+      body: {
+        ciId: input.ciId,
+        relationshipType: input.relationshipType,
+        ...(input.impactScope ? { impactScope: input.impactScope } : {}),
+      },
     });
+    return response.transport;
   }
 
   listAffectedCis(input: {
@@ -852,9 +945,10 @@ export class NilesIncidentApiAdapter implements NilesIncidentLiveAdapter {
       ...input,
       method: 'GET',
       path: `/grc/itsm/incidents/${input.incidentId}/affected-cis`,
+      pathTemplate: '/grc/itsm/incidents/:incidentId/affected-cis',
       operation: 'list affected CIs',
-    }).then((payload) =>
-      asArrayPayload(payload).flatMap((record) => {
+    }).then((response) =>
+      asArrayPayload(response.payload).flatMap((record) => {
         const value = asRecord(record) ?? {};
         const ciId =
           safeString(value['ciId']) ??
@@ -876,9 +970,11 @@ export class NilesIncidentApiAdapter implements NilesIncidentLiveAdapter {
       ...input,
       method: 'GET',
       path: `/grc/itsm/sla/records/INCIDENT/${input.incidentId}`,
+      pathTemplate: '/grc/itsm/sla/records/INCIDENT/:incidentId',
       operation: 'read SLA summary',
-    }).then((payload) => ({
-      records: asArrayPayload(payload).map((record) => {
+    }).then((response) => ({
+      transport: response.transport,
+      records: asArrayPayload(response.payload).map((record) => {
         const value = asRecord(record) ?? {};
         const summary: NilesSlaSummary['records'][number] = {
           id: safeString(value['id']) ?? 'unknown',
@@ -888,6 +984,19 @@ export class NilesIncidentApiAdapter implements NilesIncidentLiveAdapter {
         if (objectiveType) summary.objectiveType = objectiveType;
         if (status) summary.status = status;
         if (typeof value['breached'] === 'boolean') summary.breached = value['breached'];
+        const pauseAt = safeString(value['pauseAt']);
+        const stopAt = safeString(value['stopAt']);
+        if (pauseAt) summary.pauseAt = pauseAt;
+        if (stopAt) summary.stopAt = stopAt;
+        for (const key of [
+          'elapsedSeconds',
+          'remainingSeconds',
+          'pausedDurationSeconds',
+        ] as const) {
+          if (typeof value[key] === 'number' && Number.isFinite(value[key])) {
+            summary[key] = value[key];
+          }
+        }
         return summary;
       }),
     }));
@@ -903,11 +1012,33 @@ export class NilesIncidentApiAdapter implements NilesIncidentLiveAdapter {
     return this.request({
       ...input,
       method: 'GET',
-      path: `/grc/itsm/incidents/${input.incidentId}/journal/count`,
+      path: `/grc/itsm/incidents/${input.incidentId}/journal`,
+      pathTemplate: '/grc/itsm/incidents/:incidentId/journal',
       operation: 'read journal count',
-    }).then((payload) => {
-      const value = unwrapPayload(payload);
-      return { count: typeof value?.['count'] === 'number' ? value['count'] : 0 };
+    }).then((response) => {
+      const entries = asArrayPayload(response.payload).flatMap((entry) => {
+        const value = asRecord(entry) ?? {};
+        const id = safeString(value['id']);
+        const action = safeString(value['action']);
+        const createdBy = safeString(value['createdBy']);
+        const createdAt = safeString(value['createdAt']);
+        return id
+          ? [
+              {
+                id,
+                ...(action ? { action } : {}),
+                ...(createdBy ? { createdBy } : {}),
+                ...(createdAt ? { createdAt } : {}),
+              },
+            ]
+          : [];
+      });
+      const value = unwrapPayload(response.payload);
+      return {
+        count: entries.length || (typeof value?.['count'] === 'number' ? value['count'] : 0),
+        entries,
+        transport: response.transport,
+      };
     });
   }
 
@@ -924,12 +1055,16 @@ export class NilesIncidentApiAdapter implements NilesIncidentLiveAdapter {
       ...input,
       method: 'POST',
       path: `/grc/itsm/incidents/${input.incidentId}/hold`,
+      pathTemplate: '/grc/itsm/incidents/:incidentId/hold',
       operation: 'hold incident',
       body: {
         pendingReason: input.pendingReason,
         pendingReasonDetail: input.pendingReasonDetail,
       },
-    }).then(normalizeIncident);
+    }).then((response) => ({
+      ...normalizeIncident(response.payload),
+      transport: response.transport,
+    }));
   }
 
   resumeIncident(input: {
@@ -943,9 +1078,13 @@ export class NilesIncidentApiAdapter implements NilesIncidentLiveAdapter {
       ...input,
       method: 'POST',
       path: `/grc/itsm/incidents/${input.incidentId}/resume`,
+      pathTemplate: '/grc/itsm/incidents/:incidentId/resume',
       operation: 'resume incident',
       body: { status: 'in_progress' },
-    }).then(normalizeIncident);
+    }).then((response) => ({
+      ...normalizeIncident(response.payload),
+      transport: response.transport,
+    }));
   }
 
   resolveIncident(input: {
@@ -960,9 +1099,13 @@ export class NilesIncidentApiAdapter implements NilesIncidentLiveAdapter {
       ...input,
       method: 'POST',
       path: `/grc/itsm/incidents/${input.incidentId}/resolve`,
+      pathTemplate: '/grc/itsm/incidents/:incidentId/resolve',
       operation: 'resolve incident',
       body: { resolutionNotes: input.resolutionNotes },
-    }).then(normalizeIncident);
+    }).then((response) => ({
+      ...normalizeIncident(response.payload),
+      transport: response.transport,
+    }));
   }
 
   closeIncident(input: {
@@ -977,9 +1120,13 @@ export class NilesIncidentApiAdapter implements NilesIncidentLiveAdapter {
       ...input,
       method: 'POST',
       path: `/grc/itsm/incidents/${input.incidentId}/close`,
+      pathTemplate: '/grc/itsm/incidents/:incidentId/close',
       operation: 'close incident',
       body: { closureNote: input.closureNote },
-    }).then(normalizeIncident);
+    }).then((response) => ({
+      ...normalizeIncident(response.payload),
+      transport: response.transport,
+    }));
   }
 
   async softDeleteIncident(input: {
@@ -988,13 +1135,15 @@ export class NilesIncidentApiAdapter implements NilesIncidentLiveAdapter {
     tenantId: string;
     incidentId: string;
     correlationId: string;
-  }): Promise<void> {
-    await this.request({
+  }): Promise<NilesTransportEvidence> {
+    const response = await this.request({
       ...input,
       method: 'DELETE',
       path: `/grc/itsm/incidents/${input.incidentId}`,
+      pathTemplate: '/grc/itsm/incidents/:incidentId',
       operation: 'soft delete incident',
     });
+    return response.transport;
   }
 
   async verifyIncidentDeleted(input: {

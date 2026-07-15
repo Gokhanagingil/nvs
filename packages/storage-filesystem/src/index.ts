@@ -282,6 +282,7 @@ const ALL_BUNDLE_DOCUMENTS = [...BASE_BUNDLE_DOCUMENTS, ...EXTRA_BUNDLE_DOCUMENT
 export interface BundlePersistenceHooks {
   afterWrite?(document: BundleDocument): Promise<void> | void;
   beforeCommit?(): Promise<void> | void;
+  beforePromote?(document: BundleDocument | '.committed'): Promise<void> | void;
 }
 
 type LiveStateDocument = 'plan.json' | 'checkpoint.json' | 'inventory.json' | 'observations.json';
@@ -490,8 +491,10 @@ export class FilesystemRunBundleRepository implements RunBundleRepository {
       }
 
       for (const document of documents) {
+        await this.hooks.beforePromote?.(document);
         await rename(safeChild(stagingDirectory, document), safeChild(finalDirectory, document));
       }
+      await this.hooks.beforePromote?.('.committed');
       await rename(
         safeChild(stagingDirectory, '.committed'),
         safeChild(finalDirectory, '.committed'),
@@ -667,6 +670,66 @@ export class FilesystemLiveRunStateRepository implements LiveRunStateRepository 
   private directory(runId: string): string {
     assertSafeId(runId);
     return safeChild(this.root(), runId);
+  }
+
+  async reserve(state: LiveRunState): Promise<void> {
+    assertSafeId(state.runId);
+    const finalDirectory = safeChild(this.artifactRoot, 'runs', state.runId);
+    try {
+      await readFile(safeChild(finalDirectory, '.committed'), 'utf8');
+      throw new RunIdAlreadyExistsError();
+    } catch (error) {
+      if (!isMissing(error)) {
+        throw error;
+      }
+    }
+
+    const directory = this.directory(state.runId);
+    await mkdir(this.root(), { recursive: true });
+    try {
+      await mkdir(directory);
+    } catch (error) {
+      if (isAlreadyExists(error)) {
+        throw new RunIdAlreadyExistsError();
+      }
+      throw error;
+    }
+
+    try {
+      const parsedState: LiveRunState = {
+        runId: state.runId,
+        plan: executablePlanV1Schema.parse(state.plan),
+        checkpoint: liveRunCheckpointV1Schema.parse(state.checkpoint),
+        resourceInventory: resourceInventoryV1Schema.parse(state.resourceInventory),
+        observations: stepObservationV1Schema.array().parse(state.observations),
+      };
+      await writeFile(
+        safeChild(directory, 'plan.json'),
+        serializeForPersistence(parsedState.plan),
+        {
+          encoding: 'utf8',
+          flag: 'wx',
+        },
+      );
+      await writeFile(
+        safeChild(directory, 'checkpoint.json'),
+        serializeForPersistence(parsedState.checkpoint),
+        { encoding: 'utf8', flag: 'wx' },
+      );
+      await writeFile(
+        safeChild(directory, 'inventory.json'),
+        serializeForPersistence(parsedState.resourceInventory),
+        { encoding: 'utf8', flag: 'wx' },
+      );
+      await writeFile(
+        safeChild(directory, 'observations.json'),
+        serializeForPersistence(parsedState.observations),
+        { encoding: 'utf8', flag: 'wx' },
+      );
+    } catch (error) {
+      await rm(directory, { recursive: true, force: true }).catch(() => undefined);
+      throw error;
+    }
   }
 
   private async writeDocument(

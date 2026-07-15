@@ -21,6 +21,9 @@ resources:
   configurationItem:
     id: 77777777-7777-4777-8777-777777777777
     label: Synthetic Payment API CI
+  affectedCi:
+    relationshipType: affected
+    impactScope: service-impact
   impact: high
   urgency: high
   expectedPriority: p1

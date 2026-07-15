@@ -285,6 +285,7 @@ export interface LiveRunRecord {
   stepResults: Array<{
     stepId: string;
     executionStatus: 'PASS' | 'FAIL' | 'BLOCKED' | 'NOT_OBSERVED';
+    required?: boolean;
     observationId?: string;
     error?: TypedError;
   }>;
@@ -323,9 +324,14 @@ export interface StepObservation {
 export interface RunProgress {
   schemaVersion: 'nvs.run-progress/v1';
   runId: string;
-  status: 'PREPARED' | 'CREATED' | 'RUNNING' | 'COMPLETED' | 'BLOCKED_REQUIRES_RECOVERY';
-  verdict: 'PASS' | 'FAIL' | 'BLOCKED';
+  status: 'PREPARED' | 'CREATED' | 'RUNNING' | 'FINALIZING' | 'COMPLETED' | 'RECOVERY_REQUIRED';
+  verdict: 'PENDING' | 'PASS' | 'FAIL' | 'BLOCKED';
   observations: StepObservation[];
+  checkpoint?: {
+    status: 'PREPARED' | 'CREATED' | 'RUNNING' | 'FINALIZING' | 'COMPLETED' | 'RECOVERY_REQUIRED';
+    completedStepIds: string[];
+    incidentId?: string;
+  };
 }
 
 export type RunRecord = CompileOnlyRunRecord | LiveRunRecord;

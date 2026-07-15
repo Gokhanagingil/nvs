@@ -581,6 +581,13 @@ export const nilesIncidentFixtureV1Schema = z
         service: fixtureResourceRefSchema,
         offering: fixtureResourceRefSchema.optional(),
         configurationItem: fixtureResourceRefSchema.optional(),
+        affectedCi: z
+          .object({
+            relationshipType: z.string().min(1).max(80).default('affected'),
+            impactScope: z.string().min(1).max(120).optional(),
+          })
+          .strict()
+          .default({ relationshipType: 'affected', impactScope: 'service-impact' }),
         impact: incidentImpactSchema,
         urgency: incidentUrgencySchema,
         expectedPriority: z.enum(['p1', 'p2', 'p3', 'p4']).optional(),
@@ -956,6 +963,21 @@ export const resourceInventoryV1Schema = z
     runId: safeIdSchema,
     environmentId: safeIdSchema,
     tenantId: z.uuid(),
+    scenario: z
+      .object({
+        id: safeIdSchema,
+        version: z.string().min(1).max(80),
+      })
+      .strict()
+      .optional(),
+    createdAt: z.iso.datetime({ offset: true }).optional(),
+    createdBy: z
+      .object({
+        semanticActorId: safeIdSchema,
+        operationalActorId: safeIdSchema,
+      })
+      .strict()
+      .optional(),
     incident: z
       .object({
         id: z.uuid(),
@@ -1024,6 +1046,7 @@ const liveStepResultV2Schema = z
   .object({
     stepId: safeIdSchema,
     executionStatus: z.enum(['PASS', 'FAIL', 'BLOCKED', 'NOT_OBSERVED']),
+    required: z.boolean().default(true),
     observationId: safeIdSchema.optional(),
     error: typedErrorSchema.optional(),
   })
@@ -1103,7 +1126,13 @@ export const runRecordV2Schema = z
       });
     }
     if (run.verdict === 'PASS') {
-      if (run.stepResults.some((step) => step.executionStatus !== 'PASS')) {
+      if (
+        run.stepResults.some(
+          (step) =>
+            step.executionStatus !== 'PASS' &&
+            !(step.executionStatus === 'NOT_OBSERVED' && !step.required),
+        )
+      ) {
         context.addIssue({
           code: 'custom',
           path: ['stepResults'],
@@ -1151,7 +1180,14 @@ export const liveRunCheckpointV1Schema = z
     runId: safeIdSchema,
     environmentId: safeIdSchema,
     fixtureId: safeIdSchema,
-    status: z.enum(['PREPARED', 'CREATED', 'RUNNING', 'COMPLETED', 'BLOCKED_REQUIRES_RECOVERY']),
+    status: z.enum([
+      'PREPARED',
+      'CREATED',
+      'RUNNING',
+      'FINALIZING',
+      'COMPLETED',
+      'RECOVERY_REQUIRED',
+    ]),
     incidentId: z.uuid().optional(),
     completedStepIds: z.array(safeIdSchema),
     cleanup: z

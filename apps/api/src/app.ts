@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import {
@@ -70,10 +71,8 @@ export interface BuildAppOptions {
   logger?: boolean;
 }
 
-let runSequence = 0;
 function defaultRunId(): string {
-  runSequence += 1;
-  return `run_${Date.now().toString(36)}_${runSequence.toString(36)}`;
+  return `run_${randomUUID().replaceAll('-', '')}`;
 }
 
 export function createCore(rootDir: string, fetchImplementation?: FetchImplementation): NvsCore {
@@ -151,7 +150,9 @@ function safeError(error: unknown): {
   if (error instanceof LiveRunBlockedError) {
     return {
       statusCode:
-        error.code === 'LIVE_RUN_IN_PROGRESS' || error.code === 'LIVE_RUN_REQUIRES_RECOVERY'
+        error.code === 'LIVE_RUN_IN_PROGRESS' ||
+        error.code === 'LIVE_RUN_REQUIRES_RECOVERY' ||
+        error.code === 'RUN_ID_ALREADY_EXISTS'
           ? 409
           : 403,
       body: {

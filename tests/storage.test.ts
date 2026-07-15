@@ -181,4 +181,27 @@ describe('filesystem repositories', () => {
       ).rejects.toMatchObject({ code: 'ENOENT' });
     },
   );
+
+  it.each(['run.json', '.committed'] as const)(
+    'does not expose a partial PASS run when %s promotion fails',
+    async (failedDocument) => {
+      const hooks: BundlePersistenceHooks = {
+        beforePromote(document) {
+          if (document === failedDocument) {
+            throw new Error(`injected ${document} promotion failure`);
+          }
+        },
+      };
+      const bundles = new FilesystemRunBundleRepository(temporaryRoot, hooks);
+
+      await expect(createRun(bundles, 'promotion-failure-run')).rejects.toThrow(
+        `injected ${failedDocument} promotion failure`,
+      );
+      await expect(bundles.list()).resolves.toEqual([]);
+      await expect(bundles.get('promotion-failure-run')).resolves.toBeUndefined();
+      await expect(
+        readdir(path.join(temporaryRoot, 'runs', 'promotion-failure-run')),
+      ).rejects.toMatchObject({ code: 'ENOENT' });
+    },
+  );
 });

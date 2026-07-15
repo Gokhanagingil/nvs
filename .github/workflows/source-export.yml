@@ -1,0 +1,35 @@
+name: source-export
+
+on:
+  push:
+    branches:
+      - agent/m1-02b-real-incident-api
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - name: Package reviewed source
+        run: |
+          tar \
+            --exclude=.git \
+            --exclude=node_modules \
+            --exclude=artifacts \
+            --exclude=playwright-report \
+            --exclude=test-results \
+            -czf "$RUNNER_TEMP/nvs-source.tar.gz" .
+      - name: Upload source archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: nvs-source-${{ github.sha }}
+          path: ${{ runner.temp }}/nvs-source.tar.gz
+          if-no-files-found: error
+          retention-days: 1

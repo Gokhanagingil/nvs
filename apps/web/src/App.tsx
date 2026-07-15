@@ -16,9 +16,12 @@ import type {
   BuildInformation,
   CoverageResult,
   EnvironmentDefinition,
+  ExecutionReadiness,
   EvidenceManifest,
   ExecutablePlan,
   ProbeResult,
+  ResourceInventory,
+  RunProgress,
   RunRecord,
   Scenario,
 } from './types.js';
@@ -156,8 +159,8 @@ function Shell() {
         </Routes>
       </main>
       <footer>
-        M1-02A proves deployability and actor authentication readiness only. It creates no NILES
-        Incident records.
+        Live NILES mutation remains disabled unless the server switch, fixture, readiness, and
+        explicit confirmation gates all pass.
       </footer>
     </div>
   );
@@ -527,13 +530,18 @@ interface LaunchResult {
   run: RunRecord;
   plan: ExecutablePlan;
   scenario: Scenario;
+  progress?: RunProgress;
+  inventory?: ResourceInventory;
 }
 
 function RunCenterPage() {
   const [data, setData] = useState<Loadable<RunFormData>>({ status: 'loading' });
+  const [runType, setRunType] = useState<'COMPILE_ONLY' | 'LIVE_API'>('COMPILE_ONLY');
   const [environmentId, setEnvironmentId] = useState('');
   const [scenarioId, setScenarioId] = useState('');
   const [variationValues, setVariationValues] = useState<Record<string, string>>({});
+  const [confirmLive, setConfirmLive] = useState(false);
+  const [readiness, setReadiness] = useState<Loadable<ExecutionReadiness> | undefined>();
   const [launch, setLaunch] = useState<Loadable<LaunchResult> | undefined>();
 
   useEffect(() => {
@@ -578,6 +586,29 @@ function RunCenterPage() {
     );
   }, [selectedScenario]);
 
+  useEffect(() => {
+    if (runType !== 'LIVE_API' || !environmentId || !scenarioId) {
+      setReadiness(undefined);
+      return;
+    }
+    const params = new URLSearchParams({ scenarioId });
+    if (variationValues['journey']) {
+      params.set('journey', variationValues['journey']);
+    }
+    setReadiness({ status: 'loading' });
+    void apiRequest<ExecutionReadiness>(
+      `/api/environments/${encodeURIComponent(environmentId)}/execution-readiness?${params.toString()}`,
+    )
+      .then((result) => setReadiness({ status: 'ready', data: result }))
+      .catch((error: unknown) =>
+        setReadiness({
+          status: 'error',
+          message: errorMessage(error),
+          ...(error instanceof ApiError ? { code: error.code } : {}),
+        }),
+      );
+  }, [environmentId, scenarioId, runType, variationValues]);
+
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (!environmentId || !scenarioId) return;
@@ -586,17 +617,24 @@ function RunCenterPage() {
       const run = await apiRequest<RunRecord>('/api/runs', {
         method: 'POST',
         body: JSON.stringify({
-          runType: 'COMPILE_ONLY',
+          runType,
           environmentId,
           scenarioId,
           variationValues,
+          ...(runType === 'LIVE_API' ? { confirmRealMutation: true } : {}),
         }),
       });
-      const [plan, scenario] = await Promise.all([
+      const [plan, scenario, progress, inventory] = await Promise.all([
         apiRequest<ExecutablePlan>(`/api/runs/${encodeURIComponent(run.runId)}/plan`),
         apiRequest<Scenario>(`/api/scenarios/${encodeURIComponent(run.scenario.id)}`),
+        run.runType === 'LIVE_API'
+          ? apiRequest<RunProgress>(`/api/runs/${encodeURIComponent(run.runId)}/progress`)
+          : Promise.resolve(undefined),
+        run.runType === 'LIVE_API'
+          ? apiRequest<ResourceInventory>(`/api/runs/${encodeURIComponent(run.runId)}/inventory`)
+          : Promise.resolve(undefined),
       ]);
-      setLaunch({ status: 'ready', data: { run, plan, scenario } });
+      setLaunch({ status: 'ready', data: { run, plan, scenario, progress, inventory } });
     } catch (error) {
       setLaunch({
         status: 'error',
@@ -609,9 +647,9 @@ function RunCenterPage() {
   return (
     <>
       <PageHeader
-        eyebrow="Compile-only orchestration"
+        eyebrow="Run orchestration"
         title="Run Center"
-        description="Compile a selected business variation into a deterministic plan. M1-01 does not execute NILES mutations."
+        description="Compile a selected business variation or launch the guarded live Incident API slice when every live gate is satisfied."
       />
       {data.status === 'loading' && <LoadingPanel label="Loading run configuration…" />}
       {data.status === 'empty' && (
@@ -621,8 +659,21 @@ function RunCenterPage() {
       {data.status === 'ready' && (
         <div className="run-layout">
           <form className="card run-form" onSubmit={(event) => void submit(event)}>
-            <h2>Compile a scenario</h2>
-            <p className="muted">No environment probe or NILES mutation is part of this action.</p>
+            <h2>{runType === 'LIVE_API' ? 'Launch live API run' : 'Compile a scenario'}</h2>
+            <p className="muted">
+              {runType === 'LIVE_API'
+                ? 'Live API runs are limited to the frozen M1-02B journey after readiness and confirmation gates pass.'
+                : 'No environment probe or NILES mutation is part of this action.'}
+            </p>
+            <label htmlFor="run-type">Run type</label>
+            <select
+              id="run-type"
+              value={runType}
+              onChange={(event) => setRunType(event.target.value as 'COMPILE_ONLY' | 'LIVE_API')}
+            >
+              <option value="COMPILE_ONLY">Compile only</option>
+              <option value="LIVE_API">Live Incident API</option>
+            </select>
             <label htmlFor="run-environment">Environment</label>
             <select
               id="run-environment"
@@ -669,10 +720,29 @@ function RunCenterPage() {
                 </select>
               </div>
             ))}
+            {runType === 'LIVE_API' && (
+              <>
+                <LiveReadinessPanel readiness={readiness} />
+                <label className="checkbox-field">
+                  <input
+                    type="checkbox"
+                    checked={confirmLive}
+                    onChange={(event) => setConfirmLive(event.target.checked)}
+                  />
+                  Confirm this may create or change a synthetic non-production NILES Incident.
+                </label>
+              </>
+            )}
             <button
               className="button button-primary"
               type="submit"
-              disabled={launch?.status === 'loading'}
+              disabled={
+                launch?.status === 'loading' ||
+                (runType === 'LIVE_API' &&
+                  (!confirmLive ||
+                    readiness?.status !== 'ready' ||
+                    readiness.data.verdict !== 'PASS'))
+              }
             >
               {launch?.status === 'loading'
                 ? 'Compiling business plan…'
@@ -695,7 +765,12 @@ function RunCenterPage() {
                 message={launch.message}
               />
             )}
-            {launch?.status === 'ready' && <CompileOnlyResult result={launch.data} />}
+            {launch?.status === 'ready' &&
+              (launch.data.run.runType === 'LIVE_API' ? (
+                <LiveRunResult result={launch.data} />
+              ) : (
+                <CompileOnlyResult result={launch.data} />
+              ))}
           </section>
         </div>
       )}
@@ -703,7 +778,144 @@ function RunCenterPage() {
   );
 }
 
+function LiveReadinessPanel({
+  readiness,
+}: {
+  readiness: Loadable<ExecutionReadiness> | undefined;
+}) {
+  if (!readiness) return null;
+  if (readiness.status === 'loading') {
+    return <LoadingPanel label="Checking live API readiness..." />;
+  }
+  if (readiness.status === 'error') {
+    return (
+      <ErrorPanel
+        title={`Live readiness unavailable${readiness.code ? ` - ${readiness.code}` : ''}`}
+        message={readiness.message}
+      />
+    );
+  }
+  if (readiness.status === 'empty') {
+    return null;
+  }
+  return (
+    <section className={`live-readiness ${readiness.data.verdict.toLowerCase()}`}>
+      <header>
+        <div>
+          <p className="eyebrow">Live API readiness</p>
+          <h3>
+            <StatusBadge value={readiness.data.verdict} />{' '}
+            {readiness.data.mutationEligible ? 'Mutation eligible' : 'Blocked'}
+          </h3>
+        </div>
+      </header>
+      <ul>
+        {readiness.data.checks.map((check) => (
+          <li key={check.id}>
+            <StatusBadge value={check.status} />
+            <span>{check.message}</span>
+            {check.code && <code>{check.code}</code>}
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
+function LiveRunResult({ result }: { result: LaunchResult }) {
+  if (result.run.runType !== 'LIVE_API') return null;
+  return (
+    <>
+      <section className="scope-warning" role="status">
+        <div className="status-pair">
+          <StatusBadge value={result.run.verdict} />
+          <StatusBadge value={result.run.assuranceScope} />
+        </div>
+        <h2>Live Incident API run completed</h2>
+        <p>
+          Gate eligible: <strong>{result.run.gateEligible ? 'Yes' : 'No'}</strong>. Cleanup:{' '}
+          <strong>{result.run.cleanup.status}</strong> via {result.run.cleanup.policy}.
+        </p>
+        {result.run.error && (
+          <div className="typed-error">
+            <strong>
+              {result.run.error.category} - {result.run.error.code}
+            </strong>
+            <p>{result.run.error.message}</p>
+          </div>
+        )}
+      </section>
+      {result.inventory && (
+        <section className="detail-section">
+          <div className="section-heading">
+            <div>
+              <p className="eyebrow">Resource disposition</p>
+              <h2>Inventory</h2>
+            </div>
+            {result.inventory.incident && (
+              <StatusBadge value={result.inventory.incident.disposition} />
+            )}
+          </div>
+          <dl className="definition-list">
+            {result.inventory.incident && (
+              <div>
+                <dt>Incident</dt>
+                <dd>
+                  <code>{result.inventory.incident.number ?? result.inventory.incident.id}</code>
+                  {result.inventory.incident.status ? ` - ${result.inventory.incident.status}` : ''}
+                </dd>
+              </div>
+            )}
+            <div>
+              <dt>Tenant</dt>
+              <dd>
+                <code>{result.inventory.tenantId}</code>
+              </dd>
+            </div>
+          </dl>
+        </section>
+      )}
+      {result.progress && (
+        <section className="detail-section">
+          <div className="section-heading">
+            <div>
+              <p className="eyebrow">Runtime observations</p>
+              <h2>Step progress</h2>
+            </div>
+            <span>{result.progress.observations.length} observed</span>
+          </div>
+          <ol className="progress-list">
+            {result.progress.observations.map((observation) => (
+              <li key={observation.id}>
+                <span className="progress-dot" aria-hidden="true">
+                  {observation.status === 'PASS' ? 'ok' : '!'}
+                </span>
+                <div>
+                  <h3>{observation.sourceStepId.replaceAll('-', ' ')}</h3>
+                  <div className="status-pair">
+                    <StatusBadge value={observation.status} />
+                    <code>{observation.action}</code>
+                  </div>
+                  {observation.error && (
+                    <small>
+                      {observation.error.category} - {observation.error.code}
+                    </small>
+                  )}
+                </div>
+              </li>
+            ))}
+          </ol>
+          <Link className="button button-secondary" to={`/evidence?runId=${result.run.runId}`}>
+            View evidence
+          </Link>
+        </section>
+      )}
+    </>
+  );
+}
+
 function CompileOnlyResult({ result }: { result: LaunchResult }) {
+  if (result.run.runType !== 'COMPILE_ONLY') return null;
   const sourceSteps = new Map(result.scenario.steps.map((step) => [step.id, step]));
   return (
     <>
@@ -771,6 +983,8 @@ interface EvidenceDetail {
   evidence: EvidenceManifest;
   plan: ExecutablePlan;
   scenario: Scenario;
+  progress?: RunProgress;
+  inventory?: ResourceInventory;
 }
 
 function EvidenceExplorerPage() {
@@ -799,10 +1013,19 @@ function EvidenceExplorerPage() {
       apiRequest<ExecutablePlan>(`/api/runs/${encodeURIComponent(selectedRunId)}/plan`),
     ])
       .then(async ([run, evidence, plan]) => {
-        const scenario = await apiRequest<Scenario>(
-          `/api/scenarios/${encodeURIComponent(run.scenario.id)}`,
-        );
-        setDetail({ status: 'ready', data: { run, evidence, plan, scenario } });
+        const [scenario, progress, inventory] = await Promise.all([
+          apiRequest<Scenario>(`/api/scenarios/${encodeURIComponent(run.scenario.id)}`),
+          run.runType === 'LIVE_API'
+            ? apiRequest<RunProgress>(`/api/runs/${encodeURIComponent(run.runId)}/progress`)
+            : Promise.resolve(undefined),
+          run.runType === 'LIVE_API'
+            ? apiRequest<ResourceInventory>(`/api/runs/${encodeURIComponent(run.runId)}/inventory`)
+            : Promise.resolve(undefined),
+        ]);
+        setDetail({
+          status: 'ready',
+          data: { run, evidence, plan, scenario, progress, inventory },
+        });
       })
       .catch((error: unknown) => setDetail({ status: 'error', message: errorMessage(error) }));
   }, [selectedRunId]);
@@ -846,7 +1069,50 @@ function EvidenceExplorerPage() {
   );
 }
 
+function EvidenceManifestSection({ evidence }: { evidence: EvidenceManifest }) {
+  return (
+    <section className="detail-section">
+      <div className="section-heading">
+        <div>
+          <p className="eyebrow">Sanitized artifact index</p>
+          <h2>Evidence manifest</h2>
+        </div>
+        <span>{evidence.entries.length} entries</span>
+      </div>
+      <ul className="manifest-list">
+        {evidence.entries.map((entry) => (
+          <li key={entry.id}>
+            <StatusBadge value={entry.kind} />
+            <div>
+              <strong>{entry.id}</strong>
+              <code>{entry.path}</code>
+              <small>{entry.mediaType}</small>
+              {entry.sha256 && (
+                <small>
+                  SHA-256 <code>{entry.sha256}</code>
+                </small>
+              )}
+            </div>
+          </li>
+        ))}
+      </ul>
+      <p className="sanitization-note">
+        Sanitization applied: <strong>{evidence.sanitization.applied ? 'Yes' : 'No'}</strong>.
+        Confidential field values are not displayed.
+      </p>
+    </section>
+  );
+}
+
 function EvidenceDetailView({ detail }: { detail: EvidenceDetail }) {
+  if (detail.run.runType === 'LIVE_API') {
+    return (
+      <div className="evidence-layout">
+        <LiveRunResult result={detail} />
+        <EvidenceManifestSection evidence={detail.evidence} />
+      </div>
+    );
+  }
   const businessSteps = new Map(detail.scenario.steps.map((step) => [step.id, step]));
   const typedErrors = [
     ...(detail.run.error ? [detail.run.error] : []),

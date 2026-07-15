@@ -13,4 +13,13 @@ capabilities:
   openApi: true
   version: true
 authProfileRef: niles.staging-readonly
+execution:
+  schemaVersion: nvs.environment-execution-policy/v1
+  liveApiEnabled: false
+  allowedRunTypes: [COMPILE_ONLY, LIVE_API]
+  fixtureProfileRef: fixture.incident-payment
+  liveRunAllowlist:
+    - scenarioId: payment-api-service-degradation
+      variationValues:
+        journey: normal
 enabled: false

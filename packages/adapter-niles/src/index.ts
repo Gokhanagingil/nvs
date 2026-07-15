@@ -10,6 +10,11 @@ import {
   type ActorSession,
   type AuthenticationCredential,
   type EnvironmentProbe,
+  type NilesFixtureResource,
+  type NilesIncidentLiveAdapter,
+  type NilesIncidentRecord,
+  type NilesJournalSummary,
+  type NilesSlaSummary,
 } from '@nvs/core';
 
 export type FetchImplementation = (
@@ -581,5 +586,403 @@ export class NilesAuthenticationAdapter implements ActorAuthenticator {
       input.correlationId,
       accessToken,
     );
+  }
+}
+
+class NilesLiveAdapterOperationError extends Error {
+  constructor(
+    readonly status: number,
+    operation: string,
+  ) {
+    super(`NILES live API operation failed: ${operation}.`);
+    this.name = 'NilesLiveAdapterOperationError';
+  }
+}
+
+function safeString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function normalizeIncident(value: unknown): NilesIncidentRecord {
+  const payload = unwrapPayload(value);
+  const id = safeString(payload?.['id']);
+  if (!id || !UUID_PATTERN.test(id)) {
+    throw new NilesLiveAdapterOperationError(502, 'normalize incident');
+  }
+  const number = safeString(payload?.['number']);
+  const status = safeString(payload?.['status']);
+  const priority = safeString(payload?.['priority']);
+  const requesterId = safeString(payload?.['requesterId']);
+  const assignmentGroupId = safeString(payload?.['assignmentGroupId']);
+  const assignedTo = safeString(payload?.['assignedTo']);
+  const incident: NilesIncidentRecord = { id };
+  if (number) incident.number = number;
+  if (status && ['open', 'in_progress', 'on_hold', 'resolved', 'closed'].includes(status)) {
+    incident.status = status as NonNullable<NilesIncidentRecord['status']>;
+  }
+  if (priority && ['p1', 'p2', 'p3', 'p4'].includes(priority)) {
+    incident.priority = priority as NonNullable<NilesIncidentRecord['priority']>;
+  }
+  if (requesterId) incident.requesterId = requesterId;
+  if (assignmentGroupId) incident.assignmentGroupId = assignmentGroupId;
+  if (assignedTo) incident.assignedTo = assignedTo;
+  return incident;
+}
+
+function normalizeResource(
+  value: unknown,
+  expectedId: string,
+  operation: string,
+): NilesFixtureResource {
+  const payload = unwrapPayload(value);
+  const id = safeString(payload?.['id']);
+  if (!id || id !== expectedId) {
+    throw new NilesLiveAdapterOperationError(502, operation);
+  }
+  const label = safeString(payload?.['name']) ?? safeString(payload?.['displayName']);
+  return { id, ...(label ? { label } : {}) };
+}
+
+function asArrayPayload(value: unknown): unknown[] {
+  const payload = unwrapPayload(value);
+  if (Array.isArray(payload)) {
+    return payload;
+  }
+  const items = payload?.['items'];
+  if (Array.isArray(items)) {
+    return items;
+  }
+  return [];
+}
+
+export class NilesIncidentApiAdapter implements NilesIncidentLiveAdapter {
+  constructor(
+    private readonly fetchImplementation: FetchImplementation = fetch,
+    private readonly timeoutMs = DEFAULT_AUTHENTICATION_TIMEOUT_MS,
+  ) {}
+
+  private async request(input: {
+    environment: EnvironmentDefinitionV1;
+    session: ActorSession;
+    tenantId: string;
+    correlationId: string;
+    method: 'GET' | 'POST' | 'DELETE';
+    path: string;
+    operation: string;
+    body?: unknown;
+  }): Promise<unknown> {
+    let response: Response;
+    try {
+      response = await withAuthenticationTimeout(this.timeoutMs, (signal) =>
+        input.session.withAuthorization((authorization) =>
+          this.fetchImplementation(new URL(input.path, input.environment.baseUrl), {
+            method: input.method,
+            headers: {
+              accept: 'application/json',
+              authorization,
+              'x-tenant-id': input.tenantId,
+              'x-correlation-id': input.correlationId,
+              ...(input.body ? { 'content-type': 'application/json' } : {}),
+            },
+            ...(input.body ? { body: JSON.stringify(input.body) } : {}),
+            signal,
+          }),
+        ),
+      );
+    } catch {
+      throw new NilesLiveAdapterOperationError(0, input.operation);
+    }
+    if (!response.ok) {
+      throw new NilesLiveAdapterOperationError(response.status, input.operation);
+    }
+    return readJson(response);
+  }
+
+  verifyResource(input: {
+    environment: EnvironmentDefinitionV1;
+    session: ActorSession;
+    tenantId: string;
+    kind: 'ASSIGNMENT_GROUP' | 'SERVICE' | 'OFFERING' | 'CI';
+    id: string;
+    correlationId: string;
+  }): Promise<NilesFixtureResource> {
+    const path =
+      input.kind === 'ASSIGNMENT_GROUP'
+        ? `/grc/groups/${input.id}`
+        : input.kind === 'SERVICE'
+          ? `/grc/cmdb/services/${input.id}`
+          : input.kind === 'OFFERING'
+            ? `/grc/cmdb/service-offerings/${input.id}`
+            : `/grc/cmdb/cis/${input.id}`;
+    return this.request({ ...input, method: 'GET', path, operation: `verify ${input.kind}` }).then(
+      (payload) => normalizeResource(payload, input.id, `verify ${input.kind}`),
+    );
+  }
+
+  createIncident(input: {
+    environment: EnvironmentDefinitionV1;
+    session: ActorSession;
+    tenantId: string;
+    correlationId: string;
+    runId: string;
+    requesterUserId: string;
+    assignmentGroupId: string;
+    serviceId: string;
+    offeringId?: string;
+    impact: 'low' | 'medium' | 'high';
+    urgency: 'low' | 'medium' | 'high';
+  }): Promise<NilesIncidentRecord> {
+    return this.request({
+      ...input,
+      method: 'POST',
+      path: '/grc/itsm/incidents',
+      operation: 'create incident',
+      body: {
+        shortDescription: `NVS ${input.runId} payment API degradation`,
+        description:
+          'Synthetic NVS live API validation for customer-facing payment API degradation.',
+        category: 'software',
+        source: 'user',
+        impact: input.impact,
+        urgency: input.urgency,
+        requesterId: input.requesterUserId,
+        assignmentGroupId: input.assignmentGroupId,
+        serviceId: input.serviceId,
+        ...(input.offeringId ? { offeringId: input.offeringId } : {}),
+        metadata: {
+          nvs: {
+            schemaVersion: 'nvs.live-incident-metadata/v1',
+            runId: input.runId,
+            synthetic: true,
+          },
+        },
+      },
+    }).then(normalizeIncident);
+  }
+
+  readIncident(input: {
+    environment: EnvironmentDefinitionV1;
+    session: ActorSession;
+    tenantId: string;
+    incidentId: string;
+    correlationId: string;
+  }): Promise<NilesIncidentRecord> {
+    return this.request({
+      ...input,
+      method: 'GET',
+      path: `/grc/itsm/incidents/${input.incidentId}`,
+      operation: 'read incident',
+    }).then(normalizeIncident);
+  }
+
+  assignIncident(input: {
+    environment: EnvironmentDefinitionV1;
+    session: ActorSession;
+    tenantId: string;
+    incidentId: string;
+    assignmentGroupId: string;
+    correlationId: string;
+  }): Promise<NilesIncidentRecord> {
+    return this.request({
+      ...input,
+      method: 'POST',
+      path: `/grc/itsm/incidents/${input.incidentId}/assign`,
+      operation: 'assign incident',
+      body: { assignmentGroupId: input.assignmentGroupId },
+    }).then(normalizeIncident);
+  }
+
+  takeOwnership(input: {
+    environment: EnvironmentDefinitionV1;
+    session: ActorSession;
+    tenantId: string;
+    incidentId: string;
+    correlationId: string;
+  }): Promise<NilesIncidentRecord> {
+    return this.request({
+      ...input,
+      method: 'POST',
+      path: `/grc/itsm/incidents/${input.incidentId}/take-ownership`,
+      operation: 'take ownership',
+    }).then(normalizeIncident);
+  }
+
+  startWork(input: {
+    environment: EnvironmentDefinitionV1;
+    session: ActorSession;
+    tenantId: string;
+    incidentId: string;
+    correlationId: string;
+  }): Promise<NilesIncidentRecord> {
+    return this.request({
+      ...input,
+      method: 'POST',
+      path: `/grc/itsm/incidents/${input.incidentId}/start-work`,
+      operation: 'start work',
+    }).then(normalizeIncident);
+  }
+
+  async addAffectedCi(input: {
+    environment: EnvironmentDefinitionV1;
+    session: ActorSession;
+    tenantId: string;
+    incidentId: string;
+    ciId: string;
+    correlationId: string;
+  }): Promise<void> {
+    await this.request({
+      ...input,
+      method: 'POST',
+      path: `/grc/itsm/incidents/${input.incidentId}/affected-cis`,
+      operation: 'add affected CI',
+      body: { ciId: input.ciId, relationshipType: 'affected', impactScope: 'service-impact' },
+    });
+  }
+
+  readSlaSummary(input: {
+    environment: EnvironmentDefinitionV1;
+    session: ActorSession;
+    tenantId: string;
+    incidentId: string;
+    correlationId: string;
+  }): Promise<NilesSlaSummary> {
+    return this.request({
+      ...input,
+      method: 'GET',
+      path: `/grc/itsm/sla/records/INCIDENT/${input.incidentId}`,
+      operation: 'read SLA summary',
+    }).then((payload) => ({
+      records: asArrayPayload(payload).map((record) => {
+        const value = asRecord(record) ?? {};
+        const summary: NilesSlaSummary['records'][number] = {
+          id: safeString(value['id']) ?? 'unknown',
+        };
+        const objectiveType = safeString(value['objectiveType']);
+        const status = safeString(value['status']);
+        if (objectiveType) summary.objectiveType = objectiveType;
+        if (status) summary.status = status;
+        if (typeof value['breached'] === 'boolean') summary.breached = value['breached'];
+        return summary;
+      }),
+    }));
+  }
+
+  readJournalSummary(input: {
+    environment: EnvironmentDefinitionV1;
+    session: ActorSession;
+    tenantId: string;
+    incidentId: string;
+    correlationId: string;
+  }): Promise<NilesJournalSummary> {
+    return this.request({
+      ...input,
+      method: 'GET',
+      path: `/grc/itsm/incidents/${input.incidentId}/journal/count`,
+      operation: 'read journal count',
+    }).then((payload) => {
+      const value = unwrapPayload(payload);
+      return { count: typeof value?.['count'] === 'number' ? value['count'] : 0 };
+    });
+  }
+
+  holdIncident(input: {
+    environment: EnvironmentDefinitionV1;
+    session: ActorSession;
+    tenantId: string;
+    incidentId: string;
+    pendingReason: string;
+    pendingReasonDetail: string;
+    correlationId: string;
+  }): Promise<NilesIncidentRecord> {
+    return this.request({
+      ...input,
+      method: 'POST',
+      path: `/grc/itsm/incidents/${input.incidentId}/hold`,
+      operation: 'hold incident',
+      body: {
+        pendingReason: input.pendingReason,
+        pendingReasonDetail: input.pendingReasonDetail,
+      },
+    }).then(normalizeIncident);
+  }
+
+  resumeIncident(input: {
+    environment: EnvironmentDefinitionV1;
+    session: ActorSession;
+    tenantId: string;
+    incidentId: string;
+    correlationId: string;
+  }): Promise<NilesIncidentRecord> {
+    return this.request({
+      ...input,
+      method: 'POST',
+      path: `/grc/itsm/incidents/${input.incidentId}/resume`,
+      operation: 'resume incident',
+      body: { status: 'in_progress' },
+    }).then(normalizeIncident);
+  }
+
+  resolveIncident(input: {
+    environment: EnvironmentDefinitionV1;
+    session: ActorSession;
+    tenantId: string;
+    incidentId: string;
+    resolutionNotes: string;
+    correlationId: string;
+  }): Promise<NilesIncidentRecord> {
+    return this.request({
+      ...input,
+      method: 'POST',
+      path: `/grc/itsm/incidents/${input.incidentId}/resolve`,
+      operation: 'resolve incident',
+      body: { resolutionNotes: input.resolutionNotes },
+    }).then(normalizeIncident);
+  }
+
+  closeIncident(input: {
+    environment: EnvironmentDefinitionV1;
+    session: ActorSession;
+    tenantId: string;
+    incidentId: string;
+    closureNote: string;
+    correlationId: string;
+  }): Promise<NilesIncidentRecord> {
+    return this.request({
+      ...input,
+      method: 'POST',
+      path: `/grc/itsm/incidents/${input.incidentId}/close`,
+      operation: 'close incident',
+      body: { closureNote: input.closureNote },
+    }).then(normalizeIncident);
+  }
+
+  async softDeleteIncident(input: {
+    environment: EnvironmentDefinitionV1;
+    session: ActorSession;
+    tenantId: string;
+    incidentId: string;
+    correlationId: string;
+  }): Promise<void> {
+    await this.request({
+      ...input,
+      method: 'DELETE',
+      path: `/grc/itsm/incidents/${input.incidentId}`,
+      operation: 'soft delete incident',
+    });
+  }
+
+  async verifyIncidentDeleted(input: {
+    environment: EnvironmentDefinitionV1;
+    session: ActorSession;
+    tenantId: string;
+    incidentId: string;
+    correlationId: string;
+  }): Promise<boolean> {
+    try {
+      await this.readIncident(input);
+      return false;
+    } catch (error) {
+      return error instanceof NilesLiveAdapterOperationError && error.status === 404;
+    }
   }
 }

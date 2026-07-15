@@ -1,13 +1,13 @@
 # NVS — NILES Validation Suite
 
-NVS is an external, evidence-producing validation system for NILES. M1-02A packages the walking skeleton for deployment and adds safe independent synthetic-actor authentication readiness.
+NVS is an external, evidence-producing validation system for NILES. M1-02B adds a guarded live Incident API slice for the approved non-production happy path while keeping compile-only and authentication-readiness evidence intact.
 
-> **Current slice:** M1-02A deployable foundation and actor sessions
+> **Current slice:** M1-02B guarded real Incident API happy path
 > **Initial business scope:** Incident + SLA + authorization
-> **Assurance scope:** deterministic compilation, deployability, read-only connectivity, and authentication readiness
-> **Release-gate status:** compile-only results are never release-gate eligible
+> **Assurance scope:** deterministic compilation, deployability, read-only connectivity, authentication readiness, and gated live Incident API evidence
+> **Release-gate status:** compile-only results are never release-gate eligible; live API `PASS` requires approved evidence and retained-closed cleanup disposition
 
-## What works in M1-02A
+## What works in M1-02B
 
 The application proves this complete path:
 
@@ -37,9 +37,15 @@ It includes:
 - manual exact-SHA staging deployment with health verification and rollback;
 - sanitized actor profiles and strict environment mappings for five synthetic personas;
 - replaceable secret and NILES-authenticator boundaries with independent in-memory sessions;
-- an operator-triggered authentication preflight UI with production denial and safe typed outcomes.
+- an operator-triggered authentication preflight UI with production denial and safe typed outcomes;
+- versioned live execution, fixture, readiness, inventory, checkpoint, observation, and `nvs.run/v2` contracts;
+- a NILES Incident API adapter for confirmed Incident, SLA, journal, CMDB, and group surfaces only;
+- `GET /api/environments/:id/execution-readiness`, live `POST /api/runs`, progress, inventory, and evidence endpoints;
+- Run Center controls that separate compile-only from live API execution and require explicit live confirmation;
+- a default-off server mutation switch, disabled committed fixture examples, and production blocking before secret or network access;
+- deterministic handling for the current close-authority blocker: `NILES_CLOSE_AUTHORITY_UNSATISFIABLE` remains `BLOCKED`, followed by verified run-owned soft delete when allowed.
 
-## What M1-02A does not prove
+## What M1-02B does not prove
 
 A compile-only `PASS` means only that the reviewed blueprint compiled and its artifacts persisted within `COMPILATION_ONLY` scope. Every such run has:
 
@@ -58,7 +64,9 @@ A compile-only `PASS` means only that the reviewed blueprint compiled and its ar
 }
 ```
 
-M1-02A does not claim that NILES Incident lifecycle, SLA behavior, authorization, tenant isolation, side effects, cleanup, or release readiness passed. Authentication preflight confirms only that separately configured synthetic actors can establish normal NILES sessions. It performs no NILES business mutation.
+Compile-only runs still do not claim that NILES Incident lifecycle, SLA behavior, authorization, tenant isolation, side effects, cleanup, or release readiness passed. Authentication preflight confirms only that separately configured synthetic actors can establish normal NILES sessions.
+
+Live API runs are available only when all gates pass: non-production enabled environment, versioned live policy, server-owned `NVS_ENABLE_NILES_MUTATIONS=true`, enabled fixture profile, actor authentication into the fixture tenant, allowlisted scenario variation, `confirmRealMutation: true`, and no concurrent live run. The committed examples keep live mutation disabled. Current confirmed NILES close behavior requires requester/opening-user authority plus Incident write permission; when the configured requester cannot satisfy that, NVS records `BLOCKED` with `NILES_CLOSE_AUTHORITY_UNSATISFIABLE` and does not mark the run `PASS`.
 
 ## Repository layout
 
@@ -76,6 +84,7 @@ packages/
 actors/                    Sanitized profiles and environment mappings
 scenarios/itsm/incident/  Reviewed business blueprints
 environments/             Non-sensitive target definitions
+fixtures/                  Sanitized non-secret live API fixture examples
 artifacts/                Ignored local run and browser output
 ops/                      Deployment, rollback, verification, and runbook
 docs/discovery/           Confirmed/partial/unknown/missing NILES facts
@@ -168,6 +177,8 @@ M1-02A resolves credentials from environment variables named deterministically f
 
 The API host and port may be changed with `NVS_API_HOST` and `NVS_API_PORT`. Production paths are configured with `NVS_CONFIG_DIR`, `NVS_DATA_DIR`, and `NVS_WEB_DIR`. Build identity uses `NVS_BUILD_SHA`, `NVS_BUILD_TIMESTAMP`, and `NVS_RELEASE_VERSION`.
 
+Live Incident API execution is disabled unless the server process has `NVS_ENABLE_NILES_MUTATIONS=true`. Do not set this for production-classified environments. Versioned fixture files live under `fixtures/niles-incident/` in source and under `/opt/nvs/config/fixtures/niles-incident/` on staging. They may contain non-secret tenant/resource UUIDs only; use non-committed `.local.yaml` or `.override.yaml` files for real staging values.
+
 The staging workflow is manual and uses the GitHub `staging` environment. See [the staging bootstrap and operations runbook](ops/bootstrap-staging.md) for server setup, required SSH secrets, exact-image deployment, verification, backups, credential injection, and rollback. The workflow being present does not mean a real staging deployment has been proven.
 
 ## Optional live read-only probe
@@ -186,6 +197,18 @@ Alternatively, use the Environments page and select **Run read-only probe**. A f
 
 Do not place credentials in an environment file, and do not use this command to work around environment approval.
 
+## Guarded live Incident API run
+
+The only implemented live slice is:
+
+```text
+runType=LIVE_API
+scenarioId=payment-api-service-degradation
+variationValues.journey=normal
+```
+
+Use Run Center or `POST /api/runs` with `confirmRealMutation: true` only after `GET /api/environments/:id/execution-readiness` returns `PASS`. A successful live run persists `run.json`, `plan.json`, `evidence.json`, `inventory.json`, `observations.json`, and `checkpoint.json` under `artifacts/runs/<runId>/`. Missing prerequisites, uncertain evidence, close-authority unsatisfiability, or cleanup uncertainty produce `BLOCKED`, never `PASS`.
+
 ## Architecture and NILES findings
 
 - [M1-01 stack ADR](docs/adr/ADR-0001-M1-WALKING-SKELETON-STACK.md)
@@ -195,6 +218,6 @@ Do not place credentials in an environment file, and do not use this command to 
 - [NILES testability contract](docs/NILES_TESTABILITY_CONTRACT.md)
 - [MVP contract](docs/MVP.md)
 
-## Next slice: M1-02B
+## Next slice
 
-M1-02B may add authenticated Incident API execution only after an isolated deterministic fixture namespace, lifecycle assertions, cleanup, and correlated evidence contracts are available or explicitly accepted as blockers. It must not infer missing metadata, policy, fixture, event/job, cleanup, or virtual-time contracts.
+Next work should resolve the NILES requester close-authority/write-permission seam or provide an approved requester-safe close/intake contract, then expand negative authorization and tenant-isolation coverage. Do not broaden to browser execution, virtual-time SLA boundaries, or non-Incident journeys until the M1-02B live API blocker is product-reviewed.

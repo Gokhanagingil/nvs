@@ -133,6 +133,32 @@ describe('versioned control-plane API', () => {
       /password|accessToken|authorization|@/i,
     );
 
+    const liveReadiness = await app.inject({
+      method: 'GET',
+      url: '/api/environments/local-example/execution-readiness?scenarioId=payment-api-service-degradation&journey=normal',
+    });
+    expect(liveReadiness.statusCode).toBe(200);
+    expect(liveReadiness.json()).toMatchObject({
+      schemaVersion: 'nvs.execution-readiness/v1',
+      verdict: 'BLOCKED',
+      mutationEligible: false,
+      gateEligible: false,
+    });
+
+    const blockedLiveRun = await app.inject({
+      method: 'POST',
+      url: '/api/runs',
+      payload: {
+        runType: 'LIVE_API',
+        environmentId: 'local-example',
+        scenarioId: 'payment-api-service-degradation',
+        variationValues: { journey: 'normal' },
+        confirmRealMutation: true,
+      },
+    });
+    expect(blockedLiveRun.statusCode).toBe(403);
+    expect(blockedLiveRun.json().error.code).toBe('LIVE_API_POLICY_DISABLED');
+
     const productionPreflight = await app.inject({
       method: 'POST',
       url: '/api/environments/production-example/auth-preflight',

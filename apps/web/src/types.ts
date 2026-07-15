@@ -65,7 +65,35 @@ export interface EnvironmentDefinition {
     version: boolean;
   };
   authProfileRef?: string;
+  execution?: {
+    schemaVersion: 'nvs.environment-execution-policy/v1';
+    liveApiEnabled: boolean;
+    allowedRunTypes: Array<'COMPILE_ONLY' | 'LIVE_API'>;
+    fixtureProfileRef?: string;
+    liveRunAllowlist: Array<{
+      scenarioId: string;
+      variationValues: Record<string, string>;
+    }>;
+  };
   enabled: boolean;
+}
+
+export interface ExecutionReadiness {
+  schemaVersion: 'nvs.execution-readiness/v1';
+  environmentId: string;
+  runType: 'LIVE_API';
+  scenarioId?: string;
+  variationValues?: Record<string, string>;
+  verdict: 'PASS' | 'BLOCKED';
+  mutationEligible: boolean;
+  gateEligible: false;
+  checks: Array<{
+    id: string;
+    status: 'PASS' | 'BLOCKED' | 'NOT_CHECKED';
+    message: string;
+    code?: string;
+  }>;
+  error?: TypedError;
 }
 
 export interface ProbeResult {
@@ -180,7 +208,7 @@ export interface EvidenceManifest {
   createdAt: string;
 }
 
-export interface RunRecord {
+export interface CompileOnlyRunRecord {
   schemaVersion: 'nvs.run/v1';
   runId: string;
   runType: 'COMPILE_ONLY';
@@ -214,6 +242,91 @@ export interface RunRecord {
     details?: string;
   };
 }
+
+export interface ResourceInventory {
+  schemaVersion: 'nvs.resource-inventory/v1';
+  runId: string;
+  environmentId: string;
+  tenantId: string;
+  incident?: {
+    id: string;
+    number?: string;
+    status?: string;
+    disposition: string;
+  };
+  resources: Array<{
+    kind: string;
+    id: string;
+    label?: string;
+    disposition: string;
+  }>;
+  updatedAt: string;
+}
+
+export interface LiveRunRecord {
+  schemaVersion: 'nvs.run/v2';
+  runId: string;
+  runType: 'LIVE_API';
+  status: 'CREATED' | 'RUNNING' | 'COMPLETED';
+  verdict: 'PASS' | 'FAIL' | 'BLOCKED';
+  gateEligible: boolean;
+  assuranceScope: 'LIVE_NILES_INCIDENT_API';
+  environmentId: string;
+  scenario: { id: string; version: string };
+  variationValues: Record<string, string>;
+  planId: string;
+  fixtureId: string;
+  timestamps: {
+    createdAt: string;
+    completedAt: string;
+  };
+  stepResults: Array<{
+    stepId: string;
+    executionStatus: 'PASS' | 'FAIL' | 'BLOCKED' | 'NOT_OBSERVED';
+    observationId?: string;
+    error?: TypedError;
+  }>;
+  error?: TypedError;
+  evidence: EvidenceEntry[];
+  sanitization: {
+    applied: boolean;
+    redactedFields: string[];
+    patterns: string[];
+  };
+  cleanup: {
+    status: string;
+    policy: string;
+    details?: string;
+  };
+  resourceInventory: ResourceInventory;
+}
+
+export interface StepObservation {
+  schemaVersion: 'nvs.step-observation/v1';
+  id: string;
+  runId: string;
+  stepId: string;
+  sourceStepId: string;
+  sequence: number;
+  actorId: string;
+  action: string;
+  status: 'PASS' | 'FAIL' | 'BLOCKED' | 'NOT_OBSERVED';
+  startedAt: string;
+  completedAt: string;
+  correlationId: string;
+  evidence: Record<string, string | number | boolean | null>;
+  error?: TypedError;
+}
+
+export interface RunProgress {
+  schemaVersion: 'nvs.run-progress/v1';
+  runId: string;
+  status: 'CREATED' | 'RUNNING' | 'COMPLETED';
+  verdict: 'PASS' | 'FAIL' | 'BLOCKED';
+  observations: StepObservation[];
+}
+
+export type RunRecord = CompileOnlyRunRecord | LiveRunRecord;
 
 export interface CoverageCell {
   scenarioId: string;

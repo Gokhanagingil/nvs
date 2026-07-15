@@ -84,6 +84,8 @@ export interface ExecutionReadiness {
   runType: 'LIVE_API';
   scenarioId?: string;
   variationValues?: Record<string, string>;
+  confirmed: boolean;
+  staticEligible: boolean;
   verdict: 'PASS' | 'BLOCKED';
   mutationEligible: boolean;
   gateEligible: false;
@@ -300,6 +302,7 @@ export interface LiveRunRecord {
     status: string;
     policy: string;
     details?: string;
+    error?: TypedError;
   };
   resourceInventory: ResourceInventory;
 }
@@ -317,7 +320,20 @@ export interface StepObservation {
   startedAt: string;
   completedAt: string;
   correlationId: string;
-  evidence: Record<string, string | number | boolean | null>;
+  evidence: Record<
+    string,
+    | string
+    | number
+    | boolean
+    | null
+    | Array<{
+        method: 'GET' | 'POST' | 'DELETE';
+        pathTemplate: string;
+        httpStatus?: number;
+        durationMs: number;
+        correlationId: string;
+      }>
+  >;
   error?: TypedError;
 }
 

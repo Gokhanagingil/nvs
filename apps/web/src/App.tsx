@@ -32,6 +32,20 @@ type Loadable<T> =
   | { status: 'error'; message: string; code?: string }
   | { status: 'ready'; data: T };
 
+const LIVE_PENDING_RUN_STORAGE_KEY = 'nvs.pendingLiveRunId';
+
+function rememberPendingLiveRun(runId: string) {
+  window.sessionStorage.setItem(LIVE_PENDING_RUN_STORAGE_KEY, runId);
+}
+
+function forgetPendingLiveRun() {
+  window.sessionStorage.removeItem(LIVE_PENDING_RUN_STORAGE_KEY);
+}
+
+function readPendingLiveRun() {
+  return window.sessionStorage.getItem(LIVE_PENDING_RUN_STORAGE_KEY);
+}
+
 const navItems = [
   { to: '/environments', label: 'Environments' },
   { to: '/scenarios', label: 'Scenario Library' },
@@ -573,10 +587,14 @@ function RunCenterPage() {
   const [variationValues, setVariationValues] = useState<Record<string, string>>({});
   const [confirmLive, setConfirmLive] = useState(false);
   const [readiness, setReadiness] = useState<Loadable<ExecutionReadiness> | undefined>();
+  const [confirmedReadiness, setConfirmedReadiness] = useState<
+    Loadable<ExecutionReadiness> | undefined
+  >();
   const [launch, setLaunch] = useState<Loadable<LaunchResult> | undefined>();
   const [pendingLive, setPendingLive] = useState<
     { runId: string; progress?: RunProgress; inventory?: ResourceInventory } | undefined
   >();
+  const [activeLiveRuns, setActiveLiveRuns] = useState<RunProgress[]>([]);
 
   useEffect(() => {
     void Promise.all([
@@ -621,6 +639,7 @@ function RunCenterPage() {
   }, [selectedScenario]);
 
   useEffect(() => {
+    setConfirmedReadiness(undefined);
     if (runType !== 'LIVE_API' || !environmentId || !scenarioId) {
       setReadiness(undefined);
       return;
@@ -643,6 +662,82 @@ function RunCenterPage() {
       );
   }, [environmentId, scenarioId, runType, variationValues]);
 
+  useEffect(() => {
+    const rememberedRunId = readPendingLiveRun();
+    if (!rememberedRunId) return;
+    let cancelled = false;
+    setPendingLive({ runId: rememberedRunId });
+    setLaunch({ status: 'loading' });
+    void pollLiveRunProgress(rememberedRunId, (nextProgress, inventory) => {
+      if (cancelled) return;
+      setPendingLive({
+        runId: rememberedRunId,
+        progress: nextProgress,
+        ...(inventory ? { inventory } : {}),
+      });
+    })
+      .then(async (progress) => {
+        if (cancelled) return;
+        if (progress.status === 'RECOVERY_REQUIRED') {
+          setLaunch(undefined);
+          return;
+        }
+        const [run, plan, inventory] = await Promise.all([
+          apiRequest<RunRecord>(`/api/runs/${encodeURIComponent(rememberedRunId)}`),
+          apiRequest<ExecutablePlan>(`/api/runs/${encodeURIComponent(rememberedRunId)}/plan`),
+          apiRequest<ResourceInventory>(
+            `/api/runs/${encodeURIComponent(rememberedRunId)}/inventory`,
+          ),
+        ]);
+        if (cancelled) return;
+        const scenario = await apiRequest<Scenario>(
+          `/api/scenarios/${encodeURIComponent(run.scenario.id)}`,
+        );
+        if (cancelled) return;
+        forgetPendingLiveRun();
+        setPendingLive(undefined);
+        setLaunch({ status: 'ready', data: { run, plan, scenario, progress, inventory } });
+      })
+      .catch((error: unknown) => {
+        if (cancelled) return;
+        setLaunch({
+          status: 'error',
+          message: errorMessage(error),
+          ...(error instanceof ApiError ? { code: error.code } : {}),
+        });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    void apiRequest<{ items: RunProgress[] }>('/api/runs/live-active')
+      .then(({ items }) => setActiveLiveRuns(items))
+      .catch(() => setActiveLiveRuns([]));
+  }, [pendingLive?.runId, launch?.status]);
+
+  const confirmExecutionReadiness = async () => {
+    if (!environmentId || !scenarioId) return;
+    setConfirmedReadiness({ status: 'loading' });
+    try {
+      const result = await apiRequest<ExecutionReadiness>(
+        `/api/environments/${encodeURIComponent(environmentId)}/execution-readiness/confirm`,
+        {
+          method: 'POST',
+          body: JSON.stringify({ scenarioId, variationValues }),
+        },
+      );
+      setConfirmedReadiness({ status: 'ready', data: result });
+    } catch (error) {
+      setConfirmedReadiness({
+        status: 'error',
+        message: errorMessage(error),
+        ...(error instanceof ApiError ? { code: error.code } : {}),
+      });
+    }
+  };
+
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (!environmentId || !scenarioId) return;
@@ -660,6 +755,7 @@ function RunCenterPage() {
             confirmRealMutation: true,
           }),
         });
+        rememberPendingLiveRun(accepted.runId);
         setPendingLive({ runId: accepted.runId });
         const progress = await pollLiveRunProgress(accepted.runId, (nextProgress, inventory) => {
           setPendingLive({
@@ -680,6 +776,7 @@ function RunCenterPage() {
             `/api/runs/${encodeURIComponent(accepted.runId)}/inventory`,
           ),
         ]);
+        forgetPendingLiveRun();
         setPendingLive(undefined);
         setLaunch({ status: 'ready', data: { run, plan, scenario, progress, inventory } });
         return;
@@ -801,7 +898,11 @@ function RunCenterPage() {
             ))}
             {runType === 'LIVE_API' && (
               <>
-                <LiveReadinessPanel readiness={readiness} />
+                <LiveReadinessPanel
+                  readiness={readiness}
+                  confirmedReadiness={confirmedReadiness}
+                  onConfirm={() => void confirmExecutionReadiness()}
+                />
                 <label className="checkbox-field">
                   <input
                     type="checkbox"
@@ -819,21 +920,23 @@ function RunCenterPage() {
                 launch?.status === 'loading' ||
                 (runType === 'LIVE_API' &&
                   (!confirmLive ||
-                    readiness?.status !== 'ready' ||
-                    readiness.data.verdict !== 'PASS'))
+                    confirmedReadiness?.status !== 'ready' ||
+                    confirmedReadiness.data.verdict !== 'PASS' ||
+                    !confirmedReadiness.data.mutationEligible))
               }
             >
               {launch?.status === 'loading'
                 ? runType === 'LIVE_API'
-                  ? 'Running live API validation...'
+                  ? 'Live run accepted; polling progress...'
                   : 'Compiling business plan...'
                 : runType === 'LIVE_API'
-                  ? 'Launch live API run'
+                  ? 'Start confirmed live run'
                   : 'Launch compile-only run'}
             </button>
           </form>
 
           <section className="run-result" aria-live="polite">
+            <ActiveLiveRunsPanel runs={activeLiveRuns} />
             {pendingLive && <LivePendingPanel pending={pendingLive} />}
             {!launch && !pendingLive && (
               <section className="state-panel">
@@ -872,17 +975,21 @@ function RunCenterPage() {
 
 function LiveReadinessPanel({
   readiness,
+  confirmedReadiness,
+  onConfirm,
 }: {
   readiness: Loadable<ExecutionReadiness> | undefined;
+  confirmedReadiness: Loadable<ExecutionReadiness> | undefined;
+  onConfirm: () => void;
 }) {
   if (!readiness) return null;
   if (readiness.status === 'loading') {
-    return <LoadingPanel label="Checking live API readiness..." />;
+    return <LoadingPanel label="Checking static live API eligibility..." />;
   }
   if (readiness.status === 'error') {
     return (
       <ErrorPanel
-        title={`Live readiness unavailable${readiness.code ? ` - ${readiness.code}` : ''}`}
+        title={`Static readiness unavailable${readiness.code ? ` - ${readiness.code}` : ''}`}
         message={readiness.message}
       />
     );
@@ -894,10 +1001,10 @@ function LiveReadinessPanel({
     <section className={`live-readiness ${readiness.data.verdict.toLowerCase()}`}>
       <header>
         <div>
-          <p className="eyebrow">Live API readiness</p>
+          <p className="eyebrow">Live API static eligibility</p>
           <h3>
             <StatusBadge value={readiness.data.verdict} />{' '}
-            {readiness.data.mutationEligible ? 'Mutation eligible' : 'Blocked'}
+            {readiness.data.staticEligible ? 'Static gates passed' : 'Static gates blocked'}
           </h3>
         </div>
       </header>
@@ -907,6 +1014,74 @@ function LiveReadinessPanel({
             <StatusBadge value={check.status} />
             <span>{check.message}</span>
             {check.code && <code>{check.code}</code>}
+          </li>
+        ))}
+      </ul>
+      <button
+        className="button button-secondary"
+        type="button"
+        disabled={readiness.data.verdict !== 'PASS' || confirmedReadiness?.status === 'loading'}
+        onClick={onConfirm}
+      >
+        {confirmedReadiness?.status === 'loading'
+          ? 'Running confirmed preflight...'
+          : 'Run confirmed preflight'}
+      </button>
+      {confirmedReadiness?.status === 'error' && (
+        <ErrorPanel
+          title={`Confirmed readiness unavailable${
+            confirmedReadiness.code ? ` - ${confirmedReadiness.code}` : ''
+          }`}
+          message={confirmedReadiness.message}
+        />
+      )}
+      {confirmedReadiness?.status === 'ready' && (
+        <div className="readiness-confirmation">
+          <h3>
+            <StatusBadge value={confirmedReadiness.data.verdict} />{' '}
+            {confirmedReadiness.data.mutationEligible
+              ? 'Confirmed mutation eligible'
+              : 'Confirmed preflight blocked'}
+          </h3>
+          <ul>
+            {confirmedReadiness.data.checks
+              .filter((check) => ['actor-authentication', 'fixture-resources'].includes(check.id))
+              .map((check) => (
+                <li key={check.id}>
+                  <StatusBadge value={check.status} />
+                  <span>{check.message}</span>
+                  {check.code && <code>{check.code}</code>}
+                </li>
+              ))}
+          </ul>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function ActiveLiveRunsPanel({ runs }: { runs: RunProgress[] }) {
+  if (runs.length === 0) return null;
+  return (
+    <section className="detail-section">
+      <div className="section-heading">
+        <div>
+          <p className="eyebrow">Durable live checkpoints</p>
+          <h2>Active or recovery-required runs</h2>
+        </div>
+        <span>{runs.length} tracked</span>
+      </div>
+      <ul className="manifest-list">
+        {runs.map((run) => (
+          <li key={run.runId}>
+            <StatusBadge value={run.status} />
+            <div>
+              <strong>{run.runId}</strong>
+              <small>{run.observations.length} observations</small>
+              <Link className="button button-secondary" to={`/evidence?runId=${run.runId}`}>
+                Open inventory
+              </Link>
+            </div>
           </li>
         ))}
       </ul>
@@ -1122,7 +1297,7 @@ function CompileOnlyResult({ result }: { result: LaunchResult }) {
   );
 }
 
-interface EvidenceDetail {
+interface CompletedEvidenceDetail {
   run: RunRecord;
   evidence: EvidenceManifest;
   plan: ExecutablePlan;
@@ -1130,6 +1305,16 @@ interface EvidenceDetail {
   progress?: RunProgress;
   inventory?: ResourceInventory;
 }
+
+interface RecoveryEvidenceDetail {
+  recovery: true;
+  runId: string;
+  plan: ExecutablePlan;
+  progress: RunProgress;
+  inventory: ResourceInventory;
+}
+
+type EvidenceDetail = CompletedEvidenceDetail | RecoveryEvidenceDetail;
 
 function EvidenceExplorerPage() {
   const [searchParams, setSearchParams] = useSearchParams();
@@ -1178,8 +1363,23 @@ function EvidenceExplorerPage() {
           },
         });
       })
-      .catch((error: unknown) => setDetail({ status: 'error', message: errorMessage(error) }));
+      .catch((error: unknown) => {
+        void Promise.all([
+          apiRequest<RunProgress>(`/api/runs/${encodeURIComponent(selectedRunId)}/progress`),
+          apiRequest<ResourceInventory>(`/api/runs/${encodeURIComponent(selectedRunId)}/inventory`),
+          apiRequest<ExecutablePlan>(`/api/runs/${encodeURIComponent(selectedRunId)}/plan`),
+        ])
+          .then(([progress, inventory, plan]) =>
+            setDetail({
+              status: 'ready',
+              data: { recovery: true, runId: selectedRunId, progress, inventory, plan },
+            }),
+          )
+          .catch(() => setDetail({ status: 'error', message: errorMessage(error) }));
+      });
   }, [selectedRunId]);
+
+  const canShowDetail = runs.status === 'ready' || Boolean(requestedRunId);
 
   return (
     <>
@@ -1189,25 +1389,27 @@ function EvidenceExplorerPage() {
         description="Inspect assurance scope, typed failures, compiled plan source links, and sanitized manifest entries."
       />
       {runs.status === 'loading' && <LoadingPanel label="Loading run evidence…" />}
-      {runs.status === 'empty' && (
+      {runs.status === 'empty' && !requestedRunId && (
         <EmptyPanel message="Create a compile-only run in Run Center to produce evidence." />
       )}
       {runs.status === 'error' && <ErrorPanel message={runs.message} />}
-      {runs.status === 'ready' && (
+      {canShowDetail && (
         <>
-          <label className="run-selector">
-            Run
-            <select
-              value={selectedRunId}
-              onChange={(event) => setSearchParams({ runId: event.target.value })}
-            >
-              {runs.data.map((run) => (
-                <option key={run.runId} value={run.runId}>
-                  {run.runId} · {run.verdict} · {run.assuranceScope}
-                </option>
-              ))}
-            </select>
-          </label>
+          {runs.status === 'ready' && runs.data.length > 0 && (
+            <label className="run-selector">
+              Run
+              <select
+                value={selectedRunId}
+                onChange={(event) => setSearchParams({ runId: event.target.value })}
+              >
+                {runs.data.map((run) => (
+                  <option key={run.runId} value={run.runId}>
+                    {run.runId} · {run.verdict} · {run.assuranceScope}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
           {detail?.status === 'loading' && <LoadingPanel label="Loading selected run detail…" />}
           {detail?.status === 'empty' && <EmptyPanel message="The selected run has no detail." />}
           {detail?.status === 'error' && (
@@ -1256,6 +1458,46 @@ function EvidenceManifestSection({ evidence }: { evidence: EvidenceManifest }) {
 }
 
 function EvidenceDetailView({ detail }: { detail: EvidenceDetail }) {
+  if ('recovery' in detail) {
+    return (
+      <div className="evidence-layout">
+        <section className="scope-warning" role="status">
+          <div className="status-pair">
+            <StatusBadge value={detail.progress.status} />
+            <StatusBadge value={detail.progress.verdict} />
+          </div>
+          <h2>Recovery-required live inventory</h2>
+          <p>
+            Final run artifacts are not committed for <code>{detail.runId}</code>. The durable
+            checkpoint, observations, plan, and run-owned inventory remain available for operator
+            recovery.
+          </p>
+        </section>
+        <LivePendingPanel
+          pending={{ runId: detail.runId, progress: detail.progress, inventory: detail.inventory }}
+        />
+        <section className="detail-section">
+          <div className="section-heading">
+            <div>
+              <p className="eyebrow">Durable plan retrieval</p>
+              <h2>Compiled live plan</h2>
+            </div>
+            <span>{detail.plan.steps.length} steps</span>
+          </div>
+          <ol className="plan-entry-list">
+            {detail.plan.steps.map((step) => (
+              <li key={step.id}>
+                <div>
+                  <h3>{step.source.blueprintStepId.replaceAll('-', ' ')}</h3>
+                  <p>{step.action}</p>
+                </div>
+              </li>
+            ))}
+          </ol>
+        </section>
+      </div>
+    );
+  }
   const run = detail.run;
   if (run.runType === 'LIVE_API') {
     return (

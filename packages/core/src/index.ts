@@ -122,6 +122,7 @@ export interface RunBundle {
 }
 
 export interface RunBundleRepository {
+  reserveRunId?(runId: string): Promise<void>;
   saveBundle(bundle: RunBundle): Promise<RunRecord>;
   list(): Promise<RunRecord[]>;
   get(id: string): Promise<RunRecord | undefined>;
@@ -177,9 +178,14 @@ export interface NilesFixtureResource {
 export interface NilesTransportEvidence {
   method: 'GET' | 'POST' | 'DELETE';
   pathTemplate: string;
-  httpStatus: number;
+  httpStatus?: number;
   durationMs: number;
   correlationId: string;
+}
+
+export interface NilesAffectedCiSummary {
+  items: Array<{ ciId: string }>;
+  transport?: NilesTransportEvidence;
 }
 
 export interface NilesSlaSummary {
@@ -187,6 +193,7 @@ export interface NilesSlaSummary {
     id: string;
     objectiveType?: 'response' | 'resolution' | string;
     status?: string;
+    policyRef?: string;
     breached?: boolean;
     pauseAt?: string;
     stopAt?: string;
@@ -201,7 +208,8 @@ export interface NilesJournalSummary {
   count: number;
   entries?: Array<{
     id: string;
-    action?: string;
+    type?: string;
+    message?: string;
     createdBy?: string;
     createdAt?: string;
   }>;
@@ -276,7 +284,7 @@ export interface NilesIncidentLiveAdapter {
     tenantId: string;
     incidentId: string;
     correlationId: string;
-  }): Promise<Array<{ ciId: string }>>;
+  }): Promise<NilesAffectedCiSummary>;
   readSlaSummary(input: {
     environment: EnvironmentDefinitionV1;
     session: ActorSession;
@@ -517,7 +525,17 @@ function requireLiveAssertion(condition: boolean, code: string, message: string)
   }
 }
 
-type LiveObservationPayload = Record<string, string | number | boolean | null>;
+type LiveObservationOperation = {
+  method: 'GET' | 'POST' | 'DELETE';
+  pathTemplate: string;
+  httpStatus?: number;
+  durationMs: number;
+  correlationId: string;
+};
+type LiveObservationPayload = Record<
+  string,
+  string | number | boolean | null | LiveObservationOperation[]
+>;
 type LiveObservationOutcome =
   LiveObservationPayload | { status: 'PASS' | 'NOT_OBSERVED'; evidence: LiveObservationPayload };
 
@@ -538,17 +556,165 @@ function transportObservation(
     ? {
         method: transport.method,
         pathTemplate: transport.pathTemplate,
-        httpStatus: transport.httpStatus,
+        ...(transport.httpStatus !== undefined ? { httpStatus: transport.httpStatus } : {}),
         durationMs: transport.durationMs,
         correlationId: transport.correlationId,
       }
     : {};
 }
 
+function transportOperation(
+  transport: NilesTransportEvidence | undefined,
+): LiveObservationOperation | undefined {
+  return transport
+    ? {
+        method: transport.method,
+        pathTemplate: transport.pathTemplate,
+        ...(transport.httpStatus !== undefined ? { httpStatus: transport.httpStatus } : {}),
+        durationMs: transport.durationMs,
+        correlationId: transport.correlationId,
+      }
+    : undefined;
+}
+
+function operationsEvidence(
+  transports: Array<NilesTransportEvidence | undefined>,
+): LiveObservationPayload {
+  const operations = transports.flatMap((transport) => {
+    const operation = transportOperation(transport);
+    return operation ? [operation] : [];
+  });
+  return operations.length > 0 ? { operations } : {};
+}
+
+function errorTransportEvidence(error: unknown): LiveObservationPayload {
+  const transport =
+    error instanceof Error && 'transport' in error
+      ? (error.transport as NilesTransportEvidence | undefined)
+      : undefined;
+  const operations =
+    error instanceof Error && 'operations' in error
+      ? (error.operations as NilesTransportEvidence[] | undefined)
+      : undefined;
+  return {
+    ...(transport ? transportObservation(transport) : {}),
+    ...operationsEvidence(operations ?? (transport ? [transport] : [])),
+  };
+}
+
+function attachOperationEvidence<T extends Error>(
+  error: T,
+  transports: Array<NilesTransportEvidence | undefined>,
+): T {
+  const errorTransport =
+    'transport' in error ? (error.transport as NilesTransportEvidence | undefined) : undefined;
+  const operations = [...transports, errorTransport].filter(
+    (transport): transport is NilesTransportEvidence => transport !== undefined,
+  );
+  if (operations.length > 0) {
+    Object.defineProperty(error, 'operations', {
+      value: operations,
+      enumerable: false,
+      configurable: true,
+    });
+  }
+  return error;
+}
+
+function observedSlaObjectiveTypes(summary: NilesSlaSummary): Set<string> {
+  return new Set(
+    summary.records
+      .map((record) => record.objectiveType?.toLowerCase())
+      .filter((objectiveType): objectiveType is string => Boolean(objectiveType)),
+  );
+}
+
+function assertRequiredSlaObjectives(
+  summary: NilesSlaSummary,
+  requiredObjectiveTypes: string[],
+): void {
+  const observed = observedSlaObjectiveTypes(summary);
+  const missing = requiredObjectiveTypes.filter((objectiveType) => !observed.has(objectiveType));
+  if (summary.records.length === 0 || missing.length > 0) {
+    throw new LiveStepError(
+      typedError(
+        'ENVIRONMENT',
+        'SLA_SUMMARY_MISSING',
+        missing.length > 0
+          ? `Required SLA objective(s) were not observable: ${missing.join(', ')}.`
+          : 'Required SLA summary records were not observable for the incident.',
+      ),
+    );
+  }
+}
+
+function assertObservedSlaPolicy(summary: NilesSlaSummary, expectedPolicyRef?: string): void {
+  if (!expectedPolicyRef) {
+    return;
+  }
+  const observedPolicyRefs = new Set(
+    summary.records
+      .map((record) => record.policyRef)
+      .filter((policyRef): policyRef is string => Boolean(policyRef)),
+  );
+  if (observedPolicyRefs.size > 0 && !observedPolicyRefs.has(expectedPolicyRef)) {
+    throw new LiveStepError(
+      typedError(
+        'ASSERTION',
+        'SLA_POLICY_MISMATCH',
+        'Observed SLA records did not reference the configured fixture SLA policy.',
+      ),
+    );
+  }
+}
+
+function isRunningSlaStatus(status: string | undefined): boolean {
+  return ['running', 'active', 'in_progress', 'in progress'].includes(status?.toLowerCase() ?? '');
+}
+
+function isPausedSlaRecord(record: NilesSlaSummary['records'][number]): boolean {
+  return Boolean(
+    record.pauseAt ||
+    (record.pausedDurationSeconds ?? 0) > 0 ||
+    ['paused', 'on_hold', 'held'].includes(record.status?.toLowerCase() ?? ''),
+  );
+}
+
+function isStoppedResolutionSlaRecord(record: NilesSlaSummary['records'][number]): boolean {
+  return Boolean(
+    record.objectiveType?.toLowerCase() === 'resolution' &&
+    (record.stopAt ||
+      ['completed', 'stopped', 'met', 'breached', 'resolved'].includes(
+        record.status?.toLowerCase() ?? '',
+      )),
+  );
+}
+
+type JournalLifecycleAction = 'hold' | 'resume' | 'resolve';
+
+const JOURNAL_ACTION_PREFIXES: Record<JournalLifecycleAction, string> = {
+  hold: 'Incident placed on hold.',
+  resume: 'Incident resumed.',
+  resolve: 'Incident resolved by operator.',
+};
+
+function hasStableJournalAttribution(
+  entry: NonNullable<NilesJournalSummary['entries']>[number],
+  action: JournalLifecycleAction,
+  expectedUserId: string,
+): boolean {
+  return Boolean(
+    entry.type === 'action' &&
+    entry.createdBy === expectedUserId &&
+    entry.message?.startsWith(JOURNAL_ACTION_PREFIXES[action]),
+  );
+}
+
 export class NvsCore {
   private activeLiveRunId: string | undefined;
   private readonly liveRunTasks = new Map<string, Promise<RunRecordV2>>();
   private readonly memoryLiveStates = new Map<string, LiveRunState>();
+  private readonly memoryReservedRunIds = new Set<string>();
 
   constructor(
     private readonly environments: EnvironmentRepository,
@@ -592,6 +758,35 @@ export class NvsCore {
         }
       },
     };
+  }
+
+  private async reserveRunId(runId: string): Promise<void> {
+    if (this.bundles.reserveRunId) {
+      try {
+        await this.bundles.reserveRunId(runId);
+      } catch (error) {
+        throw safeLiveError(error).code === 'RUN_ID_ALREADY_EXISTS'
+          ? new LiveRunBlockedError(
+              'RUN_ID_ALREADY_EXISTS',
+              'A run with this identifier already exists.',
+              'PERSISTENCE',
+            )
+          : error;
+      }
+      return;
+    }
+    if (
+      this.memoryReservedRunIds.has(runId) ||
+      this.memoryLiveStates.has(runId) ||
+      (await this.bundles.get(runId))
+    ) {
+      throw new LiveRunBlockedError(
+        'RUN_ID_ALREADY_EXISTS',
+        'A run with this identifier already exists.',
+        'PERSISTENCE',
+      );
+    }
+    this.memoryReservedRunIds.add(runId);
   }
 
   private scheduleLiveRun(runId: string, operation: () => Promise<RunRecordV2>): void {
@@ -1161,12 +1356,159 @@ export class NvsCore {
     }
 
     const blockedCheck = checks.find((check) => check.status === 'BLOCKED');
+    const staticEligible = !blockedCheck;
     return executionReadinessV1Schema.parse({
       schemaVersion: 'nvs.execution-readiness/v1',
       environmentId: environment.id,
       runType: 'LIVE_API',
       ...(input.scenarioId ? { scenarioId: input.scenarioId } : {}),
       ...(input.variationValues ? { variationValues: input.variationValues } : {}),
+      verdict: blockedCheck ? 'BLOCKED' : 'PASS',
+      confirmed: false,
+      staticEligible,
+      mutationEligible: false,
+      gateEligible: false,
+      checks,
+      ...(blockedCheck
+        ? {
+            error: typedError(
+              'ENVIRONMENT',
+              blockedCheck.code ?? 'EXECUTION_READINESS_BLOCKED',
+              blockedCheck.message,
+            ),
+          }
+        : {}),
+    });
+  }
+
+  async confirmExecutionReadiness(input: {
+    environmentId: string;
+    scenarioId?: string;
+    variationValues?: Record<string, string>;
+  }): Promise<ExecutionReadinessV1> {
+    const staticReadiness = await this.executionReadiness(input);
+    if (staticReadiness.verdict !== 'PASS') {
+      return executionReadinessV1Schema.parse({
+        ...staticReadiness,
+        confirmed: true,
+        staticEligible: false,
+        mutationEligible: false,
+      });
+    }
+
+    const environment = await this.getEnvironment(input.environmentId);
+    const live = this.liveDependencies();
+    const fixture = await live.fixtures.getForEnvironment(environment.id);
+    const checks = staticReadiness.checks.filter(
+      (check) => !['actor-authentication', 'fixture-resources'].includes(check.id),
+    );
+    const block = (id: string, code: string, message: string): void => {
+      checks.push({ id, status: 'BLOCKED', code, message });
+    };
+    const pass = (id: string, message: string): void => {
+      checks.push({ id, status: 'PASS', message });
+    };
+
+    if (!fixture?.enabled) {
+      block(
+        'fixture-resources',
+        fixture ? 'NILES_INCIDENT_FIXTURE_DISABLED' : 'NILES_INCIDENT_FIXTURE_MISSING',
+        'The configured NILES incident fixture is not available for confirmed preflight.',
+      );
+    } else {
+      let sessions: Awaited<ReturnType<NvsCore['authenticateLiveActors']>> | undefined;
+      try {
+        sessions = await this.authenticateLiveActors(environment, fixture, 'confirmed_readiness');
+        pass('actor-authentication', 'Required live actor profiles authenticated read-only.');
+        const verifiedResources = await Promise.all([
+          live.incidentAdapter.verifyResource({
+            environment,
+            session: sessions.tenantAdmin,
+            tenantId: fixture.tenantId,
+            kind: 'ASSIGNMENT_GROUP',
+            id: fixture.resources.assignmentGroup.id,
+            correlationId: this.liveCorrelation('confirmed_readiness_fixture_group'),
+          }),
+          live.incidentAdapter.verifyResource({
+            environment,
+            session: sessions.tenantAdmin,
+            tenantId: fixture.tenantId,
+            kind: 'SERVICE',
+            id: fixture.resources.service.id,
+            correlationId: this.liveCorrelation('confirmed_readiness_fixture_service'),
+          }),
+          ...(fixture.resources.offering
+            ? [
+                live.incidentAdapter.verifyResource({
+                  environment,
+                  session: sessions.tenantAdmin,
+                  tenantId: fixture.tenantId,
+                  kind: 'OFFERING' as const,
+                  id: fixture.resources.offering.id,
+                  correlationId: this.liveCorrelation('confirmed_readiness_fixture_offering'),
+                }),
+              ]
+            : []),
+          ...(fixture.resources.configurationItem
+            ? [
+                live.incidentAdapter.verifyResource({
+                  environment,
+                  session: sessions.tenantAdmin,
+                  tenantId: fixture.tenantId,
+                  kind: 'CI' as const,
+                  id: fixture.resources.configurationItem.id,
+                  correlationId: this.liveCorrelation('confirmed_readiness_fixture_ci'),
+                }),
+              ]
+            : []),
+        ]);
+        const verifiedOffering = verifiedResources.find(
+          (resource) => resource.id === fixture.resources.offering?.id,
+        );
+        if (fixture.resources.offering && !verifiedOffering?.serviceId) {
+          block(
+            'fixture-resources',
+            'NILES_OFFERING_SERVICE_UNVERIFIED',
+            'The configured service offering response did not expose a serviceId for compatibility verification.',
+          );
+        } else if (
+          fixture.resources.offering &&
+          verifiedOffering?.serviceId !== fixture.resources.service.id
+        ) {
+          block(
+            'fixture-resources',
+            'NILES_OFFERING_SERVICE_MISMATCH',
+            'The configured service offering does not belong to the configured CMDB service.',
+          );
+        } else {
+          pass(
+            'fixture-resources',
+            fixture.resources.sla.policyRef
+              ? 'Required fixture resources were verified read-only; SLA policyRef remains observational because no stable read-only policy endpoint is contracted.'
+              : 'Required fixture resources were verified read-only.',
+          );
+        }
+      } catch (error) {
+        const typed = safeLiveError(error);
+        if (!checks.some((check) => check.id === 'actor-authentication')) {
+          block('actor-authentication', typed.code, typed.message);
+        } else {
+          block('fixture-resources', typed.code, typed.message);
+        }
+      } finally {
+        sessions?.destroy();
+      }
+    }
+
+    const blockedCheck = checks.find((check) => check.status === 'BLOCKED');
+    return executionReadinessV1Schema.parse({
+      schemaVersion: 'nvs.execution-readiness/v1',
+      environmentId: environment.id,
+      runType: 'LIVE_API',
+      ...(input.scenarioId ? { scenarioId: input.scenarioId } : {}),
+      ...(input.variationValues ? { variationValues: input.variationValues } : {}),
+      confirmed: true,
+      staticEligible: true,
       verdict: blockedCheck ? 'BLOCKED' : 'PASS',
       mutationEligible: !blockedCheck,
       gateEligible: false,
@@ -1342,6 +1684,7 @@ export class NvsCore {
     plan: ExecutablePlanV1,
     fixture: NilesIncidentFixtureV1,
   ): Promise<LiveRunState> {
+    await this.reserveRunId(input.runId);
     const state: LiveRunState = {
       runId: input.runId,
       plan,
@@ -1460,6 +1803,7 @@ export class NvsCore {
     let cleanupPolicy: RunRecordV2['cleanup']['policy'] = 'RETAIN_FOR_DIAGNOSIS';
     let cleanupDetails = 'Live run did not complete cleanup classification.';
     let runError: TypedError | undefined;
+    let cleanupError: TypedError | undefined;
     let sessions:
       | {
           requester: ActorSession;
@@ -1642,7 +1986,7 @@ export class NvsCore {
             startedAt,
             completedAt: clock(),
             correlationId,
-            evidence: {},
+            evidence: errorTransportEvidence(error),
             error: typed,
           }),
         );
@@ -1698,10 +2042,17 @@ export class NvsCore {
       const verifiedOffering = verifiedResources.find(
         (resource) => resource.id === fixture.resources.offering?.id,
       );
+      const verifiedOfferingServiceId = verifiedOffering?.serviceId;
+      if (fixture.resources.offering && !verifiedOfferingServiceId) {
+        throw new LiveRunBlockedError(
+          'NILES_OFFERING_SERVICE_UNVERIFIED',
+          'The configured service offering response did not expose a serviceId for compatibility verification.',
+          'ENVIRONMENT',
+        );
+      }
       if (
         fixture.resources.offering &&
-        verifiedOffering?.serviceId &&
-        verifiedOffering.serviceId !== fixture.resources.service.id
+        verifiedOfferingServiceId !== fixture.resources.service.id
       ) {
         throw new LiveRunBlockedError(
           'NILES_OFFERING_SERVICE_MISMATCH',
@@ -1878,6 +2229,7 @@ export class NvsCore {
                     ),
                   );
                 let addAffectedCiTransport: NilesTransportEvidence | undefined;
+                let listAffectedCiTransport: NilesTransportEvidence | undefined;
                 if (fixture.resources.configurationItem) {
                   addAffectedCiTransport =
                     (await live.incidentAdapter.addAffectedCi({
@@ -1892,15 +2244,20 @@ export class NvsCore {
                         : {}),
                       correlationId,
                     })) ?? undefined;
-                  const affectedCis = await live.incidentAdapter.listAffectedCis({
-                    environment,
-                    session: sessions!.serviceDesk,
-                    tenantId: fixture.tenantId,
-                    incidentId: incident.id,
-                    correlationId,
-                  });
+                  const affectedCis = await live.incidentAdapter
+                    .listAffectedCis({
+                      environment,
+                      session: sessions!.serviceDesk,
+                      tenantId: fixture.tenantId,
+                      incidentId: incident.id,
+                      correlationId,
+                    })
+                    .catch((error: Error) => {
+                      throw attachOperationEvidence(error, [addAffectedCiTransport]);
+                    });
+                  listAffectedCiTransport = affectedCis.transport;
                   requireLiveAssertion(
-                    affectedCis.some(
+                    affectedCis.items.some(
                       (candidate) => candidate.ciId === fixture.resources.configurationItem?.id,
                     ),
                     'AFFECTED_CI_LINK_NOT_OBSERVED',
@@ -1909,6 +2266,7 @@ export class NvsCore {
                 }
                 return {
                   ...transportObservation(addAffectedCiTransport),
+                  ...operationsEvidence([addAffectedCiTransport, listAffectedCiTransport]),
                   incidentId: incident.id,
                   serviceId: fixture.resources.service.id,
                   offeringId: fixture.resources.offering?.id ?? null,
@@ -1931,38 +2289,22 @@ export class NvsCore {
                   incidentId: incident.id,
                   correlationId,
                 });
-                const observedObjectiveTypes = new Set(
-                  summary.records
-                    .map((record) => record.objectiveType?.toLowerCase())
-                    .filter((objectiveType): objectiveType is string => Boolean(objectiveType)),
-                );
+                const observedObjectiveTypes = observedSlaObjectiveTypes(summary);
                 const requiredObjectiveTypes = fixture.resources.sla.objectiveTypes;
                 const phase =
                   step.source.blueprintStepId === 'observe-held-sla' ? 'held' : 'active';
                 if (fixture.resources.sla.required) {
-                  const missing = requiredObjectiveTypes.filter(
-                    (objectiveType) => !observedObjectiveTypes.has(objectiveType),
-                  );
-                  if (summary.records.length === 0 || missing.length > 0) {
-                    throw new LiveStepError(
-                      typedError(
-                        'ENVIRONMENT',
-                        'SLA_SUMMARY_MISSING',
-                        missing.length > 0
-                          ? `Required SLA objective(s) were not observable: ${missing.join(', ')}.`
-                          : 'Required SLA summary records were not observable for the incident.',
-                      ),
-                    );
-                  }
-                  if (phase === 'held') {
-                    const pauseObserved = summary.records.some(
-                      (record) =>
-                        record.pauseAt ||
-                        (record.pausedDurationSeconds ?? 0) > 0 ||
-                        ['paused', 'on_hold', 'held'].includes(record.status?.toLowerCase() ?? ''),
-                    );
+                  assertRequiredSlaObjectives(summary, requiredObjectiveTypes);
+                  assertObservedSlaPolicy(summary, fixture.resources.sla.policyRef);
+                  if (phase === 'active') {
                     requireLiveAssertion(
-                      pauseObserved,
+                      summary.records.some((record) => isRunningSlaStatus(record.status)),
+                      'SLA_ACTIVE_POSTURE_NOT_OBSERVED',
+                      'Required active SLA running posture was not observable before hold.',
+                    );
+                  } else {
+                    requireLiveAssertion(
+                      summary.records.some(isPausedSlaRecord),
                       'SLA_PAUSE_NOT_OBSERVED',
                       'Required held SLA posture was not observable while the incident was on hold.',
                     );
@@ -1983,6 +2325,10 @@ export class NvsCore {
                   incidentId: incident.id,
                   slaRecords: summary.records.length,
                   slaPhase: phase,
+                  slaPolicyRef: fixture.resources.sla.policyRef ?? null,
+                  slaPolicyVerification: fixture.resources.sla.policyRef
+                    ? 'DEFERRED_NO_CONFIRMED_READ_CONTRACT'
+                    : 'NOT_CONFIGURED',
                   responseObjectiveObserved: observedObjectiveTypes.has('response'),
                   resolutionObjectiveObserved: observedObjectiveTypes.has('resolution'),
                 };
@@ -2038,17 +2384,21 @@ export class NvsCore {
                   'INCIDENT_NOT_RESUMED',
                   'The incident did not resume to in-progress state.',
                 );
-                const resumedSla = await live.incidentAdapter.readSlaSummary({
-                  environment,
-                  session: sessions!.serviceDesk,
-                  tenantId: fixture.tenantId,
-                  incidentId: incident.id,
-                  correlationId,
-                });
+                const resumedSla = await live.incidentAdapter
+                  .readSlaSummary({
+                    environment,
+                    session: sessions!.serviceDesk,
+                    tenantId: fixture.tenantId,
+                    incidentId: incident.id,
+                    correlationId,
+                  })
+                  .catch((error: Error) => {
+                    throw attachOperationEvidence(error, [incident!.transport]);
+                  });
                 if (fixture.resources.sla.required) {
-                  const stillPaused = resumedSla.records.some((record) =>
-                    ['paused', 'on_hold', 'held'].includes(record.status?.toLowerCase() ?? ''),
-                  );
+                  assertRequiredSlaObjectives(resumedSla, fixture.resources.sla.objectiveTypes);
+                  assertObservedSlaPolicy(resumedSla, fixture.resources.sla.policyRef);
+                  const stillPaused = resumedSla.records.some(isPausedSlaRecord);
                   requireLiveAssertion(
                     !stillPaused,
                     'SLA_NOT_RESUMED',
@@ -2057,10 +2407,14 @@ export class NvsCore {
                 }
                 return {
                   ...transportObservation(incident.transport),
+                  ...operationsEvidence([incident.transport, resumedSla.transport]),
                   incidentId: incident.id,
                   status: incident.status ?? null,
                   supportedStateField: 'status',
                   slaResumedObserved: resumedSla.records.length > 0,
+                  responseObjectiveObserved: observedSlaObjectiveTypes(resumedSla).has('response'),
+                  resolutionObjectiveObserved:
+                    observedSlaObjectiveTypes(resumedSla).has('resolution'),
                 };
               }
               case 'incident.resolve': {
@@ -2085,22 +2439,21 @@ export class NvsCore {
                   'INCIDENT_NOT_RESOLVED',
                   'The incident did not reach resolved state.',
                 );
-                const resolvedSla = await live.incidentAdapter.readSlaSummary({
-                  environment,
-                  session: sessions!.serviceDesk,
-                  tenantId: fixture.tenantId,
-                  incidentId: incident.id,
-                  correlationId,
-                });
+                const resolvedSla = await live.incidentAdapter
+                  .readSlaSummary({
+                    environment,
+                    session: sessions!.serviceDesk,
+                    tenantId: fixture.tenantId,
+                    incidentId: incident.id,
+                    correlationId,
+                  })
+                  .catch((error: Error) => {
+                    throw attachOperationEvidence(error, [incident!.transport]);
+                  });
                 if (fixture.resources.sla.required) {
-                  const resolutionStopped = resolvedSla.records.some(
-                    (record) =>
-                      record.objectiveType?.toLowerCase() === 'resolution' &&
-                      (record.stopAt ||
-                        ['completed', 'stopped', 'met', 'breached', 'resolved'].includes(
-                          record.status?.toLowerCase() ?? '',
-                        )),
-                  );
+                  assertRequiredSlaObjectives(resolvedSla, fixture.resources.sla.objectiveTypes);
+                  assertObservedSlaPolicy(resolvedSla, fixture.resources.sla.policyRef);
+                  const resolutionStopped = resolvedSla.records.some(isStoppedResolutionSlaRecord);
                   requireLiveAssertion(
                     resolutionStopped,
                     'SLA_RESOLUTION_STOP_NOT_OBSERVED',
@@ -2109,10 +2462,14 @@ export class NvsCore {
                 }
                 return {
                   ...transportObservation(incident.transport),
+                  ...operationsEvidence([incident.transport, resolvedSla.transport]),
                   incidentId: incident.id,
                   status: incident.status ?? null,
                   supportedStateField: 'status',
                   slaResolvedObserved: resolvedSla.records.length > 0,
+                  responseObjectiveObserved: observedSlaObjectiveTypes(resolvedSla).has('response'),
+                  resolutionObjectiveObserved:
+                    observedSlaObjectiveTypes(resolvedSla).has('resolution'),
                 };
               }
               case 'evidence.read_audit': {
@@ -2124,22 +2481,24 @@ export class NvsCore {
                       'The incident must exist before audit review.',
                     ),
                   );
-                const [reviewedIncident, journal] = await Promise.all([
-                  live.incidentAdapter.readIncident({
+                const reviewedIncident = await live.incidentAdapter.readIncident({
+                  environment,
+                  session: sessions!.incidentManager,
+                  tenantId: fixture.tenantId,
+                  incidentId: incident.id,
+                  correlationId,
+                });
+                const journal = await live.incidentAdapter
+                  .readJournalSummary({
                     environment,
                     session: sessions!.incidentManager,
                     tenantId: fixture.tenantId,
                     incidentId: incident.id,
                     correlationId,
-                  }),
-                  live.incidentAdapter.readJournalSummary({
-                    environment,
-                    session: sessions!.incidentManager,
-                    tenantId: fixture.tenantId,
-                    incidentId: incident.id,
-                    correlationId,
-                  }),
-                ]);
+                  })
+                  .catch((error: Error) => {
+                    throw attachOperationEvidence(error, [reviewedIncident.transport]);
+                  });
                 incident = reviewedIncident;
                 if (journal.count === 0) {
                   throw new LiveStepError(
@@ -2150,28 +2509,29 @@ export class NvsCore {
                     ),
                   );
                 }
-                const requiredAuditActions = ['hold', 'resume', 'resolve'];
-                if (journal.entries) {
-                  const missingActions = requiredAuditActions.filter(
-                    (action) =>
-                      !journal.entries?.some(
-                        (entry) =>
-                          entry.action === action &&
-                          entry.createdBy === sessions!.serviceDesk.userId,
-                      ),
+                const requiredAuditActions: JournalLifecycleAction[] = [
+                  'hold',
+                  'resume',
+                  'resolve',
+                ];
+                const missingActions = requiredAuditActions.filter(
+                  (action) =>
+                    !journal.entries?.some((entry) =>
+                      hasStableJournalAttribution(entry, action, sessions!.serviceDesk.userId),
+                    ),
+                );
+                if (missingActions.length > 0) {
+                  throw new LiveStepError(
+                    typedError(
+                      'ENVIRONMENT',
+                      'AUDIT_ACTION_ATTRIBUTION_UNAVAILABLE',
+                      `Required journal lifecycle attribution was unavailable from stable public fields: ${missingActions.join(', ')}.`,
+                    ),
                   );
-                  if (missingActions.length > 0) {
-                    throw new LiveStepError(
-                      typedError(
-                        'ENVIRONMENT',
-                        'AUDIT_ATTRIBUTION_NOT_OBSERVED',
-                        `Required journal action attribution was not observable: ${missingActions.join(', ')}.`,
-                      ),
-                    );
-                  }
                 }
                 return {
                   ...transportObservation(reviewedIncident.transport ?? journal.transport),
+                  ...operationsEvidence([reviewedIncident.transport, journal.transport]),
                   incidentId: incident.id,
                   status: incident.status ?? null,
                   journalCount: journal.count,
@@ -2238,8 +2598,15 @@ export class NvsCore {
         throw error;
       }
       runError = safeLiveError(error);
-      if (incident && runError.code === 'NILES_CLOSE_AUTHORITY_UNSATISFIABLE' && sessions) {
-        cleanupPolicy = 'DELETE_IF_RUN_OWNED';
+      const failureVerdict = classifyError(runError);
+      if (
+        incident &&
+        incident.status !== 'closed' &&
+        sessions &&
+        failureVerdict === 'BLOCKED' &&
+        fixture.cleanup.onBlockedBeforeClose === 'DELETE_IF_RUN_OWNED'
+      ) {
+        cleanupPolicy = fixture.cleanup.onBlockedBeforeClose;
         try {
           await live.incidentAdapter.softDeleteIncident({
             environment,
@@ -2257,10 +2624,10 @@ export class NvsCore {
           });
           cleanupStatus = deleted ? 'CLEAN' : 'PARTIAL';
           cleanupDetails = deleted
-            ? 'Run-owned resolved incident was soft-deleted after close authority was unsatisfiable.'
+            ? 'Run-owned pre-close incident was soft-deleted after BLOCKED live execution.'
             : 'Run-owned incident delete was attempted but absence could not be verified.';
           if (!deleted) {
-            runError = typedError(
+            cleanupError = typedError(
               'CLEANUP',
               'RUN_OWNED_CLEANUP_UNVERIFIED',
               'Run-owned incident delete was attempted but absence could not be verified.',
@@ -2275,21 +2642,41 @@ export class NvsCore {
         } catch {
           cleanupStatus = 'PARTIAL';
           cleanupDetails =
-            'Run-owned incident delete was attempted after close authority was unsatisfiable but did not complete.';
-          runError = typedError(
+            'Run-owned incident delete was attempted after BLOCKED live execution but did not complete.';
+          cleanupError = typedError(
             'CLEANUP',
             'RUN_OWNED_CLEANUP_FAILED',
-            'Run-owned incident cleanup failed after close authority was unsatisfiable.',
+            'Run-owned incident cleanup failed after BLOCKED live execution.',
           );
         }
+      } else if (
+        incident &&
+        incident.status !== 'closed' &&
+        !sessions &&
+        failureVerdict === 'BLOCKED' &&
+        fixture.cleanup.onBlockedBeforeClose === 'DELETE_IF_RUN_OWNED'
+      ) {
+        cleanupPolicy = fixture.cleanup.onBlockedBeforeClose;
+        cleanupStatus = 'PARTIAL';
+        cleanupDetails =
+          'Run-owned incident cleanup was required after BLOCKED live execution but no live session was available.';
+        cleanupError = typedError(
+          'CLEANUP',
+          'RUN_OWNED_CLEANUP_SESSION_UNAVAILABLE',
+          'Run-owned incident cleanup could not run because no live session was available.',
+        );
       } else if (incident) {
-        cleanupPolicy = 'RETAIN_FOR_DIAGNOSIS';
+        cleanupPolicy = failureVerdict === 'FAIL' ? fixture.cleanup.onFail : 'RETAIN_FOR_DIAGNOSIS';
         cleanupStatus = 'RETAINED_BY_POLICY';
-        cleanupDetails = 'Incident retained for diagnosis after live API failure.';
+        cleanupDetails =
+          failureVerdict === 'FAIL'
+            ? 'Incident retained for diagnosis after live API assertion failure.'
+            : 'Incident retained for diagnosis after live API blocker.';
       } else {
-        cleanupPolicy = 'RETAIN_FOR_DIAGNOSIS';
+        cleanupPolicy =
+          failureVerdict === 'FAIL' ? fixture.cleanup.onFail : fixture.cleanup.onBlockedBeforeClose;
         cleanupStatus = 'NOT_REQUIRED';
-        cleanupDetails = 'No NILES incident was created before the live run blocked.';
+        cleanupDetails = 'No NILES incident was created before the live run ended.';
       }
     } finally {
       sessions?.destroy();
@@ -2297,9 +2684,7 @@ export class NvsCore {
 
     const inventory = baseInventory();
     const finalInventory =
-      runError?.code === 'NILES_CLOSE_AUTHORITY_UNSATISFIABLE' &&
-      cleanupStatus === 'CLEAN' &&
-      incident
+      cleanupStatus === 'CLEAN' && incident
         ? resourceInventoryV1Schema.parse({
             ...inventory,
             incident: {
@@ -2361,6 +2746,7 @@ export class NvsCore {
         status: cleanupStatus,
         policy: cleanupPolicy,
         details: cleanupDetails,
+        ...(cleanupError ? { error: cleanupError } : {}),
       },
       resourceInventory: finalInventory,
     });
@@ -2424,6 +2810,7 @@ export class NvsCore {
   async createCompileOnlyRun(input: CompileOnlyRunInput): Promise<RunRecordV1> {
     const environment = await this.getEnvironment(input.environmentId);
     enforceEnvironmentOperationPolicy(environment, 'COMPILE_ONLY');
+    await this.reserveRunId(input.runId);
     const plan = await this.compileScenario(input.scenarioId, input.variationValues ?? {});
     const evidenceEntries = [
       {
@@ -2566,6 +2953,20 @@ export class NvsCore {
       observations: state.observations,
       checkpoint,
     };
+  }
+
+  async listActiveLiveRuns(): Promise<
+    Array<{
+      schemaVersion: 'nvs.run-progress/v1';
+      runId: string;
+      status: RunRecord['status'] | 'PREPARED' | 'FINALIZING' | 'RECOVERY_REQUIRED';
+      verdict: RunRecord['verdict'] | 'PENDING';
+      observations: StepObservationV1[];
+      checkpoint?: LiveRunCheckpointV1;
+    }>
+  > {
+    const states = await this.liveStateRepository().listActive();
+    return Promise.all(states.map((state) => this.getRunProgress(state.runId)));
   }
 
   async getResourceInventory(runId: string): Promise<ResourceInventoryV1> {

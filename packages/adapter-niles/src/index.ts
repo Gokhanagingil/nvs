@@ -596,15 +596,25 @@ class NilesLiveAdapterOperationError extends Error {
   readonly retryable: boolean;
 
   constructor(
-    readonly status: number,
+    readonly status: number | undefined,
     operation: string,
+    readonly transport?: NilesTransportEvidence,
+    kind?: 'network' | 'timeout' | 'malformed',
   ) {
     super(`NILES live API operation failed: ${operation}.`);
     this.name = 'NilesLiveAdapterOperationError';
-    if (status === 0) {
-      this.code = 'NILES_NETWORK_OR_TIMEOUT';
+    if (kind === 'timeout') {
+      this.code = 'NILES_TIMEOUT';
       this.category = 'ADAPTER';
       this.retryable = true;
+    } else if (kind === 'network') {
+      this.code = 'NILES_NETWORK_FAILURE';
+      this.category = 'ADAPTER';
+      this.retryable = true;
+    } else if (kind === 'malformed') {
+      this.code = 'NILES_MALFORMED_RESPONSE';
+      this.category = 'ADAPTER';
+      this.retryable = false;
     } else if (status === 400) {
       this.code = 'NILES_PRODUCT_RULE_REJECTED';
       this.category = 'PRODUCT';
@@ -625,10 +635,10 @@ class NilesLiveAdapterOperationError extends Error {
       this.code = 'NILES_RATE_LIMITED';
       this.category = 'ADAPTER';
       this.retryable = true;
-    } else if (status >= 500) {
-      this.code = status === 502 ? 'NILES_MALFORMED_RESPONSE' : 'NILES_UPSTREAM_FAILURE';
+    } else if (typeof status === 'number' && status >= 500) {
+      this.code = 'NILES_UPSTREAM_FAILURE';
       this.category = 'ADAPTER';
-      this.retryable = status !== 502;
+      this.retryable = true;
     } else {
       this.code = 'NILES_LIVE_HTTP_FAILURE';
       this.category = 'ADAPTER';
@@ -641,11 +651,19 @@ function safeString(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
 }
 
-function normalizeIncident(value: unknown): NilesIncidentRecord {
+function normalizeIncident(
+  value: unknown,
+  transport?: NilesTransportEvidence,
+): NilesIncidentRecord {
   const payload = unwrapPayload(value);
   const id = safeString(payload?.['id']);
   if (!id || !UUID_PATTERN.test(id)) {
-    throw new NilesLiveAdapterOperationError(502, 'normalize incident');
+    throw new NilesLiveAdapterOperationError(
+      transport?.httpStatus,
+      'normalize incident',
+      transport,
+      'malformed',
+    );
   }
   const number = safeString(payload?.['number']);
   const status = safeString(payload?.['status']);
@@ -671,11 +689,17 @@ function normalizeResource(
   value: unknown,
   expectedId: string,
   operation: string,
+  transport?: NilesTransportEvidence,
 ): NilesFixtureResource {
   const payload = unwrapPayload(value);
   const id = safeString(payload?.['id']);
   if (!id || id !== expectedId) {
-    throw new NilesLiveAdapterOperationError(502, operation);
+    throw new NilesLiveAdapterOperationError(
+      transport?.httpStatus,
+      operation,
+      transport,
+      'malformed',
+    );
   }
   const label = safeString(payload?.['name']) ?? safeString(payload?.['displayName']);
   const serviceId = safeString(payload?.['serviceId']);
@@ -713,6 +737,13 @@ export class NilesIncidentApiAdapter implements NilesIncidentLiveAdapter {
   }): Promise<{ payload: unknown; transport: NilesTransportEvidence }> {
     let response: Response;
     const startedAt = performance.now();
+    const transport = (httpStatus?: number): NilesTransportEvidence => ({
+      method: input.method,
+      pathTemplate: input.pathTemplate,
+      ...(httpStatus !== undefined ? { httpStatus } : {}),
+      durationMs: Math.max(0, Math.round(performance.now() - startedAt)),
+      correlationId: input.correlationId,
+    });
     try {
       response = await withAuthenticationTimeout(this.timeoutMs, (signal) =>
         input.session.withAuthorization((authorization) =>
@@ -730,21 +761,27 @@ export class NilesIncidentApiAdapter implements NilesIncidentLiveAdapter {
           }),
         ),
       );
-    } catch {
-      throw new NilesLiveAdapterOperationError(0, input.operation);
+    } catch (error) {
+      throw new NilesLiveAdapterOperationError(
+        undefined,
+        input.operation,
+        transport(),
+        error instanceof AuthenticationRequestTimeoutError ||
+          (error instanceof Error && error.name === 'AbortError')
+          ? 'timeout'
+          : 'network',
+      );
     }
     if (!response.ok) {
-      throw new NilesLiveAdapterOperationError(response.status, input.operation);
+      throw new NilesLiveAdapterOperationError(
+        response.status,
+        input.operation,
+        transport(response.status),
+      );
     }
     return {
       payload: await readJson(response),
-      transport: {
-        method: input.method,
-        pathTemplate: input.pathTemplate,
-        httpStatus: response.status,
-        durationMs: Math.max(0, Math.round(performance.now() - startedAt)),
-        correlationId: input.correlationId,
-      },
+      transport: transport(response.status),
     };
   }
 
@@ -779,7 +816,7 @@ export class NilesIncidentApiAdapter implements NilesIncidentLiveAdapter {
       pathTemplate,
       operation: `verify ${input.kind}`,
     }).then((response) => ({
-      ...normalizeResource(response.payload, input.id, `verify ${input.kind}`),
+      ...normalizeResource(response.payload, input.id, `verify ${input.kind}`, response.transport),
       transport: response.transport,
     }));
   }
@@ -826,7 +863,7 @@ export class NilesIncidentApiAdapter implements NilesIncidentLiveAdapter {
         },
       },
     }).then((response) => ({
-      ...normalizeIncident(response.payload),
+      ...normalizeIncident(response.payload, response.transport),
       transport: response.transport,
     }));
   }
@@ -845,7 +882,7 @@ export class NilesIncidentApiAdapter implements NilesIncidentLiveAdapter {
       pathTemplate: '/grc/itsm/incidents/:incidentId',
       operation: 'read incident',
     }).then((response) => ({
-      ...normalizeIncident(response.payload),
+      ...normalizeIncident(response.payload, response.transport),
       transport: response.transport,
     }));
   }
@@ -866,7 +903,7 @@ export class NilesIncidentApiAdapter implements NilesIncidentLiveAdapter {
       operation: 'assign incident',
       body: { assignmentGroupId: input.assignmentGroupId },
     }).then((response) => ({
-      ...normalizeIncident(response.payload),
+      ...normalizeIncident(response.payload, response.transport),
       transport: response.transport,
     }));
   }
@@ -885,7 +922,7 @@ export class NilesIncidentApiAdapter implements NilesIncidentLiveAdapter {
       pathTemplate: '/grc/itsm/incidents/:incidentId/take-ownership',
       operation: 'take ownership',
     }).then((response) => ({
-      ...normalizeIncident(response.payload),
+      ...normalizeIncident(response.payload, response.transport),
       transport: response.transport,
     }));
   }
@@ -904,7 +941,7 @@ export class NilesIncidentApiAdapter implements NilesIncidentLiveAdapter {
       pathTemplate: '/grc/itsm/incidents/:incidentId/start-work',
       operation: 'start work',
     }).then((response) => ({
-      ...normalizeIncident(response.payload),
+      ...normalizeIncident(response.payload, response.transport),
       transport: response.transport,
     }));
   }
@@ -940,15 +977,16 @@ export class NilesIncidentApiAdapter implements NilesIncidentLiveAdapter {
     tenantId: string;
     incidentId: string;
     correlationId: string;
-  }): Promise<Array<{ ciId: string }>> {
+  }): Promise<{ items: Array<{ ciId: string }>; transport: NilesTransportEvidence }> {
     return this.request({
       ...input,
       method: 'GET',
       path: `/grc/itsm/incidents/${input.incidentId}/affected-cis`,
       pathTemplate: '/grc/itsm/incidents/:incidentId/affected-cis',
       operation: 'list affected CIs',
-    }).then((response) =>
-      asArrayPayload(response.payload).flatMap((record) => {
+    }).then((response) => ({
+      transport: response.transport,
+      items: asArrayPayload(response.payload).flatMap((record) => {
         const value = asRecord(record) ?? {};
         const ciId =
           safeString(value['ciId']) ??
@@ -956,7 +994,7 @@ export class NilesIncidentApiAdapter implements NilesIncidentLiveAdapter {
           safeString(asRecord(value['ci'])?.['id']);
         return ciId ? [{ ciId }] : [];
       }),
-    );
+    }));
   }
 
   readSlaSummary(input: {
@@ -981,8 +1019,10 @@ export class NilesIncidentApiAdapter implements NilesIncidentLiveAdapter {
         };
         const objectiveType = safeString(value['objectiveType']);
         const status = safeString(value['status']);
+        const policyRef = safeString(value['policyRef']) ?? safeString(value['policyId']);
         if (objectiveType) summary.objectiveType = objectiveType;
         if (status) summary.status = status;
+        if (policyRef) summary.policyRef = policyRef;
         if (typeof value['breached'] === 'boolean') summary.breached = value['breached'];
         const pauseAt = safeString(value['pauseAt']);
         const stopAt = safeString(value['stopAt']);
@@ -1014,19 +1054,21 @@ export class NilesIncidentApiAdapter implements NilesIncidentLiveAdapter {
       method: 'GET',
       path: `/grc/itsm/incidents/${input.incidentId}/journal`,
       pathTemplate: '/grc/itsm/incidents/:incidentId/journal',
-      operation: 'read journal count',
+      operation: 'read journal entries',
     }).then((response) => {
       const entries = asArrayPayload(response.payload).flatMap((entry) => {
         const value = asRecord(entry) ?? {};
         const id = safeString(value['id']);
-        const action = safeString(value['action']);
+        const type = safeString(value['type']);
+        const message = safeString(value['message']);
         const createdBy = safeString(value['createdBy']);
         const createdAt = safeString(value['createdAt']);
         return id
           ? [
               {
                 id,
-                ...(action ? { action } : {}),
+                ...(type ? { type } : {}),
+                ...(message ? { message } : {}),
                 ...(createdBy ? { createdBy } : {}),
                 ...(createdAt ? { createdAt } : {}),
               },
@@ -1062,7 +1104,7 @@ export class NilesIncidentApiAdapter implements NilesIncidentLiveAdapter {
         pendingReasonDetail: input.pendingReasonDetail,
       },
     }).then((response) => ({
-      ...normalizeIncident(response.payload),
+      ...normalizeIncident(response.payload, response.transport),
       transport: response.transport,
     }));
   }
@@ -1082,7 +1124,7 @@ export class NilesIncidentApiAdapter implements NilesIncidentLiveAdapter {
       operation: 'resume incident',
       body: { status: 'in_progress' },
     }).then((response) => ({
-      ...normalizeIncident(response.payload),
+      ...normalizeIncident(response.payload, response.transport),
       transport: response.transport,
     }));
   }
@@ -1103,7 +1145,7 @@ export class NilesIncidentApiAdapter implements NilesIncidentLiveAdapter {
       operation: 'resolve incident',
       body: { resolutionNotes: input.resolutionNotes },
     }).then((response) => ({
-      ...normalizeIncident(response.payload),
+      ...normalizeIncident(response.payload, response.transport),
       transport: response.transport,
     }));
   }
@@ -1124,7 +1166,7 @@ export class NilesIncidentApiAdapter implements NilesIncidentLiveAdapter {
       operation: 'close incident',
       body: { closureNote: input.closureNote },
     }).then((response) => ({
-      ...normalizeIncident(response.payload),
+      ...normalizeIncident(response.payload, response.transport),
       transport: response.transport,
     }));
   }

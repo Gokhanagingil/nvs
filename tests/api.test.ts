@@ -225,8 +225,27 @@ describe('versioned control-plane API', () => {
     expect(liveReadiness.json()).toMatchObject({
       schemaVersion: 'nvs.execution-readiness/v1',
       verdict: 'BLOCKED',
+      confirmed: false,
+      staticEligible: false,
       mutationEligible: false,
       gateEligible: false,
+    });
+
+    const confirmedLiveReadiness = await app.inject({
+      method: 'POST',
+      url: '/api/environments/local-example/execution-readiness/confirm',
+      payload: {
+        scenarioId: 'payment-api-service-degradation',
+        variationValues: { journey: 'normal' },
+      },
+    });
+    expect(confirmedLiveReadiness.statusCode).toBe(200);
+    expect(confirmedLiveReadiness.json()).toMatchObject({
+      schemaVersion: 'nvs.execution-readiness/v1',
+      verdict: 'BLOCKED',
+      confirmed: true,
+      staticEligible: false,
+      mutationEligible: false,
     });
 
     const blockedLiveRun = await app.inject({

@@ -317,6 +317,22 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     });
   });
 
+  app.post('/api/environments/:id/execution-readiness/confirm', async (request) => {
+    const { id } = idParamsSchema.parse(request.params);
+    const body = z
+      .object({
+        scenarioId: safeIdSchema.optional(),
+        variationValues: z.record(safeIdSchema, safeIdSchema).optional(),
+      })
+      .strict()
+      .parse(request.body ?? {});
+    return core.confirmExecutionReadiness({
+      environmentId: id,
+      ...(body.scenarioId ? { scenarioId: body.scenarioId } : {}),
+      ...(body.variationValues ? { variationValues: body.variationValues } : {}),
+    });
+  });
+
   app.get('/api/scenarios', async () => ({ items: await core.listScenarios() }));
 
   app.get('/api/scenarios/:id', async (request) => {
@@ -357,6 +373,8 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   });
 
   app.get('/api/runs', async () => ({ items: await core.listRuns() }));
+
+  app.get('/api/runs/live-active', async () => ({ items: await core.listActiveLiveRuns() }));
 
   app.get('/api/runs/:id', async (request) => {
     const { id } = idParamsSchema.parse(request.params);

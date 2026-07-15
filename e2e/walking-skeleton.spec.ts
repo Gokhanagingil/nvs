@@ -126,13 +126,65 @@ test('shows live run polling progress with retained run inventory', async ({ pag
         runType: 'LIVE_API',
         scenarioId: 'payment-api-service-degradation',
         variationValues: { journey: 'normal' },
+        confirmed: false,
+        staticEligible: true,
         verdict: 'PASS',
-        mutationEligible: true,
+        mutationEligible: false,
         gateEligible: false,
         checks: [
           { id: 'server-mutation-switch', status: 'PASS', message: 'Test gate enabled.' },
           { id: 'concurrency', status: 'PASS', message: 'No live API run is active.' },
+          {
+            id: 'actor-authentication',
+            status: 'NOT_CHECKED',
+            message: 'Actor authentication requires confirmed preflight.',
+          },
+          {
+            id: 'fixture-resources',
+            status: 'NOT_CHECKED',
+            message: 'Fixture resources require confirmed preflight.',
+          },
         ],
+      },
+    });
+  });
+  await page.route(
+    '**/api/environments/local-example/execution-readiness/confirm',
+    async (route) => {
+      await route.fulfill({
+        json: {
+          schemaVersion: 'nvs.execution-readiness/v1',
+          environmentId: 'local-example',
+          runType: 'LIVE_API',
+          scenarioId: 'payment-api-service-degradation',
+          variationValues: { journey: 'normal' },
+          confirmed: true,
+          staticEligible: true,
+          verdict: 'PASS',
+          mutationEligible: true,
+          gateEligible: false,
+          checks: [
+            { id: 'server-mutation-switch', status: 'PASS', message: 'Test gate enabled.' },
+            { id: 'concurrency', status: 'PASS', message: 'No live API run is active.' },
+            {
+              id: 'actor-authentication',
+              status: 'PASS',
+              message: 'Required live actor profiles authenticated read-only.',
+            },
+            {
+              id: 'fixture-resources',
+              status: 'PASS',
+              message: 'Required fixture resources were verified read-only.',
+            },
+          ],
+        },
+      });
+    },
+  );
+  await page.route('**/api/runs/live-active', async (route) => {
+    await route.fulfill({
+      json: {
+        items: [],
       },
     });
   });
@@ -223,9 +275,11 @@ test('shows live run polling progress with retained run inventory', async ({ pag
     .getByLabel('Scenario', { exact: true })
     .selectOption('payment-api-service-degradation');
   await page.getByLabel(/Approved positive, lifecycle, SLA/).selectOption('normal');
-  await expect(page.getByText('Mutation eligible')).toBeVisible();
+  await expect(page.getByText('Static gates passed')).toBeVisible();
+  await page.getByRole('button', { name: 'Run confirmed preflight' }).click();
+  await expect(page.getByText('Confirmed mutation eligible')).toBeVisible();
   await page.getByLabel(/Confirm this may create or change/).check();
-  await page.getByRole('button', { name: 'Launch live API run' }).click();
+  await page.getByRole('button', { name: 'Start confirmed live run' }).click();
 
   await expect(page.getByText('Live API progress')).toBeVisible();
   await expect(page.getByText(liveRunId)).toBeVisible();

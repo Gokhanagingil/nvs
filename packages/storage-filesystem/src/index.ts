@@ -446,10 +446,48 @@ function isAlreadyExists(error: unknown): boolean {
 }
 
 export class FilesystemRunBundleRepository implements RunBundleRepository {
+  private readonly reservedRunIds = new Set<string>();
+
   constructor(
     private readonly artifactRoot: string,
     private readonly hooks: BundlePersistenceHooks = {},
   ) {}
+
+  async reserveRunId(runId: string): Promise<void> {
+    assertSafeId(runId);
+    const runsRoot = safeChild(this.artifactRoot, 'runs');
+    const finalDirectory = safeChild(runsRoot, runId);
+    const inflightDirectory = safeChild(runsRoot, '.inflight', runId);
+    await mkdir(runsRoot, { recursive: true });
+    try {
+      await readdir(inflightDirectory);
+      throw new RunIdAlreadyExistsError();
+    } catch (error) {
+      if (!isMissing(error)) {
+        throw error;
+      }
+    }
+    try {
+      await mkdir(finalDirectory);
+      await writeFile(
+        safeChild(finalDirectory, '.reserved'),
+        serializeForPersistence({
+          schemaVersion: 'nvs.run-namespace-reservation/v1',
+          runId,
+          reservedAt: new Date().toISOString(),
+          pid: process.pid,
+        }),
+        { encoding: 'utf8', flag: 'wx' },
+      );
+      this.reservedRunIds.add(runId);
+    } catch (error) {
+      if (isAlreadyExists(error)) {
+        throw new RunIdAlreadyExistsError();
+      }
+      await rm(finalDirectory, { recursive: true, force: true }).catch(() => undefined);
+      throw error;
+    }
+  }
 
   async saveBundle(bundle: RunBundle): Promise<RunRecord> {
     const prepared = prepareBundle(bundle);
@@ -463,6 +501,7 @@ export class FilesystemRunBundleRepository implements RunBundleRepository {
       `${prepared.run.runId}-${process.pid}-${stagingSequence}`,
     );
     let finalDirectoryCreated = false;
+    const usingReservedDirectory = this.reservedRunIds.has(prepared.run.runId);
 
     await mkdir(stagingRoot, { recursive: true });
     await mkdir(stagingDirectory);
@@ -480,14 +519,22 @@ export class FilesystemRunBundleRepository implements RunBundleRepository {
       });
       await this.hooks.beforeCommit?.();
 
-      try {
-        await mkdir(finalDirectory);
-        finalDirectoryCreated = true;
-      } catch (error) {
-        if (isAlreadyExists(error)) {
+      if (this.reservedRunIds.has(prepared.run.runId)) {
+        try {
+          await readFile(safeChild(finalDirectory, '.reserved'), 'utf8');
+        } catch {
           throw new RunIdAlreadyExistsError();
         }
-        throw error;
+      } else {
+        try {
+          await mkdir(finalDirectory);
+          finalDirectoryCreated = true;
+        } catch (error) {
+          if (isAlreadyExists(error)) {
+            throw new RunIdAlreadyExistsError();
+          }
+          throw error;
+        }
       }
 
       for (const document of documents) {
@@ -499,13 +546,18 @@ export class FilesystemRunBundleRepository implements RunBundleRepository {
         safeChild(stagingDirectory, '.committed'),
         safeChild(finalDirectory, '.committed'),
       );
+      if (usingReservedDirectory) {
+        await rm(safeChild(finalDirectory, '.reserved'), { force: true }).catch(() => undefined);
+        this.reservedRunIds.delete(prepared.run.runId);
+      }
       await rm(stagingDirectory, { recursive: true, force: true }).catch(() => undefined);
       return prepared.run;
     } catch (error) {
       await rm(stagingDirectory, { recursive: true, force: true });
-      if (finalDirectoryCreated) {
+      if (finalDirectoryCreated || usingReservedDirectory) {
         await rm(finalDirectory, { recursive: true, force: true });
       }
+      this.reservedRunIds.delete(prepared.run.runId);
       throw error;
     }
   }
@@ -680,6 +732,22 @@ export class FilesystemLiveRunStateRepository implements LiveRunStateRepository 
       throw new RunIdAlreadyExistsError();
     } catch (error) {
       if (!isMissing(error)) {
+        throw error;
+      }
+    }
+    try {
+      await readFile(safeChild(finalDirectory, '.reserved'), 'utf8');
+    } catch (error) {
+      if (isMissing(error)) {
+        try {
+          await readdir(finalDirectory);
+          throw new RunIdAlreadyExistsError();
+        } catch (directoryError) {
+          if (!isMissing(directoryError)) {
+            throw directoryError;
+          }
+        }
+      } else {
         throw error;
       }
     }

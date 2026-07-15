@@ -33,6 +33,16 @@ const session: ActorSession = {
   },
 };
 
+function hangsUntilAborted(_input: string | URL | Request, init?: RequestInit): Promise<Response> {
+  return new Promise((_resolve, reject) => {
+    init?.signal?.addEventListener(
+      'abort',
+      () => reject(new DOMException('transport detail', 'AbortError')),
+      { once: true },
+    );
+  });
+}
+
 describe('NILES incident live API adapter', () => {
   it('persists typed sanitized transport evidence and uses the fixture namespace marker', async () => {
     const fetchMock = vi.fn<FetchImplementation>().mockResolvedValue(
@@ -93,7 +103,7 @@ describe('NILES incident live API adapter', () => {
     [409, 'NILES_CONFLICT', 'PRODUCT', false],
     [429, 'NILES_RATE_LIMITED', 'ADAPTER', true],
     [500, 'NILES_UPSTREAM_FAILURE', 'ADAPTER', true],
-    [502, 'NILES_MALFORMED_RESPONSE', 'ADAPTER', false],
+    [502, 'NILES_UPSTREAM_FAILURE', 'ADAPTER', true],
   ] as const)(
     'maps HTTP %s to stable typed error %s',
     async (httpStatus, code, category, retryable) => {
@@ -129,7 +139,16 @@ describe('NILES incident live API adapter', () => {
         incidentId,
         correlationId: 'read-network',
       }),
-    ).rejects.toMatchObject({ code: 'NILES_NETWORK_OR_TIMEOUT', category: 'ADAPTER' });
+    ).rejects.toMatchObject({
+      code: 'NILES_NETWORK_FAILURE',
+      category: 'ADAPTER',
+      retryable: true,
+      transport: expect.objectContaining({
+        method: 'GET',
+        pathTemplate: '/grc/itsm/incidents/:incidentId',
+        correlationId: 'read-network',
+      }),
+    });
 
     const malformedAdapter = new NilesIncidentApiAdapter(
       vi
@@ -147,6 +166,90 @@ describe('NILES incident live API adapter', () => {
         incidentId,
         correlationId: 'read-malformed',
       }),
-    ).rejects.toMatchObject({ code: 'NILES_MALFORMED_RESPONSE', category: 'ADAPTER' });
+    ).rejects.toMatchObject({
+      code: 'NILES_MALFORMED_RESPONSE',
+      category: 'ADAPTER',
+      retryable: false,
+      transport: expect.objectContaining({ httpStatus: 200 }),
+    });
+  });
+
+  it('maps timeouts to a distinct retryable adapter error', async () => {
+    vi.useFakeTimers();
+    try {
+      const timeoutAdapter = new NilesIncidentApiAdapter(
+        vi.fn<FetchImplementation>(hangsUntilAborted),
+        100,
+      );
+      const read = timeoutAdapter.readIncident({
+        environment,
+        session,
+        tenantId,
+        incidentId,
+        correlationId: 'read-timeout',
+      });
+      const assertion = expect(read).rejects.toMatchObject({
+        code: 'NILES_TIMEOUT',
+        category: 'ADAPTER',
+        retryable: true,
+        transport: expect.objectContaining({
+          method: 'GET',
+          pathTemplate: '/grc/itsm/incidents/:incidentId',
+          correlationId: 'read-timeout',
+        }),
+      });
+
+      await vi.advanceTimersByTimeAsync(100);
+
+      await assertion;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('parses the real GRC journal response shape without inventing action fields', async () => {
+    const fetchMock = vi.fn<FetchImplementation>().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          items: [
+            {
+              id: 'journal-1',
+              type: 'action',
+              message: 'Incident resumed. Work returned to In Progress.',
+              createdBy: requesterId,
+              createdAt: '2026-07-15T12:00:00.000Z',
+            },
+          ],
+          total: 1,
+          page: 1,
+          pageSize: 20,
+          totalPages: 1,
+        }),
+        { status: 200 },
+      ),
+    );
+    const adapter = new NilesIncidentApiAdapter(fetchMock, 100);
+
+    const journal = await adapter.readJournalSummary({
+      environment,
+      session,
+      tenantId,
+      incidentId,
+      correlationId: 'read-journal',
+    });
+
+    expect(journal).toMatchObject({
+      count: 1,
+      entries: [
+        {
+          id: 'journal-1',
+          type: 'action',
+          message: 'Incident resumed. Work returned to In Progress.',
+          createdBy: requesterId,
+          createdAt: '2026-07-15T12:00:00.000Z',
+        },
+      ],
+    });
+    expect(JSON.stringify(journal)).not.toMatch(/"action":/);
   });
 });

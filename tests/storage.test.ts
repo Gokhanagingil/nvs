@@ -100,6 +100,28 @@ describe('filesystem repositories', () => {
     await expect(bundles.getEvidence('incomplete-run')).resolves.toBeUndefined();
   });
 
+  it('rejects run ID reservation when a partial final directory already exists', async () => {
+    await mkdir(path.join(temporaryRoot, 'runs', 'partial-final-run'), { recursive: true });
+    const bundles = new FilesystemRunBundleRepository(temporaryRoot);
+
+    await expect(bundles.reserveRunId('partial-final-run')).rejects.toBeInstanceOf(
+      RunIdAlreadyExistsError,
+    );
+  });
+
+  it('allows only one repository instance to reserve a run ID', async () => {
+    const first = new FilesystemRunBundleRepository(temporaryRoot);
+    const second = new FilesystemRunBundleRepository(temporaryRoot);
+
+    const attempts = await Promise.allSettled([
+      first.reserveRunId('shared-reservation-run'),
+      second.reserveRunId('shared-reservation-run'),
+    ]);
+
+    expect(attempts.filter((attempt) => attempt.status === 'fulfilled')).toHaveLength(1);
+    expect(attempts.filter((attempt) => attempt.status === 'rejected')).toHaveLength(1);
+  });
+
   it('atomically persists an immutable bundle with exact persisted-byte hashes', async () => {
     const bundles = new FilesystemRunBundleRepository(temporaryRoot);
     const created = await createRun(bundles);
@@ -154,7 +176,10 @@ describe('filesystem repositories', () => {
     const runFile = path.join(temporaryRoot, 'runs', created.runId, 'run.json');
     const originalBytes = await readFile(runFile, 'utf8');
 
-    await expect(createRun(bundles, created.runId)).rejects.toBeInstanceOf(RunIdAlreadyExistsError);
+    await expect(createRun(bundles, created.runId)).rejects.toMatchObject({
+      code: 'RUN_ID_ALREADY_EXISTS',
+      category: 'PERSISTENCE',
+    });
     expect(await readFile(runFile, 'utf8')).toBe(originalBytes);
     await expect(bundles.list()).resolves.toHaveLength(1);
   });

@@ -651,6 +651,8 @@ export const executionReadinessV1Schema = z
     runType: z.literal('LIVE_API'),
     scenarioId: safeIdSchema.optional(),
     variationValues: z.record(safeIdSchema, safeIdSchema).optional(),
+    confirmed: z.boolean().default(false),
+    staticEligible: z.boolean().default(false),
     verdict: z.enum(['PASS', 'BLOCKED']),
     mutationEligible: z.boolean(),
     gateEligible: z.literal(false),
@@ -673,13 +675,6 @@ export const executionReadinessV1Schema = z
   })
   .strict()
   .superRefine((readiness, context) => {
-    if (readiness.verdict === 'PASS' && !readiness.mutationEligible) {
-      context.addIssue({
-        code: 'custom',
-        path: ['mutationEligible'],
-        message: 'PASS readiness requires mutation eligibility',
-      });
-    }
     if (readiness.verdict === 'PASS' && readiness.error) {
       context.addIssue({
         code: 'custom',
@@ -998,6 +993,17 @@ const observationValueSchema = z.union([
   z.number().finite(),
   z.boolean(),
   z.null(),
+  z.array(
+    z
+      .object({
+        method: z.enum(['GET', 'POST', 'DELETE']),
+        pathTemplate: z.string().min(1).max(200),
+        httpStatus: z.number().int().min(0).max(599).optional(),
+        durationMs: z.number().finite().nonnegative(),
+        correlationId: safeIdSchema,
+      })
+      .strict(),
+  ),
 ]);
 
 export const stepObservationV1Schema = z
@@ -1111,6 +1117,7 @@ export const runRecordV2Schema = z
         status: z.enum(['CLEAN', 'RETAINED_BY_POLICY', 'PARTIAL', 'UNKNOWN', 'NOT_REQUIRED']),
         policy: z.enum(['RETAIN_CLOSED', 'RETAIN_FOR_DIAGNOSIS', 'DELETE_IF_RUN_OWNED']),
         details: z.string().max(400).optional(),
+        error: typedErrorSchema.optional(),
       })
       .strict(),
     resourceInventory: resourceInventoryV1Schema,

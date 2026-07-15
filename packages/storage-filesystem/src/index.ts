@@ -489,6 +489,25 @@ export class FilesystemRunBundleRepository implements RunBundleRepository {
     }
   }
 
+  async releaseRunId(runId: string): Promise<void> {
+    assertSafeId(runId);
+    if (!this.reservedRunIds.has(runId)) {
+      return;
+    }
+    const finalDirectory = safeChild(this.artifactRoot, 'runs', runId);
+    try {
+      await readFile(safeChild(finalDirectory, '.reserved'), 'utf8');
+    } catch (error) {
+      if (isMissing(error)) {
+        this.reservedRunIds.delete(runId);
+        return;
+      }
+      throw error;
+    }
+    await rm(finalDirectory, { recursive: true, force: true });
+    this.reservedRunIds.delete(runId);
+  }
+
   async saveBundle(bundle: RunBundle): Promise<RunRecord> {
     const prepared = prepareBundle(bundle);
     const documents = ALL_BUNDLE_DOCUMENTS.filter((document) => prepared.bytes[document]);

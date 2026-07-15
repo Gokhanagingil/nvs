@@ -952,6 +952,16 @@ const inventoryResourceSchema = z
   })
   .strict();
 
+const sanitizedTransportEvidenceSchema = z
+  .object({
+    method: z.enum(['GET', 'POST', 'DELETE']),
+    pathTemplate: z.string().min(1).max(200),
+    httpStatus: z.number().int().min(0).max(599).optional(),
+    durationMs: z.number().finite().nonnegative(),
+    correlationId: safeIdSchema,
+  })
+  .strict();
+
 export const resourceInventoryV1Schema = z
   .object({
     schemaVersion: z.literal('nvs.resource-inventory/v1'),
@@ -982,6 +992,19 @@ export const resourceInventoryV1Schema = z
       })
       .strict()
       .optional(),
+    creationOutcome: z
+      .object({
+        kind: z.literal('INCIDENT_CREATE'),
+        status: z.literal('UNKNOWN'),
+        runId: safeIdSchema,
+        runNamespacePrefix: safeIdSchema,
+        marker: z.string().min(1).max(200),
+        tenantId: z.uuid(),
+        correlationId: safeIdSchema,
+        transport: sanitizedTransportEvidenceSchema.optional(),
+      })
+      .strict()
+      .optional(),
     resources: z.array(inventoryResourceSchema),
     updatedAt: z.iso.datetime({ offset: true }),
   })
@@ -993,17 +1016,7 @@ const observationValueSchema = z.union([
   z.number().finite(),
   z.boolean(),
   z.null(),
-  z.array(
-    z
-      .object({
-        method: z.enum(['GET', 'POST', 'DELETE']),
-        pathTemplate: z.string().min(1).max(200),
-        httpStatus: z.number().int().min(0).max(599).optional(),
-        durationMs: z.number().finite().nonnegative(),
-        correlationId: safeIdSchema,
-      })
-      .strict(),
-  ),
+  z.array(sanitizedTransportEvidenceSchema),
 ]);
 
 export const stepObservationV1Schema = z
@@ -1197,6 +1210,7 @@ export const liveRunCheckpointV1Schema = z
     ]),
     incidentId: z.uuid().optional(),
     completedStepIds: z.array(safeIdSchema),
+    error: typedErrorSchema.optional(),
     cleanup: z
       .object({
         attempted: z.boolean(),

@@ -10,6 +10,8 @@ import {
   type ActorSession,
   type AuthenticationCredential,
   type EnvironmentRepository,
+  type LiveRunState,
+  type LiveRunStateRepository,
   type NilesAffectedCiSummary,
   type NilesIncidentLiveAdapter,
   type NilesIncidentRecord,
@@ -19,6 +21,7 @@ import {
   type SecretConfigurationStatus,
   type SecretProvider,
 } from '@nvs/core';
+import { NilesIncidentApiAdapter, type FetchImplementation } from '@nvs/adapter-niles';
 import type {
   ActorProfileV1,
   EnvironmentActorMapV1,
@@ -261,7 +264,7 @@ class StatefulIncidentAdapter implements NilesIncidentLiveAdapter {
     };
   }
 
-  async createIncident() {
+  async createIncident(): Promise<NilesIncidentRecord> {
     this.operations.push('POST create incident');
     return {
       ...this.incident,
@@ -449,6 +452,7 @@ function buildCore(
   backgroundCoordinator?: (operation: () => Promise<void>) => void,
   bundleHooks: BundlePersistenceHooks = {},
   currentFixture: NilesIncidentFixtureV1 = fixture,
+  stateRepository?: LiveRunStateRepository,
 ) {
   const scenarios: ScenarioRepository = new FilesystemScenarioRepository(
     path.join(repositoryRoot, 'scenarios'),
@@ -479,7 +483,7 @@ function buildCore(
     {
       fixtures: new StaticFixtureRepository(currentFixture),
       incidentAdapter: adapter,
-      state: new FilesystemLiveRunStateRepository(temporaryRoot, stateHooks),
+      state: stateRepository ?? new FilesystemLiveRunStateRepository(temporaryRoot, stateHooks),
       mutationsEnabled: () => true,
       clock: () => '2026-07-15T12:00:00.000Z',
       correlationIdFactory: (seed) => `live_${seed.replace(/[^a-z0-9]+/gi, '_').toLowerCase()}`,
@@ -863,6 +867,61 @@ describe('live Incident API orchestration', () => {
     expect(adapter.operations).toEqual([]);
   });
 
+  it('releases live run reservations when initial live-state persistence fails before mutation', async () => {
+    class FailingReserveStateRepository implements LiveRunStateRepository {
+      async reserve(): Promise<void> {
+        throw new Error('injected live-state reserve failure');
+      }
+
+      async save(): Promise<void> {
+        throw new Error('save should not be reached');
+      }
+
+      async get(): Promise<LiveRunState | undefined> {
+        return undefined;
+      }
+
+      async listActive(): Promise<LiveRunState[]> {
+        return [];
+      }
+
+      async complete(): Promise<void> {}
+    }
+
+    const adapter = new StatefulIncidentAdapter();
+    const core = buildCore(
+      adapter,
+      liveEnvironment,
+      {},
+      undefined,
+      {},
+      fixture,
+      new FailingReserveStateRepository(),
+    );
+
+    await expect(
+      core.startLiveApiRun({
+        runId: 'live-state-reserve-rollback',
+        environmentId: 'live-test',
+        scenarioId: 'payment-api-service-degradation',
+        variationValues: { journey: 'normal' },
+        confirmRealMutation: true,
+        now: '2026-07-15T12:00:00.000Z',
+      }),
+    ).rejects.toThrow('injected live-state reserve failure');
+    expect(adapter.operations).toEqual([]);
+
+    await expect(
+      core.createCompileOnlyRun({
+        runId: 'live-state-reserve-rollback',
+        environmentId: 'live-test',
+        scenarioId: 'payment-api-service-degradation',
+        variationValues: { journey: 'normal' },
+        now: '2026-07-15T12:01:00.000Z',
+      }),
+    ).resolves.toMatchObject({ runId: 'live-state-reserve-rollback', verdict: 'PASS' });
+  });
+
   it('allows only one compile/live run with the same ID to reserve the namespace', async () => {
     const scheduled: Array<() => Promise<void>> = [];
     const adapter = new StatefulIncidentAdapter();
@@ -986,6 +1045,106 @@ describe('live Incident API orchestration', () => {
     await expect(
       new FilesystemRunBundleRepository(temporaryRoot).get('live-crash-after-create'),
     ).resolves.toBeUndefined();
+  });
+
+  it('keeps ambiguous incident create outcomes recovery-required without claiming no incident exists', async () => {
+    class AmbiguousCreateError extends Error {
+      readonly code = 'NILES_NETWORK_FAILURE';
+      readonly category = 'ADAPTER';
+      readonly retryable = true;
+      readonly transport = {
+        method: 'POST' as const,
+        pathTemplate: '/grc/itsm/incidents',
+        durationMs: 13,
+        correlationId: 'create_response_lost',
+      };
+    }
+
+    class AmbiguousCreateAdapter extends StatefulIncidentAdapter {
+      serverSideCreateSideEffect = false;
+
+      override async createIncident(): Promise<NilesIncidentRecord> {
+        this.operations.push('POST create incident');
+        this.serverSideCreateSideEffect = true;
+        throw new AmbiguousCreateError('client response lost after create side effect');
+      }
+    }
+
+    const adapter = new AmbiguousCreateAdapter();
+    const core = buildCore(adapter);
+
+    await expect(
+      core.createLiveApiRun({
+        runId: 'live-ambiguous-create',
+        environmentId: 'live-test',
+        scenarioId: 'payment-api-service-degradation',
+        variationValues: { journey: 'normal' },
+        confirmRealMutation: true,
+        now: '2026-07-15T12:00:00.000Z',
+      }),
+    ).rejects.toMatchObject({ code: 'NILES_CREATE_OUTCOME_UNKNOWN' });
+
+    expect(adapter.serverSideCreateSideEffect).toBe(true);
+    expect(adapter.deleted).toBe(false);
+    expect(adapter.operations).toEqual(
+      expect.arrayContaining([
+        'GET resource 55555555-5555-4555-8555-555555555555',
+        'GET resource 66666666-6666-4666-8666-666666666666',
+        'POST create incident',
+      ]),
+    );
+    await expect(
+      new FilesystemRunBundleRepository(temporaryRoot).get('live-ambiguous-create'),
+    ).resolves.toBeUndefined();
+
+    const progress = await core.getRunProgress('live-ambiguous-create');
+    expect(progress).toMatchObject({
+      status: 'RECOVERY_REQUIRED',
+      verdict: 'BLOCKED',
+      checkpoint: {
+        status: 'RECOVERY_REQUIRED',
+        error: { code: 'NILES_CREATE_OUTCOME_UNKNOWN' },
+      },
+    });
+    expect(progress.observations.at(-1)).toMatchObject({
+      sourceStepId: 'report-degradation',
+      status: 'BLOCKED',
+      error: { code: 'NILES_CREATE_OUTCOME_UNKNOWN' },
+      evidence: {
+        method: 'POST',
+        pathTemplate: '/grc/itsm/incidents',
+        creationOutcome: 'UNKNOWN',
+        marker: 'nvs-m1-02b-live-ambiguous-create',
+        createCorrelationId: 'live_live_ambiguous_create_1_incident_report',
+      },
+    });
+
+    await expect(core.getResourceInventory('live-ambiguous-create')).resolves.toMatchObject({
+      creationOutcome: {
+        kind: 'INCIDENT_CREATE',
+        status: 'UNKNOWN',
+        runId: 'live-ambiguous-create',
+        runNamespacePrefix: 'nvs-m1-02b',
+        marker: 'nvs-m1-02b-live-ambiguous-create',
+        tenantId,
+        correlationId: 'live_live_ambiguous_create_1_incident_report',
+        transport: {
+          method: 'POST',
+          pathTemplate: '/grc/itsm/incidents',
+          correlationId: 'create_response_lost',
+        },
+      },
+    });
+    await expect(
+      core.executionReadiness({
+        environmentId: 'live-test',
+        scenarioId: 'payment-api-service-degradation',
+        variationValues: { journey: 'normal' },
+      }),
+    ).resolves.toMatchObject({
+      verdict: 'BLOCKED',
+      error: { code: 'LIVE_RUN_REQUIRES_RECOVERY' },
+    });
   });
 
   it('keeps observations discoverable after an intermediate-step persistence failure', async () => {
@@ -1114,6 +1273,112 @@ describe('live Incident API orchestration', () => {
     ).toHaveLength(2);
   });
 
+  it('passes required SLA objectives from a real GRC wrapped array envelope', async () => {
+    class WrappedSlaArrayAdapter extends StatefulIncidentAdapter {
+      private resumed = false;
+
+      override async resumeIncident() {
+        this.resumed = true;
+        return super.resumeIncident();
+      }
+
+      override async readSlaSummary(): Promise<NilesSlaSummary> {
+        this.operations.push('GET SLA summary');
+        const status =
+          this.incident.status === 'on_hold'
+            ? 'PAUSED'
+            : this.incident.status === 'resolved' || this.incident.status === 'closed'
+              ? 'COMPLETED'
+              : 'IN_PROGRESS';
+        const payload = {
+          success: true,
+          data: [
+            {
+              id: 'sla-response',
+              objectiveType: 'response',
+              status,
+              policyRef: fixture.resources.sla.policyRef,
+            },
+            {
+              id: 'sla-resolution',
+              objectiveType: 'resolution',
+              status,
+              policyRef: fixture.resources.sla.policyRef,
+              ...(status === 'PAUSED' ? { pauseAt: '2026-07-15T12:00:00.000Z' } : {}),
+              ...(status === 'IN_PROGRESS' && this.resumed
+                ? { pauseAt: null, pausedDurationSeconds: 5 }
+                : {}),
+              ...(status === 'COMPLETED' ? { stopAt: '2026-07-15T12:00:00.000Z' } : {}),
+            },
+          ],
+        };
+        const parser = new NilesIncidentApiAdapter(
+          vi
+            .fn<FetchImplementation>()
+            .mockResolvedValue(new Response(JSON.stringify(payload), { status: 200 })),
+          100,
+        );
+        return parser.readSlaSummary({
+          environment: liveEnvironment,
+          session: new FakeSession(
+            'live-service-desk-agent',
+            userIds.serviceDesk,
+            tenantId,
+            'wrapped-sla',
+          ),
+          tenantId,
+          incidentId: this.incident.id,
+          correlationId: 'read_wrapped_sla',
+        });
+      }
+    }
+    const closableFixture: NilesIncidentFixtureV1 = {
+      ...fixture,
+      resources: {
+        ...fixture.resources,
+        closeAuthority: {
+          strategy: 'REQUESTER_CONFIRMATION',
+          requesterMustHaveIncidentWrite: true,
+        },
+      },
+    };
+    const adapter = new WrappedSlaArrayAdapter();
+    const core = buildCore(adapter, liveEnvironment, {}, undefined, {}, closableFixture);
+
+    const run = await core.createLiveApiRun({
+      runId: 'live-wrapped-sla-array',
+      environmentId: 'live-test',
+      scenarioId: 'payment-api-service-degradation',
+      variationValues: { journey: 'normal' },
+      confirmRealMutation: true,
+      now: '2026-07-15T12:00:00.000Z',
+    });
+
+    expect(run.verdict).toBe('PASS');
+    expect(run.error?.code).not.toBe('SLA_SUMMARY_MISSING');
+    const progress = await core.getRunProgress(run.runId);
+    const slaObservations = progress.observations.filter((observation) =>
+      [
+        'observe-active-sla',
+        'observe-held-sla',
+        'resume-restoration',
+        'resolve-with-evidence',
+      ].includes(observation.sourceStepId),
+    );
+    expect(slaObservations).not.toHaveLength(0);
+    expect(slaObservations).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          status: 'PASS',
+          evidence: expect.objectContaining({
+            responseObjectiveObserved: true,
+            resolutionObjectiveObserved: true,
+          }),
+        }),
+      ]),
+    );
+  });
+
   it('blocks required SLA when only the response objective is observable', async () => {
     class ResponseOnlySlaAdapter extends StatefulIncidentAdapter {
       override async readSlaSummary() {
@@ -1147,6 +1412,16 @@ describe('live Incident API orchestration', () => {
     expect(run.resourceInventory.incident?.disposition).toBe('DELETED');
     expect(adapter.deleted).toBe(true);
     expect(adapter.closeCalled).toBe(false);
+    const progress = await core.getRunProgress(run.runId);
+    const observation = progress.observations.find(
+      (candidate) => candidate.error?.code === 'SLA_SUMMARY_MISSING',
+    );
+    expect(observation?.evidence).toMatchObject({
+      method: 'GET',
+      pathTemplate: '/grc/itsm/sla/records/INCIDENT/:incidentId',
+      responseObjectiveObserved: true,
+      resolutionObjectiveObserved: false,
+    });
   });
 
   it('records sanitized transport evidence for a failed multi-call step', async () => {
@@ -1205,6 +1480,118 @@ describe('live Incident API orchestration', () => {
     expect(JSON.stringify(observation?.evidence)).not.toMatch(/authorization|dummy|token/i);
   });
 
+  it('preserves HTTP evidence when priority assertion fails after a successful read', async () => {
+    class PriorityMismatchAdapter extends StatefulIncidentAdapter {
+      override async readIncident() {
+        const incident = await super.readIncident();
+        return { ...incident, priority: 'p2' as const };
+      }
+    }
+    const core = buildCore(new PriorityMismatchAdapter());
+
+    const run = await core.createLiveApiRun({
+      runId: 'live-priority-evidence',
+      environmentId: 'live-test',
+      scenarioId: 'payment-api-service-degradation',
+      variationValues: { journey: 'normal' },
+      confirmRealMutation: true,
+      now: '2026-07-15T12:00:00.000Z',
+    });
+
+    expect(run.verdict).toBe('FAIL');
+    expect(run.error?.code).toBe('INCIDENT_PRIORITY_MISMATCH');
+    const progress = await core.getRunProgress(run.runId);
+    expect(
+      progress.observations.find(
+        (observation) => observation.error?.code === 'INCIDENT_PRIORITY_MISMATCH',
+      )?.evidence,
+    ).toMatchObject({
+      method: 'GET',
+      pathTemplate: '/grc/itsm/incidents/:incidentId',
+      observedPriority: 'p2',
+      expectedPriority: 'p1',
+    });
+  });
+
+  it('preserves HTTP evidence when assignment assertion fails after a successful write', async () => {
+    const unexpectedGroupId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    class AssignmentMismatchAdapter extends StatefulIncidentAdapter {
+      override async assignIncident() {
+        this.incident = { ...this.incident, assignmentGroupId: unexpectedGroupId };
+        return this.readIncident();
+      }
+    }
+    const core = buildCore(new AssignmentMismatchAdapter());
+
+    const run = await core.createLiveApiRun({
+      runId: 'live-assignment-evidence',
+      environmentId: 'live-test',
+      scenarioId: 'payment-api-service-degradation',
+      variationValues: { journey: 'normal' },
+      confirmRealMutation: true,
+      now: '2026-07-15T12:00:00.000Z',
+    });
+
+    expect(run.verdict).toBe('FAIL');
+    expect(run.error?.code).toBe('INCIDENT_ASSIGNMENT_GROUP_MISMATCH');
+    const progress = await core.getRunProgress(run.runId);
+    expect(
+      progress.observations.find(
+        (observation) => observation.error?.code === 'INCIDENT_ASSIGNMENT_GROUP_MISMATCH',
+      )?.evidence,
+    ).toMatchObject({
+      method: 'GET',
+      pathTemplate: '/grc/itsm/incidents/:incidentId',
+      assignmentGroupId: unexpectedGroupId,
+      expectedAssignmentGroupId: fixture.resources.assignmentGroup.id,
+    });
+  });
+
+  it('preserves POST and GET evidence when affected-CI read-back assertion fails', async () => {
+    class AffectedCiReadbackMismatchAdapter extends StatefulIncidentAdapter {
+      override async listAffectedCis(): Promise<NilesAffectedCiSummary> {
+        this.operations.push('GET affected CIs');
+        return {
+          items: [],
+          transport: {
+            method: 'GET' as const,
+            pathTemplate: '/grc/itsm/incidents/:incidentId/affected-cis',
+            httpStatus: 200,
+            durationMs: 1,
+            correlationId: 'list_affected_cis_empty',
+          },
+        };
+      }
+    }
+    const core = buildCore(new AffectedCiReadbackMismatchAdapter());
+
+    const run = await core.createLiveApiRun({
+      runId: 'live-affected-ci-evidence',
+      environmentId: 'live-test',
+      scenarioId: 'payment-api-service-degradation',
+      variationValues: { journey: 'normal' },
+      confirmRealMutation: true,
+      now: '2026-07-15T12:00:00.000Z',
+    });
+
+    expect(run.verdict).toBe('FAIL');
+    expect(run.error?.code).toBe('AFFECTED_CI_LINK_NOT_OBSERVED');
+    const progress = await core.getRunProgress(run.runId);
+    expect(
+      progress.observations.find(
+        (observation) => observation.error?.code === 'AFFECTED_CI_LINK_NOT_OBSERVED',
+      )?.evidence,
+    ).toMatchObject({
+      method: 'GET',
+      pathTemplate: '/grc/itsm/incidents/:incidentId/affected-cis',
+      affectedCiCount: 0,
+      operations: [
+        expect.objectContaining({ method: 'POST' }),
+        expect.objectContaining({ method: 'GET' }),
+      ],
+    });
+  });
+
   it('blocks required SLA when resume read returns no records', async () => {
     class EmptyResumeSlaAdapter extends StatefulIncidentAdapter {
       private resumed = false;
@@ -1246,6 +1633,155 @@ describe('live Incident API orchestration', () => {
     expect(run.error?.code).toBe('SLA_SUMMARY_MISSING');
     expect(run.cleanup).toMatchObject({ status: 'CLEAN', policy: 'DELETE_IF_RUN_OWNED' });
     expect(adapter.deleted).toBe(true);
+  });
+
+  it('accepts resumed SLA records with historical paused duration after current pause clears', async () => {
+    class HistoricalPauseAfterResumeAdapter extends StatefulIncidentAdapter {
+      private resumed = false;
+
+      override async resumeIncident() {
+        this.resumed = true;
+        return super.resumeIncident();
+      }
+
+      override async readSlaSummary(): Promise<NilesSlaSummary> {
+        if (this.resumed && this.incident.status === 'in_progress') {
+          const policyEvidence = fixture.resources.sla.policyRef
+            ? { policyRef: fixture.resources.sla.policyRef }
+            : {};
+          return {
+            transport: {
+              method: 'GET' as const,
+              pathTemplate: '/grc/itsm/sla/records/INCIDENT/:incidentId',
+              httpStatus: 200,
+              durationMs: 1,
+              correlationId: 'read_sla_resumed_history',
+            },
+            records: [
+              {
+                id: 'sla-1',
+                objectiveType: 'response',
+                status: 'IN_PROGRESS',
+                ...policyEvidence,
+              },
+              {
+                id: 'sla-2',
+                objectiveType: 'resolution',
+                status: 'IN_PROGRESS',
+                pausedDurationSeconds: 5,
+                ...policyEvidence,
+              },
+            ],
+          };
+        }
+        return super.readSlaSummary();
+      }
+    }
+    const closableFixture: NilesIncidentFixtureV1 = {
+      ...fixture,
+      resources: {
+        ...fixture.resources,
+        closeAuthority: {
+          strategy: 'REQUESTER_CONFIRMATION',
+          requesterMustHaveIncidentWrite: true,
+        },
+      },
+    };
+    const adapter = new HistoricalPauseAfterResumeAdapter();
+    const core = buildCore(adapter, liveEnvironment, {}, undefined, {}, closableFixture);
+
+    const run = await core.createLiveApiRun({
+      runId: 'live-resumed-sla-history',
+      environmentId: 'live-test',
+      scenarioId: 'payment-api-service-degradation',
+      variationValues: { journey: 'normal' },
+      confirmRealMutation: true,
+      now: '2026-07-15T12:00:00.000Z',
+    });
+
+    expect(run.verdict).toBe('PASS');
+    expect(run.error?.code).not.toBe('SLA_NOT_RESUMED');
+    const progress = await core.getRunProgress(run.runId);
+    expect(
+      progress.observations.find(
+        (observation) => observation.sourceStepId === 'resume-restoration',
+      ),
+    ).toMatchObject({
+      status: 'PASS',
+      evidence: {
+        slaPauseHistoryObserved: true,
+        responseObjectiveObserved: true,
+        resolutionObjectiveObserved: true,
+      },
+    });
+  });
+
+  it('fails resumed SLA records when current pause posture remains set', async () => {
+    class StillPausedAfterResumeAdapter extends StatefulIncidentAdapter {
+      private resumed = false;
+
+      override async resumeIncident() {
+        this.resumed = true;
+        return super.resumeIncident();
+      }
+
+      override async readSlaSummary(): Promise<NilesSlaSummary> {
+        if (this.resumed && this.incident.status === 'in_progress') {
+          const policyEvidence = fixture.resources.sla.policyRef
+            ? { policyRef: fixture.resources.sla.policyRef }
+            : {};
+          return {
+            transport: {
+              method: 'GET' as const,
+              pathTemplate: '/grc/itsm/sla/records/INCIDENT/:incidentId',
+              httpStatus: 200,
+              durationMs: 1,
+              correlationId: 'read_sla_still_paused',
+            },
+            records: [
+              {
+                id: 'sla-1',
+                objectiveType: 'response',
+                status: 'PAUSED',
+                ...policyEvidence,
+              },
+              {
+                id: 'sla-2',
+                objectiveType: 'resolution',
+                status: 'IN_PROGRESS',
+                pauseAt: '2026-07-15T12:00:00.000Z',
+                pausedDurationSeconds: 5,
+                ...policyEvidence,
+              },
+            ],
+          };
+        }
+        return super.readSlaSummary();
+      }
+    }
+    const adapter = new StillPausedAfterResumeAdapter();
+    const core = buildCore(adapter);
+
+    const run = await core.createLiveApiRun({
+      runId: 'live-sla-still-paused-after-resume',
+      environmentId: 'live-test',
+      scenarioId: 'payment-api-service-degradation',
+      variationValues: { journey: 'normal' },
+      confirmRealMutation: true,
+      now: '2026-07-15T12:00:00.000Z',
+    });
+
+    expect(run.verdict).toBe('FAIL');
+    expect(run.error?.code).toBe('SLA_NOT_RESUMED');
+    const progress = await core.getRunProgress(run.runId);
+    expect(
+      progress.observations.find((observation) => observation.error?.code === 'SLA_NOT_RESUMED')
+        ?.evidence,
+    ).toMatchObject({
+      method: 'GET',
+      pathTemplate: '/grc/itsm/sla/records/INCIDENT/:incidentId',
+      slaPauseHistoryObserved: true,
+    });
   });
 
   it('fails required SLA when active records are cancelled instead of running', async () => {
@@ -1298,6 +1834,17 @@ describe('live Incident API orchestration', () => {
       policy: 'RETAIN_FOR_DIAGNOSIS',
     });
     expect(adapter.deleted).toBe(false);
+    const progress = await core.getRunProgress(run.runId);
+    expect(
+      progress.observations.find(
+        (observation) => observation.error?.code === 'SLA_ACTIVE_POSTURE_NOT_OBSERVED',
+      )?.evidence,
+    ).toMatchObject({
+      method: 'GET',
+      pathTemplate: '/grc/itsm/sla/records/INCIDENT/:incidentId',
+      responseObjectiveObserved: true,
+      resolutionObjectiveObserved: true,
+    });
   });
 
   it('fails required SLA when observed records reference the wrong policy', async () => {
@@ -1327,6 +1874,16 @@ describe('live Incident API orchestration', () => {
     expect(run.cleanup).toMatchObject({
       status: 'RETAINED_BY_POLICY',
       policy: 'RETAIN_FOR_DIAGNOSIS',
+    });
+    const progress = await core.getRunProgress(run.runId);
+    expect(
+      progress.observations.find((observation) => observation.error?.code === 'SLA_POLICY_MISMATCH')
+        ?.evidence,
+    ).toMatchObject({
+      method: 'GET',
+      pathTemplate: '/grc/itsm/sla/records/INCIDENT/:incidentId',
+      responseObjectiveObserved: true,
+      resolutionObjectiveObserved: true,
     });
   });
 
@@ -1363,6 +1920,16 @@ describe('live Incident API orchestration', () => {
     expect(run.verdict).toBe('FAIL');
     expect(run.error?.code).toBe('SLA_PAUSE_NOT_OBSERVED');
     expect(adapter.closeCalled).toBe(false);
+    const progress = await core.getRunProgress(run.runId);
+    expect(
+      progress.observations.find(
+        (observation) => observation.error?.code === 'SLA_PAUSE_NOT_OBSERVED',
+      )?.evidence,
+    ).toMatchObject({
+      method: 'GET',
+      pathTemplate: '/grc/itsm/sla/records/INCIDENT/:incidentId',
+      slaPhase: 'held',
+    });
   });
 
   it('blocks audit review when journal entries are not observable', async () => {
@@ -1437,6 +2004,67 @@ describe('live Incident API orchestration', () => {
     expect(run.error?.code).toBe('AUDIT_ACTION_ATTRIBUTION_UNAVAILABLE');
     expect(run.cleanup).toMatchObject({ status: 'CLEAN', policy: 'DELETE_IF_RUN_OWNED' });
     expect(adapter.deleted).toBe(true);
+    const progress = await core.getRunProgress(run.runId);
+    expect(
+      progress.observations.find(
+        (observation) => observation.error?.code === 'AUDIT_ACTION_ATTRIBUTION_UNAVAILABLE',
+      )?.evidence,
+    ).toMatchObject({
+      method: 'GET',
+      pathTemplate: '/grc/itsm/incidents/:incidentId/journal',
+      journalCount: 3,
+      operations: [
+        expect.objectContaining({ method: 'GET', pathTemplate: '/grc/itsm/incidents/:incidentId' }),
+        expect.objectContaining({
+          method: 'GET',
+          pathTemplate: '/grc/itsm/incidents/:incidentId/journal',
+        }),
+      ],
+    });
+  });
+
+  it('preserves HTTP evidence when close state assertion fails after a successful close call', async () => {
+    class CloseStateMismatchAdapter extends StatefulIncidentAdapter {
+      override async closeIncident() {
+        this.closeCalled = true;
+        this.incident = { ...this.incident, status: 'resolved' };
+        return this.readIncident();
+      }
+    }
+    const closableFixture: NilesIncidentFixtureV1 = {
+      ...fixture,
+      resources: {
+        ...fixture.resources,
+        closeAuthority: {
+          strategy: 'REQUESTER_CONFIRMATION',
+          requesterMustHaveIncidentWrite: true,
+        },
+      },
+    };
+    const adapter = new CloseStateMismatchAdapter();
+    const core = buildCore(adapter, liveEnvironment, {}, undefined, {}, closableFixture);
+
+    const run = await core.createLiveApiRun({
+      runId: 'live-close-state-evidence',
+      environmentId: 'live-test',
+      scenarioId: 'payment-api-service-degradation',
+      variationValues: { journey: 'normal' },
+      confirmRealMutation: true,
+      now: '2026-07-15T12:00:00.000Z',
+    });
+
+    expect(run.verdict).toBe('FAIL');
+    expect(run.error?.code).toBe('INCIDENT_NOT_CLOSED');
+    expect(adapter.closeCalled).toBe(true);
+    const progress = await core.getRunProgress(run.runId);
+    expect(
+      progress.observations.find((observation) => observation.error?.code === 'INCIDENT_NOT_CLOSED')
+        ?.evidence,
+    ).toMatchObject({
+      method: 'GET',
+      pathTemplate: '/grc/itsm/incidents/:incidentId',
+      status: 'resolved',
+    });
   });
 
   it('persists BLOCKED close-authority evidence and verified run-owned cleanup', async () => {

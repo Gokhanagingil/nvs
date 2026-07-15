@@ -258,6 +258,22 @@ export interface ResourceInventory {
     status?: string;
     disposition: string;
   };
+  creationOutcome?: {
+    kind: 'INCIDENT_CREATE';
+    status: 'UNKNOWN';
+    runId: string;
+    runNamespacePrefix: string;
+    marker: string;
+    tenantId: string;
+    correlationId: string;
+    transport?: {
+      method: 'GET' | 'POST' | 'DELETE';
+      pathTemplate: string;
+      httpStatus?: number;
+      durationMs: number;
+      correlationId: string;
+    };
+  };
   resources: Array<{
     kind: string;
     id: string;
@@ -347,6 +363,7 @@ export interface RunProgress {
     status: 'PREPARED' | 'CREATED' | 'RUNNING' | 'FINALIZING' | 'COMPLETED' | 'RECOVERY_REQUIRED';
     completedStepIds: string[];
     incidentId?: string;
+    error?: TypedError;
   };
 }
 

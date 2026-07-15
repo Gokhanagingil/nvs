@@ -77,9 +77,13 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
     : undefined;
 }
 
-function unwrapPayload(value: unknown): Record<string, unknown> | undefined {
+function unwrapPayload(value: unknown): unknown {
   const root = asRecord(value);
-  return asRecord(root?.['data']) ?? root;
+  return root && 'data' in root ? root['data'] : value;
+}
+
+function payloadObject(value: unknown): Record<string, unknown> | undefined {
+  return asRecord(unwrapPayload(value));
 }
 
 async function readJson(response: Response): Promise<unknown> {
@@ -111,7 +115,7 @@ async function optionalReadiness(
       );
       return {
         response,
-        payload: response.ok ? unwrapPayload(await readJson(response)) : undefined,
+        payload: response.ok ? payloadObject(await readJson(response)) : undefined,
       };
     });
     if (!response.ok) {
@@ -235,7 +239,7 @@ async function optionalVersion(
       );
       return {
         response,
-        payload: response.ok ? unwrapPayload(await readJson(response)) : undefined,
+        payload: response.ok ? payloadObject(await readJson(response)) : undefined,
       };
     });
     if (!response.ok) {
@@ -655,7 +659,7 @@ function normalizeIncident(
   value: unknown,
   transport?: NilesTransportEvidence,
 ): NilesIncidentRecord {
-  const payload = unwrapPayload(value);
+  const payload = payloadObject(value);
   const id = safeString(payload?.['id']);
   if (!id || !UUID_PATTERN.test(id)) {
     throw new NilesLiveAdapterOperationError(
@@ -691,7 +695,7 @@ function normalizeResource(
   operation: string,
   transport?: NilesTransportEvidence,
 ): NilesFixtureResource {
-  const payload = unwrapPayload(value);
+  const payload = payloadObject(value);
   const id = safeString(payload?.['id']);
   if (!id || id !== expectedId) {
     throw new NilesLiveAdapterOperationError(
@@ -711,7 +715,7 @@ function asArrayPayload(value: unknown): unknown[] {
   if (Array.isArray(payload)) {
     return payload;
   }
-  const items = payload?.['items'];
+  const items = asRecord(payload)?.['items'];
   if (Array.isArray(items)) {
     return items;
   }
@@ -1075,7 +1079,7 @@ export class NilesIncidentApiAdapter implements NilesIncidentLiveAdapter {
             ]
           : [];
       });
-      const value = unwrapPayload(response.payload);
+      const value = payloadObject(response.payload);
       return {
         count: entries.length || (typeof value?.['count'] === 'number' ? value['count'] : 0),
         entries,

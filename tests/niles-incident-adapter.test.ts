@@ -95,6 +95,126 @@ describe('NILES incident live API adapter', () => {
     });
   });
 
+  it('parses wrapped Incident object envelopes', async () => {
+    const fetchMock = vi.fn<FetchImplementation>().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          success: true,
+          data: {
+            id: incidentId,
+            number: 'INC-NVS-1',
+            status: 'in_progress',
+            priority: 'p1',
+            requesterId,
+          },
+        }),
+        { status: 200 },
+      ),
+    );
+    const adapter = new NilesIncidentApiAdapter(fetchMock, 100);
+
+    await expect(
+      adapter.readIncident({
+        environment,
+        session,
+        tenantId,
+        incidentId,
+        correlationId: 'read-wrapped-incident',
+      }),
+    ).resolves.toMatchObject({
+      id: incidentId,
+      number: 'INC-NVS-1',
+      status: 'in_progress',
+      priority: 'p1',
+      requesterId,
+    });
+  });
+
+  it.each([
+    ['direct', [{ id: 'sla-1', objectiveType: 'response', status: 'IN_PROGRESS' }]],
+    [
+      'wrapped data array',
+      {
+        success: true,
+        data: [
+          { id: 'sla-1', objectiveType: 'response', status: 'IN_PROGRESS' },
+          { id: 'sla-2', objectiveType: 'resolution', status: 'IN_PROGRESS' },
+        ],
+      },
+    ],
+    [
+      'items object',
+      {
+        items: [
+          { id: 'sla-1', objectiveType: 'response', status: 'IN_PROGRESS' },
+          { id: 'sla-2', objectiveType: 'resolution', status: 'IN_PROGRESS' },
+        ],
+      },
+    ],
+    [
+      'wrapped data items object',
+      {
+        success: true,
+        data: {
+          items: [
+            { id: 'sla-1', objectiveType: 'response', status: 'IN_PROGRESS' },
+            { id: 'sla-2', objectiveType: 'resolution', status: 'IN_PROGRESS' },
+          ],
+        },
+      },
+    ],
+  ])('parses %s SLA array response envelopes', async (_name, payload) => {
+    const fetchMock = vi
+      .fn<FetchImplementation>()
+      .mockResolvedValue(new Response(JSON.stringify(payload), { status: 200 }));
+    const adapter = new NilesIncidentApiAdapter(fetchMock, 100);
+
+    const summary = await adapter.readSlaSummary({
+      environment,
+      session,
+      tenantId,
+      incidentId,
+      correlationId: 'read-sla-array',
+    });
+
+    expect(summary.records.map((record) => record.objectiveType)).toContain('response');
+    expect(summary.records[0]).toMatchObject({
+      id: 'sla-1',
+      objectiveType: 'response',
+      status: 'IN_PROGRESS',
+    });
+  });
+
+  it('parses affected-CI paginated object envelopes', async () => {
+    const ciId = '88888888-8888-4888-8888-888888888888';
+    const fetchMock = vi.fn<FetchImplementation>().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          success: true,
+          data: {
+            items: [{ id: 'rel-1', configurationItemId: ciId }],
+            total: 1,
+            page: 1,
+            pageSize: 20,
+            totalPages: 1,
+          },
+        }),
+        { status: 200 },
+      ),
+    );
+    const adapter = new NilesIncidentApiAdapter(fetchMock, 100);
+
+    await expect(
+      adapter.listAffectedCis({
+        environment,
+        session,
+        tenantId,
+        incidentId,
+        correlationId: 'list-affected-cis',
+      }),
+    ).resolves.toMatchObject({ items: [{ ciId }] });
+  });
+
   it.each([
     [400, 'NILES_PRODUCT_RULE_REJECTED', 'PRODUCT', false],
     [401, 'NILES_AUTHORIZATION_DENIED', 'ENVIRONMENT', false],
@@ -207,23 +327,26 @@ describe('NILES incident live API adapter', () => {
     }
   });
 
-  it('parses the real GRC journal response shape without inventing action fields', async () => {
+  it('parses the real GRC journal paginated response shape without inventing action fields', async () => {
     const fetchMock = vi.fn<FetchImplementation>().mockResolvedValue(
       new Response(
         JSON.stringify({
-          items: [
-            {
-              id: 'journal-1',
-              type: 'action',
-              message: 'Incident resumed. Work returned to In Progress.',
-              createdBy: requesterId,
-              createdAt: '2026-07-15T12:00:00.000Z',
-            },
-          ],
-          total: 1,
-          page: 1,
-          pageSize: 20,
-          totalPages: 1,
+          success: true,
+          data: {
+            items: [
+              {
+                id: 'journal-1',
+                type: 'action',
+                message: 'Incident resumed. Work returned to In Progress.',
+                createdBy: requesterId,
+                createdAt: '2026-07-15T12:00:00.000Z',
+              },
+            ],
+            total: 1,
+            page: 1,
+            pageSize: 20,
+            totalPages: 1,
+          },
         }),
         { status: 200 },
       ),

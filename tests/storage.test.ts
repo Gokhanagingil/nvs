@@ -122,6 +122,64 @@ describe('filesystem repositories', () => {
     expect(attempts.filter((attempt) => attempt.status === 'rejected')).toHaveLength(1);
   });
 
+  it('releases only reservations owned by the same repository instance', async () => {
+    const owner = new FilesystemRunBundleRepository(temporaryRoot);
+    const other = new FilesystemRunBundleRepository(temporaryRoot);
+
+    await owner.reserveRunId('owner-release-run');
+    await other.releaseRunId('owner-release-run');
+    await expect(other.reserveRunId('owner-release-run')).rejects.toBeInstanceOf(
+      RunIdAlreadyExistsError,
+    );
+
+    await owner.releaseRunId('owner-release-run');
+    await expect(other.reserveRunId('owner-release-run')).resolves.toBeUndefined();
+  });
+
+  it('keeps a crashed partial reservation recovery-blocking for new repository instances', async () => {
+    await mkdir(path.join(temporaryRoot, 'runs', 'crashed-reservation-run'), { recursive: true });
+    await writeFile(
+      path.join(temporaryRoot, 'runs', 'crashed-reservation-run', '.reserved'),
+      '{"schemaVersion":"nvs.run-namespace-reservation/v1"}\n',
+      'utf8',
+    );
+
+    const restarted = new FilesystemRunBundleRepository(temporaryRoot);
+
+    await expect(restarted.reserveRunId('crashed-reservation-run')).rejects.toBeInstanceOf(
+      RunIdAlreadyExistsError,
+    );
+    await restarted.releaseRunId('crashed-reservation-run');
+    await expect(restarted.reserveRunId('crashed-reservation-run')).rejects.toBeInstanceOf(
+      RunIdAlreadyExistsError,
+    );
+  });
+
+  it('releases compile-only reservations after invalid variation compilation fails', async () => {
+    const bundles = new FilesystemRunBundleRepository(temporaryRoot);
+    const core = buildCore(bundles);
+
+    await expect(
+      core.createCompileOnlyRun({
+        runId: 'invalid-variation-reuse-run',
+        environmentId: 'local-example',
+        scenarioId: 'payment-api-service-degradation',
+        variationValues: { journey: 'not-a-real-journey' },
+        now: '2026-07-14T12:00:00.000Z',
+      }),
+    ).rejects.toThrow(/variation/i);
+
+    await expect(
+      core.createCompileOnlyRun({
+        runId: 'invalid-variation-reuse-run',
+        environmentId: 'local-example',
+        scenarioId: 'payment-api-service-degradation',
+        variationValues: { journey: 'normal' },
+        now: '2026-07-14T12:01:00.000Z',
+      }),
+    ).resolves.toMatchObject({ runId: 'invalid-variation-reuse-run', verdict: 'PASS' });
+  });
+
   it('atomically persists an immutable bundle with exact persisted-byte hashes', async () => {
     const bundles = new FilesystemRunBundleRepository(temporaryRoot);
     const created = await createRun(bundles);

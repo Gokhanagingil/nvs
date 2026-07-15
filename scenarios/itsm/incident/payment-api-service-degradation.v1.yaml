@@ -1,6 +1,6 @@
 schemaVersion: nvs.blueprint/v1
 id: payment-api-service-degradation
-version: 1.0.0
+version: 1.1.0
 title: Payment API service degradation through restoration and closure
 narrative: >-
   A customer-facing payment/API service suffers severe degradation during an active support
@@ -8,7 +8,7 @@ narrative: >-
   operational ownership, relates the affected service and CI context where supported, observes
   the applicable response and resolution SLA, places the incident on hold while waiting for an
   external provider, resumes work, restores service, records resolution evidence, resolves the
-  incident, and closes it under the correct authority.
+  incident, and has the requester confirm closure under the correct authority.
 objective: >-
   Demonstrate the approved Incident, SLA, authorization, tenant-isolation, evidence, and cleanup
   intent as a deterministic semantic plan and, for the allowlisted M1-02B variation, as a guarded
@@ -37,7 +37,7 @@ actors:
     authProfileRef: actor.service-desk
   - id: incident-manager
     name: Incident manager
-    persona: Reviews restoration evidence and closes the resolved incident under approved authority.
+    persona: Reviews restoration evidence and authorization audit before requester closure.
     authProfileRef: actor.incident-manager
   - id: insufficient-role-user
     name: Insufficiently privileged user
@@ -270,8 +270,8 @@ steps:
       - Correlated lifecycle audit and event observations.
   - id: close-resolved-incident
     title: Close the resolved incident under the correct authority
-    narrative: The authorized incident manager closes the incident after reviewing resolution evidence.
-    actor: incident-manager
+    narrative: The requester confirms service restoration and closes the incident after review evidence is available.
+    actor: requester
     action: incident.close
     inputs:
       closureAuthority: ${closure-authority}

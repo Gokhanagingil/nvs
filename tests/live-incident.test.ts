@@ -2,6 +2,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import {
+  AuthenticationBlockedError,
   NvsCore,
   type ActorAuthenticator,
   type ActorProfileRepository,
@@ -11,6 +12,7 @@ import {
   type NilesIncidentLiveAdapter,
   type NilesIncidentRecord,
   type ScenarioRepository,
+  type SecretConfigurationStatus,
   type SecretProvider,
 } from '@nvs/core';
 import type {
@@ -20,8 +22,10 @@ import type {
   NilesIncidentFixtureV1,
 } from '@nvs/contracts';
 import {
+  FilesystemLiveRunStateRepository,
   FilesystemRunBundleRepository,
   FilesystemScenarioRepository,
+  type LiveStatePersistenceHooks,
 } from '@nvs/storage-filesystem';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -166,7 +170,7 @@ class StaticActorRepository implements ActorProfileRepository {
 }
 
 class StaticSecrets implements SecretProvider {
-  async configurationStatus() {
+  async configurationStatus(): Promise<SecretConfigurationStatus> {
     return 'CONFIGURED' as const;
   }
 
@@ -223,6 +227,8 @@ class FakeAuthenticator implements ActorAuthenticator {
 class StatefulIncidentAdapter implements NilesIncidentLiveAdapter {
   closeCalled = false;
   deleted = false;
+  affectedCiIds = new Set<string>();
+  operations: string[] = [];
   incident: NilesIncidentRecord = {
     id: '99999999-9999-4999-8999-999999999999',
     number: 'INC-NVS-1',
@@ -233,14 +239,17 @@ class StatefulIncidentAdapter implements NilesIncidentLiveAdapter {
   };
 
   async verifyResource(input: { id: string }) {
+    this.operations.push(`GET resource ${input.id}`);
     return { id: input.id };
   }
 
   async createIncident() {
+    this.operations.push('POST create incident');
     return this.incident;
   }
 
   async readIncident() {
+    this.operations.push('GET incident');
     return this.incident;
   }
 
@@ -259,10 +268,24 @@ class StatefulIncidentAdapter implements NilesIncidentLiveAdapter {
     return this.incident;
   }
 
-  async addAffectedCi() {}
+  async addAffectedCi(input: { ciId: string }) {
+    this.operations.push('POST affected CI');
+    this.affectedCiIds.add(input.ciId);
+  }
+
+  async listAffectedCis() {
+    this.operations.push('GET affected CIs');
+    return [...this.affectedCiIds].map((ciId) => ({ ciId }));
+  }
 
   async readSlaSummary() {
-    return { records: [{ id: 'sla-1', objectiveType: 'response', status: 'running' }] };
+    this.operations.push('GET SLA summary');
+    return {
+      records: [
+        { id: 'sla-1', objectiveType: 'response', status: 'running' },
+        { id: 'sla-2', objectiveType: 'resolution', status: 'running' },
+      ],
+    };
   }
 
   async readJournalSummary() {
@@ -310,7 +333,12 @@ afterEach(async () => {
   await rm(temporaryRoot, { recursive: true, force: true });
 });
 
-function buildCore(adapter: StatefulIncidentAdapter, environment = liveEnvironment) {
+function buildCore(
+  adapter: StatefulIncidentAdapter,
+  environment = liveEnvironment,
+  stateHooks: LiveStatePersistenceHooks = {},
+  backgroundCoordinator?: (operation: () => Promise<void>) => void,
+) {
   const scenarios: ScenarioRepository = new FilesystemScenarioRepository(
     path.join(repositoryRoot, 'scenarios'),
   );
@@ -340,9 +368,11 @@ function buildCore(adapter: StatefulIncidentAdapter, environment = liveEnvironme
     {
       fixtures: new StaticFixtureRepository(fixture),
       incidentAdapter: adapter,
+      state: new FilesystemLiveRunStateRepository(temporaryRoot, stateHooks),
       mutationsEnabled: () => true,
       clock: () => '2026-07-15T12:00:00.000Z',
       correlationIdFactory: (seed) => `live_${seed.replace(/[^a-z0-9]+/gi, '_').toLowerCase()}`,
+      ...(backgroundCoordinator ? { backgroundCoordinator } : {}),
     },
   );
 }
@@ -384,6 +414,283 @@ describe('live Incident API orchestration', () => {
     expect(fixtureSpy).not.toHaveBeenCalled();
   });
 
+  it('checks live readiness with actor auth and read-only fixture resource calls only', async () => {
+    const adapter = new StatefulIncidentAdapter();
+    const core = buildCore(adapter);
+
+    const readiness = await core.executionReadiness({
+      environmentId: 'live-test',
+      scenarioId: 'payment-api-service-degradation',
+      variationValues: { journey: 'normal' },
+    });
+
+    expect(readiness.verdict).toBe('PASS');
+    expect(readiness.checks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: 'actor-authentication', status: 'PASS' }),
+        expect.objectContaining({ id: 'fixture-resources', status: 'PASS' }),
+      ]),
+    );
+    expect(adapter.operations.some((operation) => operation.startsWith('POST'))).toBe(false);
+  });
+
+  it('does not PASS readiness when a required fixture resource is missing', async () => {
+    class MissingResourceAdapter extends StatefulIncidentAdapter {
+      override async verifyResource(input: { id: string }) {
+        if (input.id === fixture.resources.service.id) {
+          throw new Error('missing service');
+        }
+        return super.verifyResource(input);
+      }
+    }
+    const core = buildCore(new MissingResourceAdapter());
+
+    const readiness = await core.executionReadiness({
+      environmentId: 'live-test',
+      scenarioId: 'payment-api-service-degradation',
+      variationValues: { journey: 'normal' },
+    });
+
+    expect(readiness.verdict).toBe('BLOCKED');
+    expect(readiness.error?.code).toBe('NILES_FIXTURE_RESOURCE_MISSING');
+  });
+
+  it('does not PASS readiness when required actor authentication fails', async () => {
+    class DenyingAuthenticator extends FakeAuthenticator {
+      override async authenticate(input: {
+        profile: ActorProfileV1;
+        correlationId: string;
+      }): Promise<FakeSession> {
+        void input;
+        throw new AuthenticationBlockedError(
+          'LOGIN_DENIED',
+          'NILES denied the actor login.',
+          false,
+        );
+      }
+    }
+    const adapter = new StatefulIncidentAdapter();
+    const scenarios: ScenarioRepository = new FilesystemScenarioRepository(
+      path.join(repositoryRoot, 'scenarios'),
+    );
+    const core = new NvsCore(
+      new StaticEnvironmentRepository([liveEnvironment]),
+      scenarios,
+      new FilesystemRunBundleRepository(temporaryRoot),
+      {
+        probe: async () => ({
+          environmentId: 'live-test',
+          verdict: 'PASS',
+          health: { available: true },
+          readiness: { available: false },
+          openApi: { available: false },
+          version: { available: false, source: 'NONE' },
+        }),
+      },
+      {
+        profiles: new StaticActorRepository(),
+        secrets: new StaticSecrets(),
+        authenticator: new DenyingAuthenticator(),
+      },
+      {
+        fixtures: new StaticFixtureRepository(fixture),
+        incidentAdapter: adapter,
+        state: new FilesystemLiveRunStateRepository(temporaryRoot),
+        mutationsEnabled: () => true,
+      },
+    );
+
+    const readiness = await core.executionReadiness({
+      environmentId: 'live-test',
+      scenarioId: 'payment-api-service-degradation',
+      variationValues: { journey: 'normal' },
+    });
+
+    expect(readiness.verdict).toBe('BLOCKED');
+    expect(readiness.error?.code).toBe('LOGIN_DENIED');
+    expect(adapter.operations.some((operation) => operation.startsWith('POST'))).toBe(false);
+  });
+
+  it('does not PASS readiness when a required actor credential is invalid', async () => {
+    class InvalidSecrets extends StaticSecrets {
+      override async configurationStatus() {
+        return 'INVALID' as const;
+      }
+
+      override async resolve(): Promise<AuthenticationCredential> {
+        throw new Error('resolve should not be called for invalid credential configuration');
+      }
+    }
+    const adapter = new StatefulIncidentAdapter();
+    const scenarios: ScenarioRepository = new FilesystemScenarioRepository(
+      path.join(repositoryRoot, 'scenarios'),
+    );
+    const core = new NvsCore(
+      new StaticEnvironmentRepository([liveEnvironment]),
+      scenarios,
+      new FilesystemRunBundleRepository(temporaryRoot),
+      {
+        probe: async () => ({
+          environmentId: 'live-test',
+          verdict: 'PASS',
+          health: { available: true },
+          readiness: { available: false },
+          openApi: { available: false },
+          version: { available: false, source: 'NONE' },
+        }),
+      },
+      {
+        profiles: new StaticActorRepository(),
+        secrets: new InvalidSecrets(),
+        authenticator: new FakeAuthenticator(),
+      },
+      {
+        fixtures: new StaticFixtureRepository(fixture),
+        incidentAdapter: adapter,
+        state: new FilesystemLiveRunStateRepository(temporaryRoot),
+        mutationsEnabled: () => true,
+      },
+    );
+
+    const readiness = await core.executionReadiness({
+      environmentId: 'live-test',
+      scenarioId: 'payment-api-service-degradation',
+      variationValues: { journey: 'normal' },
+    });
+
+    expect(readiness.verdict).toBe('BLOCKED');
+    expect(readiness.error?.code).toBe('CREDENTIAL_INVALID');
+    expect(adapter.operations.some((operation) => operation.startsWith('POST'))).toBe(false);
+  });
+
+  it('accepts live runs asynchronously, exposes RUNNING progress, and rejects a concurrent run', async () => {
+    const scheduled: Array<() => Promise<void>> = [];
+    const adapter = new StatefulIncidentAdapter();
+    const core = buildCore(adapter, liveEnvironment, {}, (operation) => scheduled.push(operation));
+
+    const accepted = await core.startLiveApiRun({
+      runId: 'live-async-run',
+      environmentId: 'live-test',
+      scenarioId: 'payment-api-service-degradation',
+      variationValues: { journey: 'normal' },
+      confirmRealMutation: true,
+      now: '2026-07-15T12:00:00.000Z',
+    });
+
+    expect(accepted).toEqual({
+      schemaVersion: 'nvs.live-run-accepted/v1',
+      runId: 'live-async-run',
+      status: 'ACCEPTED',
+    });
+    await expect(
+      core.startLiveApiRun({
+        runId: 'live-second-run',
+        environmentId: 'live-test',
+        scenarioId: 'payment-api-service-degradation',
+        variationValues: { journey: 'normal' },
+        confirmRealMutation: true,
+        now: '2026-07-15T12:00:00.000Z',
+      }),
+    ).rejects.toMatchObject({ code: 'LIVE_RUN_IN_PROGRESS' });
+
+    const preparedProgress = await core.getRunProgress('live-async-run');
+    expect(preparedProgress.status).toBe('PREPARED');
+    expect(preparedProgress.observations).toEqual([]);
+
+    await scheduled[0]!();
+    const finalRun = await core.waitForLiveRun('live-async-run');
+    expect(finalRun.status).toBe('COMPLETED');
+    expect((await core.getRunProgress('live-async-run')).status).toBe('COMPLETED');
+  });
+
+  it('keeps run-owned incident inventory discoverable after a create-time persistence failure', async () => {
+    const adapter = new StatefulIncidentAdapter();
+    const hooks: LiveStatePersistenceHooks = {
+      afterWrite(document, state) {
+        if (document === 'inventory.json' && state.resourceInventory.incident) {
+          throw new Error('injected crash after create inventory');
+        }
+      },
+    };
+    const core = buildCore(adapter, liveEnvironment, hooks);
+
+    await expect(
+      core.createLiveApiRun({
+        runId: 'live-crash-after-create',
+        environmentId: 'live-test',
+        scenarioId: 'payment-api-service-degradation',
+        variationValues: { journey: 'normal' },
+        confirmRealMutation: true,
+        now: '2026-07-15T12:00:00.000Z',
+      }),
+    ).rejects.toThrow('injected crash after create inventory');
+
+    const recovered = await new FilesystemLiveRunStateRepository(temporaryRoot).get(
+      'live-crash-after-create',
+    );
+    expect(recovered?.checkpoint.status).toBe('RUNNING');
+    expect(recovered?.resourceInventory.incident).toMatchObject({
+      id: adapter.incident.id,
+      number: adapter.incident.number,
+    });
+    await expect(
+      new FilesystemRunBundleRepository(temporaryRoot).get('live-crash-after-create'),
+    ).resolves.toBeUndefined();
+  });
+
+  it('keeps observations discoverable after an intermediate-step persistence failure', async () => {
+    const adapter = new StatefulIncidentAdapter();
+    const hooks: LiveStatePersistenceHooks = {
+      afterWrite(document, state) {
+        if (document === 'observations.json' && state.observations.length >= 3) {
+          throw new Error('injected crash after intermediate step');
+        }
+      },
+    };
+    const core = buildCore(adapter, liveEnvironment, hooks);
+
+    await expect(
+      core.createLiveApiRun({
+        runId: 'live-crash-mid-step',
+        environmentId: 'live-test',
+        scenarioId: 'payment-api-service-degradation',
+        variationValues: { journey: 'normal' },
+        confirmRealMutation: true,
+        now: '2026-07-15T12:00:00.000Z',
+      }),
+    ).rejects.toThrow('injected crash after intermediate step');
+
+    const recovered = await new FilesystemLiveRunStateRepository(temporaryRoot).get(
+      'live-crash-mid-step',
+    );
+    expect(recovered?.checkpoint.status).toBe('RUNNING');
+    expect(recovered?.observations.length).toBeGreaterThanOrEqual(3);
+    expect(recovered?.resourceInventory.incident?.id).toBe(adapter.incident.id);
+  });
+
+  it('blocks required SLA when only the response objective is observable', async () => {
+    class ResponseOnlySlaAdapter extends StatefulIncidentAdapter {
+      override async readSlaSummary() {
+        return { records: [{ id: 'sla-1', objectiveType: 'response', status: 'running' }] };
+      }
+    }
+    const adapter = new ResponseOnlySlaAdapter();
+    const core = buildCore(adapter);
+
+    const run = await core.createLiveApiRun({
+      runId: 'live-sla-missing-resolution',
+      environmentId: 'live-test',
+      scenarioId: 'payment-api-service-degradation',
+      variationValues: { journey: 'normal' },
+      confirmRealMutation: true,
+      now: '2026-07-15T12:00:00.000Z',
+    });
+
+    expect(run.verdict).toBe('BLOCKED');
+    expect(run.error?.code).toBe('SLA_SUMMARY_MISSING');
+    expect(adapter.closeCalled).toBe(false);
+  });
+
   it('persists BLOCKED close-authority evidence and verified run-owned cleanup', async () => {
     const adapter = new StatefulIncidentAdapter();
     const core = buildCore(adapter);
@@ -408,9 +715,13 @@ describe('live Incident API orchestration', () => {
     const progress = await core.getRunProgress(run.runId);
     expect(progress.observations.at(-1)).toMatchObject({
       sourceStepId: 'close-resolved-incident',
+      actorId: 'requester',
+      semanticActorId: 'requester',
+      actorProfileId: 'live-requester',
       status: 'BLOCKED',
       error: { code: 'NILES_CLOSE_AUTHORITY_UNSATISFIABLE' },
     });
+    expect(progress.observations.at(-1)?.actorProfileId).not.toBe('live-incident-manager');
     await expect(core.getResourceInventory(run.runId)).resolves.toMatchObject({
       incident: { disposition: 'DELETED' },
     });

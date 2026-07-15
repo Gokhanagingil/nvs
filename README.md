@@ -40,7 +40,7 @@ It includes:
 - an operator-triggered authentication preflight UI with production denial and safe typed outcomes;
 - versioned live execution, fixture, readiness, inventory, checkpoint, observation, and `nvs.run/v2` contracts;
 - a NILES Incident API adapter for confirmed Incident, SLA, journal, CMDB, and group surfaces only;
-- `GET /api/environments/:id/execution-readiness`, live `POST /api/runs`, progress, inventory, and evidence endpoints;
+- `GET /api/environments/:id/execution-readiness`, async live `POST /api/runs` (`202` + `runId`), progress, inventory, and evidence endpoints;
 - Run Center controls that separate compile-only from live API execution and require explicit live confirmation;
 - a default-off server mutation switch, disabled committed fixture examples, and production blocking before secret or network access;
 - deterministic handling for the current close-authority blocker: `NILES_CLOSE_AUTHORITY_UNSATISFIABLE` remains `BLOCKED`, followed by verified run-owned soft delete when allowed.
@@ -66,7 +66,7 @@ A compile-only `PASS` means only that the reviewed blueprint compiled and its ar
 
 Compile-only runs still do not claim that NILES Incident lifecycle, SLA behavior, authorization, tenant isolation, side effects, cleanup, or release readiness passed. Authentication preflight confirms only that separately configured synthetic actors can establish normal NILES sessions.
 
-Live API runs are available only when all gates pass: non-production enabled environment, versioned live policy, server-owned `NVS_ENABLE_NILES_MUTATIONS=true`, enabled fixture profile, actor authentication into the fixture tenant, allowlisted scenario variation, `confirmRealMutation: true`, and no concurrent live run. The committed examples keep live mutation disabled. Current confirmed NILES close behavior requires requester/opening-user authority plus Incident write permission; when the configured requester cannot satisfy that, NVS records `BLOCKED` with `NILES_CLOSE_AUTHORITY_UNSATISFIABLE` and does not mark the run `PASS`.
+Live API runs are available only when all gates pass: non-production enabled environment, versioned live policy, server-owned `NVS_ENABLE_NILES_MUTATIONS=true`, enabled fixture profile, actor authentication into the fixture tenant, allowlisted scenario variation, `confirmRealMutation: true`, and no concurrent live run. Accepted live runs write a durable `PREPARED` checkpoint before the first mutation, expose `RUNNING` progress and observations while the background coordinator executes, and leave interrupted runs discoverable under `runs/.inflight` as `BLOCKED_REQUIRES_RECOVERY`. The committed examples keep live mutation disabled. Current confirmed NILES close behavior requires requester/opening-user authority plus Incident write permission; when the configured requester cannot satisfy that, NVS records `BLOCKED` with `NILES_CLOSE_AUTHORITY_UNSATISFIABLE` and does not mark the run `PASS`.
 
 ## Repository layout
 

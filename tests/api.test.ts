@@ -7,7 +7,7 @@ import {
   NilesReadOnlyAdapter,
   type FetchImplementation,
 } from '@nvs/adapter-niles';
-import { NvsCore } from '@nvs/core';
+import { LiveRunBlockedError, NvsCore } from '@nvs/core';
 import {
   EnvironmentVariableSecretProvider,
   credentialEnvironmentVariable,
@@ -70,6 +70,90 @@ afterEach(async () => {
 });
 
 describe('versioned control-plane API', () => {
+  it('returns 202 Accepted for live API run launch without waiting for final execution', async () => {
+    const startLiveApiRun = vi.fn().mockResolvedValue({
+      schemaVersion: 'nvs.live-run-accepted/v1',
+      runId: 'api-live-run',
+      status: 'ACCEPTED',
+    });
+    const liveApp = buildApp({
+      core: { startLiveApiRun } as unknown as NvsCore,
+      runtimePaths: {
+        configDir: repositoryRoot,
+        dataDir: temporaryRoot,
+        webDir: path.join(temporaryRoot, 'web'),
+      },
+      idFactory: () => 'api-live-run',
+      clock: () => '2026-07-15T12:00:00.000Z',
+    });
+    try {
+      const response = await liveApp.inject({
+        method: 'POST',
+        url: '/api/runs',
+        payload: {
+          runType: 'LIVE_API',
+          environmentId: 'live-test',
+          scenarioId: 'payment-api-service-degradation',
+          variationValues: { journey: 'normal' },
+          confirmRealMutation: true,
+        },
+      });
+
+      expect(response.statusCode).toBe(202);
+      expect(response.json()).toEqual({
+        schemaVersion: 'nvs.live-run-accepted/v1',
+        runId: 'api-live-run',
+        status: 'ACCEPTED',
+      });
+      expect(startLiveApiRun).toHaveBeenCalledWith({
+        runId: 'api-live-run',
+        environmentId: 'live-test',
+        scenarioId: 'payment-api-service-degradation',
+        variationValues: { journey: 'normal' },
+        confirmRealMutation: true,
+        now: '2026-07-15T12:00:00.000Z',
+      });
+    } finally {
+      await liveApp.close();
+    }
+  });
+
+  it('maps concurrent live API run launch to HTTP 409', async () => {
+    const liveApp = buildApp({
+      core: {
+        startLiveApiRun: vi
+          .fn()
+          .mockRejectedValue(
+            new LiveRunBlockedError('LIVE_RUN_IN_PROGRESS', 'Another run is active.'),
+          ),
+      } as unknown as NvsCore,
+      runtimePaths: {
+        configDir: repositoryRoot,
+        dataDir: temporaryRoot,
+        webDir: path.join(temporaryRoot, 'web'),
+      },
+      idFactory: () => 'api-live-run',
+    });
+    try {
+      const response = await liveApp.inject({
+        method: 'POST',
+        url: '/api/runs',
+        payload: {
+          runType: 'LIVE_API',
+          environmentId: 'live-test',
+          scenarioId: 'payment-api-service-degradation',
+          variationValues: { journey: 'normal' },
+          confirmRealMutation: true,
+        },
+      });
+
+      expect(response.statusCode).toBe(409);
+      expect(response.json().error.code).toBe('LIVE_RUN_IN_PROGRESS');
+    } finally {
+      await liveApp.close();
+    }
+  });
+
   it('serves the critical compile-only foundation endpoints', async () => {
     expect((await app.inject({ method: 'GET', url: '/api/health' })).statusCode).toBe(200);
     expect((await app.inject({ method: 'GET', url: '/api/health/live' })).json()).toMatchObject({

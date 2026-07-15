@@ -133,6 +133,8 @@ Live Incident API execution is disabled by default. To run the M1-02B live slice
 - the Run Center operator or API caller supplies `confirmRealMutation: true`;
 - no other live API run is in progress.
 
+Live `POST /api/runs` returns `202` with a `runId`; operators must watch `GET /api/runs/:id/progress` until `COMPLETED` before using the evidence bundle. If NVS restarts with a durable `runs/.inflight/<runId>` checkpoint that has not been promoted to a final bundle, readiness blocks new live runs with `LIVE_RUN_REQUIRES_RECOVERY`; inspect that checkpoint and inventory to locate any run-owned Incident before deciding whether to clean up or retain it.
+
 Do not enable `NVS_ENABLE_NILES_MUTATIONS` for production. Do not use this switch to bypass missing fixture readiness. If close authority is unsatisfiable for the configured requester profile, NVS records `BLOCKED` with `NILES_CLOSE_AUTHORITY_UNSATISFIABLE`, attempts verified run-owned soft delete while the incident remains deletable, and does not mark the run `PASS`.
 
 ## 3. Pinned SSH trust and GitHub environment

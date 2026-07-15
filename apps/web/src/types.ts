@@ -169,6 +169,8 @@ export interface PlanStep {
   id: string;
   sequence: number;
   actorId: string;
+  semanticActorId?: string;
+  actorProfileId?: string;
   action: string;
   assertions: Array<{ id: string; kind: string; statement: string }>;
   evidenceRequests: string[];
@@ -321,7 +323,7 @@ export interface StepObservation {
 export interface RunProgress {
   schemaVersion: 'nvs.run-progress/v1';
   runId: string;
-  status: 'CREATED' | 'RUNNING' | 'COMPLETED';
+  status: 'PREPARED' | 'CREATED' | 'RUNNING' | 'COMPLETED' | 'BLOCKED_REQUIRES_RECOVERY';
   verdict: 'PASS' | 'FAIL' | 'BLOCKED';
   observations: StepObservation[];
 }

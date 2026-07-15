@@ -13,6 +13,7 @@ import { EnvironmentVariableSecretProvider } from '@nvs/secret-provider-environm
 import {
   FilesystemActorProfileRepository,
   FilesystemEnvironmentRepository,
+  FilesystemLiveRunStateRepository,
   FilesystemNilesIncidentFixtureRepository,
   FilesystemRunBundleRepository,
   FilesystemScenarioRepository,
@@ -101,6 +102,7 @@ export function createCore(rootDir: string, fetchImplementation?: FetchImplement
         path.join(runtimePaths.configDir, 'fixtures', 'niles-incident'),
       ),
       incidentAdapter: new NilesIncidentApiAdapter(fetchImplementation, authenticationTimeout),
+      state: new FilesystemLiveRunStateRepository(runtimePaths.dataDir),
       mutationsEnabled: () => process.env['NVS_ENABLE_NILES_MUTATIONS'] === 'true',
     },
   );
@@ -148,7 +150,10 @@ function safeError(error: unknown): {
   }
   if (error instanceof LiveRunBlockedError) {
     return {
-      statusCode: error.code === 'LIVE_RUN_IN_PROGRESS' ? 409 : 403,
+      statusCode:
+        error.code === 'LIVE_RUN_IN_PROGRESS' || error.code === 'LIVE_RUN_REQUIRES_RECOVERY'
+          ? 409
+          : 403,
       body: {
         error: {
           code: error.code,
@@ -327,25 +332,27 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   app.post('/api/runs', async (request, reply) => {
     const body = createRunBodySchema.parse(request.body);
     const runId = body.runId ?? idFactory();
-    const run =
-      body.runType === 'COMPILE_ONLY'
-        ? await core.createCompileOnlyRun({
-            runId,
-            environmentId: body.environmentId,
-            scenarioId: body.scenarioId,
-            variationValues: body.variationValues,
-            now: clock(),
-          })
-        : await core.createLiveApiRun({
-            runId,
-            environmentId: body.environmentId,
-            scenarioId: body.scenarioId,
-            variationValues: body.variationValues,
-            confirmRealMutation: body.confirmRealMutation,
-            now: clock(),
-          });
-    void reply.status(201);
-    return run;
+    if (body.runType === 'COMPILE_ONLY') {
+      const run = await core.createCompileOnlyRun({
+        runId,
+        environmentId: body.environmentId,
+        scenarioId: body.scenarioId,
+        variationValues: body.variationValues,
+        now: clock(),
+      });
+      void reply.status(201);
+      return run;
+    }
+    const accepted = await core.startLiveApiRun({
+      runId,
+      environmentId: body.environmentId,
+      scenarioId: body.scenarioId,
+      variationValues: body.variationValues,
+      confirmRealMutation: body.confirmRealMutation,
+      now: clock(),
+    });
+    void reply.status(202);
+    return accepted;
   });
 
   app.get('/api/runs', async () => ({ items: await core.listRuns() }));

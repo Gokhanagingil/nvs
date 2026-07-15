@@ -132,6 +132,21 @@ export interface RunBundleRepository {
   getLiveCheckpoint?(runId: string): Promise<LiveRunCheckpointV1 | undefined>;
 }
 
+export interface LiveRunState {
+  runId: string;
+  plan: ExecutablePlanV1;
+  checkpoint: LiveRunCheckpointV1;
+  resourceInventory: ResourceInventoryV1;
+  observations: StepObservationV1[];
+}
+
+export interface LiveRunStateRepository {
+  save(state: LiveRunState): Promise<void>;
+  get(runId: string): Promise<LiveRunState | undefined>;
+  listActive(): Promise<LiveRunState[]>;
+  complete(runId: string): Promise<void>;
+}
+
 export interface EnvironmentProbe {
   probe(environment: EnvironmentDefinitionV1): Promise<ProbeResultV1>;
 }
@@ -183,6 +198,7 @@ export interface NilesIncidentLiveAdapter {
     tenantId: string;
     correlationId: string;
     runId: string;
+    runNamespacePrefix: string;
     requesterUserId: string;
     assignmentGroupId: string;
     serviceId: string;
@@ -227,6 +243,13 @@ export interface NilesIncidentLiveAdapter {
     ciId: string;
     correlationId: string;
   }): Promise<void>;
+  listAffectedCis(input: {
+    environment: EnvironmentDefinitionV1;
+    session: ActorSession;
+    tenantId: string;
+    incidentId: string;
+    correlationId: string;
+  }): Promise<Array<{ ciId: string }>>;
   readSlaSummary(input: {
     environment: EnvironmentDefinitionV1;
     session: ActorSession;
@@ -292,10 +315,12 @@ export interface NilesIncidentLiveAdapter {
 export interface LiveExecutionDependencies {
   fixtures: NilesIncidentFixtureRepository;
   incidentAdapter: NilesIncidentLiveAdapter;
+  state?: LiveRunStateRepository;
   mutationsEnabled?: () => boolean;
   clock?: () => string;
   monotonicClock?: () => number;
   correlationIdFactory?: (seed: string) => string;
+  backgroundCoordinator?: (operation: () => Promise<void>) => void;
 }
 
 export interface CompileOnlyRunInput {
@@ -317,6 +342,12 @@ export interface LiveApiRunInput {
   target?: { version?: string; commit?: string };
 }
 
+export interface LiveRunAccepted {
+  schemaVersion: 'nvs.live-run-accepted/v1';
+  runId: string;
+  status: 'ACCEPTED';
+}
+
 export class LiveRunBlockedError extends Error {
   constructor(
     readonly code: string,
@@ -333,6 +364,13 @@ class LiveStepError extends Error {
   constructor(readonly typed: TypedError) {
     super(typed.message);
     this.name = 'LiveStepError';
+  }
+}
+
+class LiveStatePersistenceError extends Error {
+  constructor(cause: unknown) {
+    super(cause instanceof Error ? cause.message : 'Live run state persistence failed.');
+    this.name = 'LiveStatePersistenceError';
   }
 }
 
@@ -422,8 +460,24 @@ function requireLiveAssertion(condition: boolean, code: string, message: string)
   }
 }
 
+type LiveObservationPayload = Record<string, string | number | boolean | null>;
+type LiveObservationOutcome =
+  LiveObservationPayload | { status: 'PASS' | 'NOT_OBSERVED'; evidence: LiveObservationPayload };
+
+function normalizeObservationOutcome(outcome: LiveObservationOutcome): {
+  status: 'PASS' | 'NOT_OBSERVED';
+  evidence: LiveObservationPayload;
+} {
+  if ('status' in outcome && 'evidence' in outcome) {
+    return outcome as { status: 'PASS' | 'NOT_OBSERVED'; evidence: LiveObservationPayload };
+  }
+  return { status: 'PASS', evidence: outcome };
+}
+
 export class NvsCore {
   private activeLiveRunId: string | undefined;
+  private readonly liveRunTasks = new Map<string, Promise<RunRecordV2>>();
+  private readonly memoryLiveStates = new Map<string, LiveRunState>();
 
   constructor(
     private readonly environments: EnvironmentRepository,
@@ -433,6 +487,67 @@ export class NvsCore {
     private readonly actorReadiness?: ActorReadinessDependencies,
     private readonly liveExecution?: LiveExecutionDependencies,
   ) {}
+
+  private liveStateRepository(): LiveRunStateRepository {
+    if (this.liveExecution?.state) {
+      return this.liveExecution.state;
+    }
+    return {
+      save: async (state) => {
+        this.memoryLiveStates.set(state.runId, state);
+      },
+      get: async (runId) => this.memoryLiveStates.get(runId),
+      listActive: async () =>
+        [...this.memoryLiveStates.values()].filter(
+          (state) => state.checkpoint.status !== 'COMPLETED',
+        ),
+      complete: async (runId) => {
+        const state = this.memoryLiveStates.get(runId);
+        if (state) {
+          this.memoryLiveStates.set(runId, {
+            ...state,
+            checkpoint: { ...state.checkpoint, status: 'COMPLETED' },
+          });
+        }
+      },
+    };
+  }
+
+  private scheduleLiveRun(runId: string, operation: () => Promise<RunRecordV2>): void {
+    const coordinator =
+      this.liveExecution?.backgroundCoordinator ??
+      ((scheduled: () => Promise<void>) => {
+        void scheduled().catch(() => undefined);
+      });
+    const task = new Promise<RunRecordV2>((resolve, reject) => {
+      coordinator(async () => {
+        try {
+          resolve(await operation());
+        } catch (error) {
+          reject(error);
+        } finally {
+          this.liveRunTasks.delete(runId);
+          if (this.activeLiveRunId === runId) {
+            this.activeLiveRunId = undefined;
+          }
+        }
+      });
+    });
+    task.catch(() => undefined);
+    this.liveRunTasks.set(runId, task);
+  }
+
+  async waitForLiveRun(runId: string): Promise<RunRecordV2> {
+    const task = this.liveRunTasks.get(runId);
+    if (task) {
+      return task;
+    }
+    const run = await this.bundles.get(runId);
+    if (run?.runType === 'LIVE_API') {
+      return run;
+    }
+    throw new Error(`Run "${runId}" was not found.`);
+  }
 
   listEnvironments(): Promise<EnvironmentDefinitionV1[]> {
     return this.environments.list();
@@ -935,8 +1050,116 @@ export class NvsCore {
       });
     }
 
+    if (fixture?.enabled && this.liveExecution) {
+      let sessions:
+        | {
+            requester: ActorSession;
+            serviceDesk: ActorSession;
+            incidentManager: ActorSession;
+            tenantAdmin: ActorSession;
+            destroy: () => void;
+          }
+        | undefined;
+      try {
+        sessions = await this.authenticateLiveActors(environment, fixture, 'readiness');
+        pass(
+          'actor-authentication',
+          'Required live actors authenticated and matched the configured tenant.',
+        );
+      } catch (error) {
+        const typed = safeLiveError(error);
+        block('actor-authentication', typed.code, typed.message);
+      }
+
+      if (sessions) {
+        try {
+          await Promise.all([
+            this.liveExecution.incidentAdapter.verifyResource({
+              environment,
+              session: sessions.tenantAdmin,
+              tenantId: fixture.tenantId,
+              kind: 'ASSIGNMENT_GROUP',
+              id: fixture.resources.assignmentGroup.id,
+              correlationId: this.liveCorrelation('readiness_fixture_group'),
+            }),
+            this.liveExecution.incidentAdapter.verifyResource({
+              environment,
+              session: sessions.tenantAdmin,
+              tenantId: fixture.tenantId,
+              kind: 'SERVICE',
+              id: fixture.resources.service.id,
+              correlationId: this.liveCorrelation('readiness_fixture_service'),
+            }),
+            ...(fixture.resources.offering
+              ? [
+                  this.liveExecution.incidentAdapter.verifyResource({
+                    environment,
+                    session: sessions.tenantAdmin,
+                    tenantId: fixture.tenantId,
+                    kind: 'OFFERING' as const,
+                    id: fixture.resources.offering.id,
+                    correlationId: this.liveCorrelation('readiness_fixture_offering'),
+                  }),
+                ]
+              : []),
+            ...(fixture.resources.configurationItem
+              ? [
+                  this.liveExecution.incidentAdapter.verifyResource({
+                    environment,
+                    session: sessions.tenantAdmin,
+                    tenantId: fixture.tenantId,
+                    kind: 'CI' as const,
+                    id: fixture.resources.configurationItem.id,
+                    correlationId: this.liveCorrelation('readiness_fixture_ci'),
+                  }),
+                ]
+              : []),
+          ]);
+          pass(
+            'fixture-resources',
+            'Assignment group, service, offering, and CI fixture references were verified read-only.',
+          );
+        } catch {
+          block(
+            'fixture-resources',
+            'NILES_FIXTURE_RESOURCE_MISSING',
+            'One or more configured NILES fixture resources could not be verified read-only.',
+          );
+        } finally {
+          sessions.destroy();
+        }
+      } else {
+        checks.push({
+          id: 'fixture-resources',
+          status: 'NOT_CHECKED',
+          message: 'Fixture resources were not checked because actor authentication was blocked.',
+        });
+      }
+    } else {
+      checks.push({
+        id: 'actor-authentication',
+        status: 'NOT_CHECKED',
+        message: 'Live actor authentication was not checked because the fixture is unavailable.',
+      });
+      checks.push({
+        id: 'fixture-resources',
+        status: 'NOT_CHECKED',
+        message: 'Fixture resources were not checked because the fixture is unavailable.',
+      });
+    }
+
+    const activeStates = this.liveExecution ? await this.liveStateRepository().listActive() : [];
+    const recoveryRequired = activeStates.find(
+      (state) => state.checkpoint.status !== 'COMPLETED' && !this.liveRunTasks.has(state.runId),
+    );
     if (this.activeLiveRunId) {
       block('concurrency', 'LIVE_RUN_IN_PROGRESS', 'Another live API run is already in progress.');
+    } else if (recoveryRequired) {
+      block(
+        'concurrency',
+        'LIVE_RUN_REQUIRES_RECOVERY',
+        `Run ${recoveryRequired.runId} has a durable in-flight checkpoint and requires operator recovery before another live API run can start.`,
+      );
     } else {
       pass('concurrency', 'No live API run is currently in progress.');
     }
@@ -983,7 +1206,11 @@ export class NvsCore {
     return compileBlueprint(await this.getScenario(id), variationValues);
   }
 
-  async createLiveApiRun(input: LiveApiRunInput): Promise<RunRecordV2> {
+  private async prepareLiveApiRun(input: LiveApiRunInput): Promise<{
+    environment: EnvironmentDefinitionV1;
+    plan: ExecutablePlanV1;
+    fixture: NilesIncidentFixtureV1;
+  }> {
     const environment = await this.getEnvironment(input.environmentId);
     enforceEnvironmentOperationPolicy(environment, 'MUTATING');
     if (!input.confirmRealMutation) {
@@ -1025,6 +1252,154 @@ export class NvsCore {
     }
 
     this.activeLiveRunId = input.runId;
+    return { environment, plan, fixture };
+  }
+
+  private async saveLiveState(
+    state: LiveRunState,
+    status: LiveRunCheckpointV1['status'] = state.checkpoint.status,
+  ): Promise<LiveRunState> {
+    const checkpoint = liveRunCheckpointV1Schema.parse({
+      ...state.checkpoint,
+      status,
+      incidentId: state.resourceInventory.incident?.id ?? state.checkpoint.incidentId,
+      completedStepIds: state.observations
+        .filter((observation) => observation.status === 'PASS')
+        .map((observation) => observation.stepId),
+      updatedAt: this.liveClock()(),
+    });
+    const nextState = { ...state, checkpoint };
+    try {
+      await this.liveStateRepository().save(nextState);
+    } catch (error) {
+      throw new LiveStatePersistenceError(error);
+    }
+    return nextState;
+  }
+
+  private initialLiveInventory(
+    input: LiveApiRunInput,
+    environment: EnvironmentDefinitionV1,
+    fixture: NilesIncidentFixtureV1,
+    now: string,
+  ): ResourceInventoryV1 {
+    return resourceInventoryV1Schema.parse({
+      schemaVersion: 'nvs.resource-inventory/v1',
+      runId: input.runId,
+      environmentId: environment.id,
+      tenantId: fixture.tenantId,
+      resources: [
+        { kind: 'TENANT', id: fixture.tenantId, disposition: 'VERIFIED_EXISTING' },
+        {
+          kind: 'ASSIGNMENT_GROUP',
+          id: fixture.resources.assignmentGroup.id,
+          label: fixture.resources.assignmentGroup.label,
+          disposition: 'VERIFIED_EXISTING',
+        },
+        {
+          kind: 'SERVICE',
+          id: fixture.resources.service.id,
+          label: fixture.resources.service.label,
+          disposition: 'VERIFIED_EXISTING',
+        },
+        ...(fixture.resources.offering
+          ? [
+              {
+                kind: 'OFFERING' as const,
+                id: fixture.resources.offering.id,
+                label: fixture.resources.offering.label,
+                disposition: 'VERIFIED_EXISTING' as const,
+              },
+            ]
+          : []),
+        ...(fixture.resources.configurationItem
+          ? [
+              {
+                kind: 'CI' as const,
+                id: fixture.resources.configurationItem.id,
+                label: fixture.resources.configurationItem.label,
+                disposition: 'VERIFIED_EXISTING' as const,
+              },
+            ]
+          : []),
+      ],
+      updatedAt: now,
+    });
+  }
+
+  private async prepareLiveState(
+    input: LiveApiRunInput,
+    environment: EnvironmentDefinitionV1,
+    plan: ExecutablePlanV1,
+    fixture: NilesIncidentFixtureV1,
+  ): Promise<LiveRunState> {
+    const state: LiveRunState = {
+      runId: input.runId,
+      plan,
+      resourceInventory: this.initialLiveInventory(input, environment, fixture, input.now),
+      observations: [],
+      checkpoint: liveRunCheckpointV1Schema.parse({
+        schemaVersion: 'nvs.live-run-checkpoint/v1',
+        runId: input.runId,
+        environmentId: environment.id,
+        fixtureId: fixture.id,
+        status: 'PREPARED',
+        completedStepIds: [],
+        cleanup: { attempted: false, status: 'NOT_REQUIRED' },
+        updatedAt: input.now,
+      }),
+    };
+    await this.liveStateRepository().save(state);
+    return state;
+  }
+
+  async startLiveApiRun(input: LiveApiRunInput): Promise<LiveRunAccepted> {
+    const prepared = await this.prepareLiveApiRun(input);
+    try {
+      await this.prepareLiveState(input, prepared.environment, prepared.plan, prepared.fixture);
+    } catch (error) {
+      if (this.activeLiveRunId === input.runId) {
+        this.activeLiveRunId = undefined;
+      }
+      throw error;
+    }
+
+    this.scheduleLiveRun(input.runId, () =>
+      this.executePreparedLiveApiRun(input, prepared.environment, prepared.plan, prepared.fixture),
+    );
+    return {
+      schemaVersion: 'nvs.live-run-accepted/v1',
+      runId: input.runId,
+      status: 'ACCEPTED',
+    };
+  }
+
+  async createLiveApiRun(input: LiveApiRunInput): Promise<RunRecordV2> {
+    const prepared = await this.prepareLiveApiRun(input);
+    try {
+      await this.prepareLiveState(input, prepared.environment, prepared.plan, prepared.fixture);
+      return await this.executePreparedLiveApiRun(
+        input,
+        prepared.environment,
+        prepared.plan,
+        prepared.fixture,
+      );
+    } catch (error) {
+      if (this.activeLiveRunId === input.runId) {
+        this.activeLiveRunId = undefined;
+      }
+      throw error;
+    }
+  }
+
+  private async executePreparedLiveApiRun(
+    input: LiveApiRunInput,
+    environment: EnvironmentDefinitionV1,
+    plan: ExecutablePlanV1,
+    fixture: NilesIncidentFixtureV1,
+  ): Promise<RunRecordV2> {
+    this.activeLiveRunId = input.runId;
+    const live = this.liveDependencies();
     const clock = this.liveClock();
     const createdAt = input.now;
     const sanitization = {
@@ -1160,16 +1535,57 @@ export class NvsCore {
         updatedAt: clock(),
       });
 
+    let liveState =
+      (await this.liveStateRepository().get(input.runId)) ??
+      ({
+        runId: input.runId,
+        plan,
+        resourceInventory: baseInventory(),
+        observations,
+        checkpoint: liveRunCheckpointV1Schema.parse({
+          schemaVersion: 'nvs.live-run-checkpoint/v1',
+          runId: input.runId,
+          environmentId: environment.id,
+          fixtureId: fixture.id,
+          status: 'PREPARED',
+          completedStepIds: [],
+          cleanup: { attempted: false, status: 'NOT_REQUIRED' },
+          updatedAt: createdAt,
+        }),
+      } satisfies LiveRunState);
+
+    const persistLiveState = async (
+      status: LiveRunCheckpointV1['status'] = 'RUNNING',
+    ): Promise<void> => {
+      liveState = await this.saveLiveState(
+        {
+          ...liveState,
+          plan,
+          resourceInventory: baseInventory(),
+          observations: [...observations],
+        },
+        status,
+      );
+    };
+
+    await persistLiveState('RUNNING');
+
     const observe = async (
       step: ExecutablePlanV1['steps'][number],
       operation: (
         correlationId: string,
-      ) => Promise<Record<string, string | number | boolean | null>>,
+        actualActorId: string,
+        actorProfileId: string,
+      ) => Promise<LiveObservationOutcome>,
+      actor: ActorSession,
+      actualActorId: string,
     ): Promise<void> => {
       const startedAt = clock();
       const correlationId = this.liveCorrelation(`${input.runId}_${step.sequence}_${step.action}`);
       try {
-        const evidence = await operation(correlationId);
+        const outcome = normalizeObservationOutcome(
+          await operation(correlationId, actualActorId, actor.actorProfileId),
+        );
         observations.push(
           stepObservationV1Schema.parse({
             schemaVersion: 'nvs.step-observation/v1',
@@ -1178,16 +1594,22 @@ export class NvsCore {
             stepId: step.id,
             sourceStepId: step.source.blueprintStepId,
             sequence: step.sequence,
-            actorId: step.actorId,
+            actorId: actualActorId,
+            semanticActorId: step.actorId,
+            actorProfileId: actor.actorProfileId,
             action: step.action,
-            status: 'PASS',
+            status: outcome.status,
             startedAt,
             completedAt: clock(),
             correlationId,
-            evidence,
+            evidence: outcome.evidence,
           }),
         );
+        await persistLiveState('RUNNING');
       } catch (error) {
+        if (error instanceof LiveStatePersistenceError) {
+          throw error;
+        }
         const typed = safeLiveError(error);
         observations.push(
           stepObservationV1Schema.parse({
@@ -1197,7 +1619,9 @@ export class NvsCore {
             stepId: step.id,
             sourceStepId: step.source.blueprintStepId,
             sequence: step.sequence,
-            actorId: step.actorId,
+            actorId: actualActorId,
+            semanticActorId: step.actorId,
+            actorProfileId: actor.actorProfileId,
             action: step.action,
             status: classifyError(typed),
             startedAt,
@@ -1207,6 +1631,7 @@ export class NvsCore {
             error: typed,
           }),
         );
+        await persistLiveState('RUNNING');
         throw new LiveStepError(typed);
       }
     };
@@ -1257,348 +1682,432 @@ export class NvsCore {
       ]);
 
       for (const step of plan.steps) {
-        await observe(step, async (correlationId) => {
-          switch (step.action) {
-            case 'incident.report': {
-              incident = await live.incidentAdapter.createIncident({
-                environment,
-                session: sessions!.serviceDesk,
-                tenantId: fixture.tenantId,
-                correlationId,
-                runId: input.runId,
-                requesterUserId: sessions!.requester.userId,
-                assignmentGroupId: fixture.resources.assignmentGroup.id,
-                serviceId: fixture.resources.service.id,
-                ...(fixture.resources.offering
-                  ? { offeringId: fixture.resources.offering.id }
-                  : {}),
-                impact: fixture.resources.impact,
-                urgency: fixture.resources.urgency,
-              });
-              requireLiveAssertion(
-                Boolean(incident.id),
-                'INCIDENT_ID_MISSING',
-                'NILES did not return a created incident identity.',
-              );
-              return {
-                incidentId: incident.id,
-                incidentNumber: incident.number ?? null,
-                semanticReporter: 'requester',
-                operationalWriter: 'service-desk-agent',
-              };
-            }
-            case 'incident.triage': {
-              if (!incident)
-                throw new LiveStepError(
-                  typedError(
-                    'ASSERTION',
-                    'INCIDENT_NOT_CREATED',
-                    'The incident must exist before triage.',
-                  ),
-                );
-              incident = await live.incidentAdapter.readIncident({
-                environment,
-                session: sessions!.serviceDesk,
-                tenantId: fixture.tenantId,
-                incidentId: incident.id,
-                correlationId,
-              });
-              if (fixture.resources.expectedPriority) {
+        const actorContext =
+          step.action === 'evidence.read_audit'
+            ? { actorId: 'incident-manager', session: sessions.incidentManager }
+            : step.action === 'incident.close'
+              ? { actorId: 'requester', session: sessions.requester }
+              : { actorId: 'service-desk-agent', session: sessions.serviceDesk };
+        await observe(
+          step,
+          async (correlationId) => {
+            switch (step.action) {
+              case 'incident.report': {
+                incident = await live.incidentAdapter.createIncident({
+                  environment,
+                  session: sessions!.serviceDesk,
+                  tenantId: fixture.tenantId,
+                  correlationId,
+                  runId: input.runId,
+                  runNamespacePrefix: fixture.runNamespacePrefix,
+                  requesterUserId: sessions!.requester.userId,
+                  assignmentGroupId: fixture.resources.assignmentGroup.id,
+                  serviceId: fixture.resources.service.id,
+                  ...(fixture.resources.offering
+                    ? { offeringId: fixture.resources.offering.id }
+                    : {}),
+                  impact: fixture.resources.impact,
+                  urgency: fixture.resources.urgency,
+                });
                 requireLiveAssertion(
-                  incident.priority === fixture.resources.expectedPriority,
-                  'INCIDENT_PRIORITY_MISMATCH',
-                  'The observed incident priority does not match the configured impact and urgency expectation.',
+                  Boolean(incident.id),
+                  'INCIDENT_ID_MISSING',
+                  'NILES did not return a created incident identity.',
                 );
+                await persistLiveState('RUNNING');
+                return {
+                  incidentId: incident.id,
+                  incidentNumber: incident.number ?? null,
+                  semanticReporter: 'requester',
+                  operationalWriter: 'service-desk-agent',
+                };
               }
-              return {
-                incidentId: incident.id,
-                status: incident.status ?? null,
-                priority: incident.priority ?? null,
-              };
-            }
-            case 'incident.assign': {
-              if (!incident)
-                throw new LiveStepError(
-                  typedError(
-                    'ASSERTION',
-                    'INCIDENT_NOT_CREATED',
-                    'The incident must exist before assignment.',
-                  ),
-                );
-              incident = await live.incidentAdapter.assignIncident({
-                environment,
-                session: sessions!.serviceDesk,
-                tenantId: fixture.tenantId,
-                incidentId: incident.id,
-                assignmentGroupId: fixture.resources.assignmentGroup.id,
-                correlationId,
-              });
-              requireLiveAssertion(
-                incident.assignmentGroupId === fixture.resources.assignmentGroup.id,
-                'INCIDENT_ASSIGNMENT_GROUP_MISMATCH',
-                'The incident assignment group does not match the configured fixture.',
-              );
-              return {
-                incidentId: incident.id,
-                assignmentGroupId: incident.assignmentGroupId ?? null,
-              };
-            }
-            case 'incident.take_ownership': {
-              if (!incident)
-                throw new LiveStepError(
-                  typedError(
-                    'ASSERTION',
-                    'INCIDENT_NOT_CREATED',
-                    'The incident must exist before ownership.',
-                  ),
-                );
-              incident = await live.incidentAdapter.takeOwnership({
-                environment,
-                session: sessions!.serviceDesk,
-                tenantId: fixture.tenantId,
-                incidentId: incident.id,
-                correlationId,
-              });
-              requireLiveAssertion(
-                incident.assignedTo === sessions!.serviceDesk.userId,
-                'INCIDENT_OWNER_MISMATCH',
-                'The acting Service Desk user did not become the incident owner.',
-              );
-              return {
-                incidentId: incident.id,
-                assignedToCurrentActor: incident.assignedTo === sessions!.serviceDesk.userId,
-                status: incident.status ?? null,
-              };
-            }
-            case 'incident.start_work': {
-              if (!incident)
-                throw new LiveStepError(
-                  typedError(
-                    'ASSERTION',
-                    'INCIDENT_NOT_CREATED',
-                    'The incident must exist before work starts.',
-                  ),
-                );
-              if (incident.status !== 'in_progress') {
-                incident = await live.incidentAdapter.startWork({
+              case 'incident.triage': {
+                if (!incident)
+                  throw new LiveStepError(
+                    typedError(
+                      'ASSERTION',
+                      'INCIDENT_NOT_CREATED',
+                      'The incident must exist before triage.',
+                    ),
+                  );
+                incident = await live.incidentAdapter.readIncident({
                   environment,
                   session: sessions!.serviceDesk,
                   tenantId: fixture.tenantId,
                   incidentId: incident.id,
                   correlationId,
                 });
+                if (fixture.resources.expectedPriority) {
+                  requireLiveAssertion(
+                    incident.priority === fixture.resources.expectedPriority,
+                    'INCIDENT_PRIORITY_MISMATCH',
+                    'The observed incident priority does not match the configured impact and urgency expectation.',
+                  );
+                }
+                return {
+                  incidentId: incident.id,
+                  status: incident.status ?? null,
+                  priority: incident.priority ?? null,
+                };
               }
-              requireLiveAssertion(
-                incident.status === 'in_progress',
-                'INCIDENT_NOT_IN_PROGRESS',
-                'The incident did not enter in-progress work state.',
-              );
-              return { incidentId: incident.id, status: incident.status ?? null };
-            }
-            case 'incident.link_service_context': {
-              if (!incident)
-                throw new LiveStepError(
-                  typedError(
-                    'ASSERTION',
-                    'INCIDENT_NOT_CREATED',
-                    'The incident must exist before service context linkage.',
-                  ),
-                );
-              if (fixture.resources.configurationItem) {
-                await live.incidentAdapter.addAffectedCi({
+              case 'incident.assign': {
+                if (!incident)
+                  throw new LiveStepError(
+                    typedError(
+                      'ASSERTION',
+                      'INCIDENT_NOT_CREATED',
+                      'The incident must exist before assignment.',
+                    ),
+                  );
+                incident = await live.incidentAdapter.assignIncident({
                   environment,
                   session: sessions!.serviceDesk,
                   tenantId: fixture.tenantId,
                   incidentId: incident.id,
-                  ciId: fixture.resources.configurationItem.id,
+                  assignmentGroupId: fixture.resources.assignmentGroup.id,
                   correlationId,
                 });
-              }
-              return {
-                incidentId: incident.id,
-                serviceId: fixture.resources.service.id,
-                offeringId: fixture.resources.offering?.id ?? null,
-                ciId: fixture.resources.configurationItem?.id ?? null,
-              };
-            }
-            case 'sla.read_summary': {
-              if (!incident)
-                throw new LiveStepError(
-                  typedError(
-                    'ASSERTION',
-                    'INCIDENT_NOT_CREATED',
-                    'The incident must exist before SLA observation.',
-                  ),
-                );
-              const summary = await live.incidentAdapter.readSlaSummary({
-                environment,
-                session: sessions!.serviceDesk,
-                tenantId: fixture.tenantId,
-                incidentId: incident.id,
-                correlationId,
-              });
-              if (fixture.resources.sla.required) {
                 requireLiveAssertion(
-                  summary.records.length > 0,
-                  'SLA_SUMMARY_MISSING',
-                  'Required SLA summary records were not observable for the incident.',
+                  incident.assignmentGroupId === fixture.resources.assignmentGroup.id,
+                  'INCIDENT_ASSIGNMENT_GROUP_MISMATCH',
+                  'The incident assignment group does not match the configured fixture.',
                 );
+                return {
+                  incidentId: incident.id,
+                  assignmentGroupId: incident.assignmentGroupId ?? null,
+                };
               }
-              return { incidentId: incident.id, slaRecords: summary.records.length };
-            }
-            case 'incident.hold': {
-              if (!incident)
-                throw new LiveStepError(
-                  typedError(
-                    'ASSERTION',
-                    'INCIDENT_NOT_CREATED',
-                    'The incident must exist before hold.',
-                  ),
-                );
-              incident = await live.incidentAdapter.holdIncident({
-                environment,
-                session: sessions!.serviceDesk,
-                tenantId: fixture.tenantId,
-                incidentId: incident.id,
-                pendingReason: fixture.resources.hold.pendingReason,
-                pendingReasonDetail: fixture.resources.hold.pendingReasonDetail,
-                correlationId,
-              });
-              requireLiveAssertion(
-                incident.status === 'on_hold',
-                'INCIDENT_NOT_ON_HOLD',
-                'The incident did not enter on-hold state.',
-              );
-              return { incidentId: incident.id, status: incident.status ?? null };
-            }
-            case 'incident.resume': {
-              if (!incident)
-                throw new LiveStepError(
-                  typedError(
-                    'ASSERTION',
-                    'INCIDENT_NOT_CREATED',
-                    'The incident must exist before resume.',
-                  ),
-                );
-              incident = await live.incidentAdapter.resumeIncident({
-                environment,
-                session: sessions!.serviceDesk,
-                tenantId: fixture.tenantId,
-                incidentId: incident.id,
-                correlationId,
-              });
-              requireLiveAssertion(
-                incident.status === 'in_progress',
-                'INCIDENT_NOT_RESUMED',
-                'The incident did not resume to in-progress state.',
-              );
-              return { incidentId: incident.id, status: incident.status ?? null };
-            }
-            case 'incident.resolve': {
-              if (!incident)
-                throw new LiveStepError(
-                  typedError(
-                    'ASSERTION',
-                    'INCIDENT_NOT_CREATED',
-                    'The incident must exist before resolve.',
-                  ),
-                );
-              incident = await live.incidentAdapter.resolveIncident({
-                environment,
-                session: sessions!.serviceDesk,
-                tenantId: fixture.tenantId,
-                incidentId: incident.id,
-                resolutionNotes: fixture.resources.resolutionNotes,
-                correlationId,
-              });
-              requireLiveAssertion(
-                incident.status === 'resolved',
-                'INCIDENT_NOT_RESOLVED',
-                'The incident did not reach resolved state.',
-              );
-              return { incidentId: incident.id, status: incident.status ?? null };
-            }
-            case 'evidence.read_audit': {
-              if (!incident)
-                throw new LiveStepError(
-                  typedError(
-                    'ASSERTION',
-                    'INCIDENT_NOT_CREATED',
-                    'The incident must exist before audit review.',
-                  ),
-                );
-              const [reviewedIncident, journal] = await Promise.all([
-                live.incidentAdapter.readIncident({
+              case 'incident.take_ownership': {
+                if (!incident)
+                  throw new LiveStepError(
+                    typedError(
+                      'ASSERTION',
+                      'INCIDENT_NOT_CREATED',
+                      'The incident must exist before ownership.',
+                    ),
+                  );
+                incident = await live.incidentAdapter.takeOwnership({
                   environment,
-                  session: sessions!.incidentManager,
+                  session: sessions!.serviceDesk,
                   tenantId: fixture.tenantId,
                   incidentId: incident.id,
                   correlationId,
-                }),
-                live.incidentAdapter.readJournalSummary({
+                });
+                requireLiveAssertion(
+                  incident.assignedTo === sessions!.serviceDesk.userId,
+                  'INCIDENT_OWNER_MISMATCH',
+                  'The acting Service Desk user did not become the incident owner.',
+                );
+                return {
+                  incidentId: incident.id,
+                  assignedToCurrentActor: incident.assignedTo === sessions!.serviceDesk.userId,
+                  status: incident.status ?? null,
+                };
+              }
+              case 'incident.start_work': {
+                if (!incident)
+                  throw new LiveStepError(
+                    typedError(
+                      'ASSERTION',
+                      'INCIDENT_NOT_CREATED',
+                      'The incident must exist before work starts.',
+                    ),
+                  );
+                if (incident.status !== 'in_progress') {
+                  incident = await live.incidentAdapter.startWork({
+                    environment,
+                    session: sessions!.serviceDesk,
+                    tenantId: fixture.tenantId,
+                    incidentId: incident.id,
+                    correlationId,
+                  });
+                }
+                requireLiveAssertion(
+                  incident.status === 'in_progress',
+                  'INCIDENT_NOT_IN_PROGRESS',
+                  'The incident did not enter in-progress work state.',
+                );
+                return {
+                  incidentId: incident.id,
+                  status: incident.status ?? null,
+                  supportedStateField: 'status',
+                  expectedStatus: 'on_hold',
+                };
+              }
+              case 'incident.link_service_context': {
+                if (!incident)
+                  throw new LiveStepError(
+                    typedError(
+                      'ASSERTION',
+                      'INCIDENT_NOT_CREATED',
+                      'The incident must exist before service context linkage.',
+                    ),
+                  );
+                if (fixture.resources.configurationItem) {
+                  await live.incidentAdapter.addAffectedCi({
+                    environment,
+                    session: sessions!.serviceDesk,
+                    tenantId: fixture.tenantId,
+                    incidentId: incident.id,
+                    ciId: fixture.resources.configurationItem.id,
+                    correlationId,
+                  });
+                  const affectedCis = await live.incidentAdapter.listAffectedCis({
+                    environment,
+                    session: sessions!.serviceDesk,
+                    tenantId: fixture.tenantId,
+                    incidentId: incident.id,
+                    correlationId,
+                  });
+                  requireLiveAssertion(
+                    affectedCis.some(
+                      (candidate) => candidate.ciId === fixture.resources.configurationItem?.id,
+                    ),
+                    'AFFECTED_CI_LINK_NOT_OBSERVED',
+                    'The affected CI relation was not observable after creation.',
+                  );
+                }
+                return {
+                  incidentId: incident.id,
+                  serviceId: fixture.resources.service.id,
+                  offeringId: fixture.resources.offering?.id ?? null,
+                  ciId: fixture.resources.configurationItem?.id ?? null,
+                };
+              }
+              case 'sla.read_summary': {
+                if (!incident)
+                  throw new LiveStepError(
+                    typedError(
+                      'ASSERTION',
+                      'INCIDENT_NOT_CREATED',
+                      'The incident must exist before SLA observation.',
+                    ),
+                  );
+                const summary = await live.incidentAdapter.readSlaSummary({
                   environment,
-                  session: sessions!.incidentManager,
+                  session: sessions!.serviceDesk,
                   tenantId: fixture.tenantId,
                   incidentId: incident.id,
                   correlationId,
-                }),
-              ]);
-              incident = reviewedIncident;
-              return {
-                incidentId: incident.id,
-                status: incident.status ?? null,
-                journalCount: journal.count,
-              };
-            }
-            case 'incident.close': {
-              if (!incident)
-                throw new LiveStepError(
-                  typedError(
-                    'ASSERTION',
-                    'INCIDENT_NOT_CREATED',
-                    'The incident must exist before close.',
-                  ),
+                });
+                const observedObjectiveTypes = new Set(
+                  summary.records
+                    .map((record) => record.objectiveType?.toLowerCase())
+                    .filter((objectiveType): objectiveType is string => Boolean(objectiveType)),
                 );
-              if (!fixture.resources.closeAuthority.requesterMustHaveIncidentWrite) {
-                throw new LiveStepError(
-                  typedError(
-                    'ENVIRONMENT',
-                    'NILES_CLOSE_AUTHORITY_UNSATISFIABLE',
-                    'NILES requires requester or opening-user close authority, but the configured requester profile does not have the required write permission.',
-                  ),
-                );
+                const requiredObjectiveTypes = fixture.resources.sla.objectiveTypes;
+                if (fixture.resources.sla.required) {
+                  const missing = requiredObjectiveTypes.filter(
+                    (objectiveType) => !observedObjectiveTypes.has(objectiveType),
+                  );
+                  if (summary.records.length === 0 || missing.length > 0) {
+                    throw new LiveStepError(
+                      typedError(
+                        'ENVIRONMENT',
+                        'SLA_SUMMARY_MISSING',
+                        missing.length > 0
+                          ? `Required SLA objective(s) were not observable: ${missing.join(', ')}.`
+                          : 'Required SLA summary records were not observable for the incident.',
+                      ),
+                    );
+                  }
+                } else if (summary.records.length === 0) {
+                  return {
+                    status: 'NOT_OBSERVED',
+                    evidence: { incidentId: incident.id, slaRecords: 0, required: false },
+                  };
+                }
+                return {
+                  incidentId: incident.id,
+                  slaRecords: summary.records.length,
+                  responseObjectiveObserved: observedObjectiveTypes.has('response'),
+                  resolutionObjectiveObserved: observedObjectiveTypes.has('resolution'),
+                };
               }
-              incident = await live.incidentAdapter.closeIncident({
-                environment,
-                session: sessions!.requester,
-                tenantId: fixture.tenantId,
-                incidentId: incident.id,
-                closureNote: 'NVS synthetic requester confirms service restoration.',
-                correlationId,
-              });
-              requireLiveAssertion(
-                incident.status === 'closed',
-                'INCIDENT_NOT_CLOSED',
-                'The incident did not reach closed state.',
-              );
-              return { incidentId: incident.id, status: incident.status ?? null };
+              case 'incident.hold': {
+                if (!incident)
+                  throw new LiveStepError(
+                    typedError(
+                      'ASSERTION',
+                      'INCIDENT_NOT_CREATED',
+                      'The incident must exist before hold.',
+                    ),
+                  );
+                incident = await live.incidentAdapter.holdIncident({
+                  environment,
+                  session: sessions!.serviceDesk,
+                  tenantId: fixture.tenantId,
+                  incidentId: incident.id,
+                  pendingReason: fixture.resources.hold.pendingReason,
+                  pendingReasonDetail: fixture.resources.hold.pendingReasonDetail,
+                  correlationId,
+                });
+                requireLiveAssertion(
+                  incident.status === 'on_hold',
+                  'INCIDENT_NOT_ON_HOLD',
+                  'The incident did not enter on-hold state.',
+                );
+                return {
+                  incidentId: incident.id,
+                  status: incident.status ?? null,
+                  supportedStateField: 'status',
+                  expectedStatus: 'in_progress',
+                };
+              }
+              case 'incident.resume': {
+                if (!incident)
+                  throw new LiveStepError(
+                    typedError(
+                      'ASSERTION',
+                      'INCIDENT_NOT_CREATED',
+                      'The incident must exist before resume.',
+                    ),
+                  );
+                incident = await live.incidentAdapter.resumeIncident({
+                  environment,
+                  session: sessions!.serviceDesk,
+                  tenantId: fixture.tenantId,
+                  incidentId: incident.id,
+                  correlationId,
+                });
+                requireLiveAssertion(
+                  incident.status === 'in_progress',
+                  'INCIDENT_NOT_RESUMED',
+                  'The incident did not resume to in-progress state.',
+                );
+                return {
+                  incidentId: incident.id,
+                  status: incident.status ?? null,
+                  supportedStateField: 'status',
+                  expectedStatus: 'resolved',
+                };
+              }
+              case 'incident.resolve': {
+                if (!incident)
+                  throw new LiveStepError(
+                    typedError(
+                      'ASSERTION',
+                      'INCIDENT_NOT_CREATED',
+                      'The incident must exist before resolve.',
+                    ),
+                  );
+                incident = await live.incidentAdapter.resolveIncident({
+                  environment,
+                  session: sessions!.serviceDesk,
+                  tenantId: fixture.tenantId,
+                  incidentId: incident.id,
+                  resolutionNotes: fixture.resources.resolutionNotes,
+                  correlationId,
+                });
+                requireLiveAssertion(
+                  incident.status === 'resolved',
+                  'INCIDENT_NOT_RESOLVED',
+                  'The incident did not reach resolved state.',
+                );
+                return {
+                  incidentId: incident.id,
+                  status: incident.status ?? null,
+                  supportedStateField: 'status',
+                  expectedStatus: 'resolved',
+                };
+              }
+              case 'evidence.read_audit': {
+                if (!incident)
+                  throw new LiveStepError(
+                    typedError(
+                      'ASSERTION',
+                      'INCIDENT_NOT_CREATED',
+                      'The incident must exist before audit review.',
+                    ),
+                  );
+                const [reviewedIncident, journal] = await Promise.all([
+                  live.incidentAdapter.readIncident({
+                    environment,
+                    session: sessions!.incidentManager,
+                    tenantId: fixture.tenantId,
+                    incidentId: incident.id,
+                    correlationId,
+                  }),
+                  live.incidentAdapter.readJournalSummary({
+                    environment,
+                    session: sessions!.incidentManager,
+                    tenantId: fixture.tenantId,
+                    incidentId: incident.id,
+                    correlationId,
+                  }),
+                ]);
+                incident = reviewedIncident;
+                if (journal.count === 0) {
+                  throw new LiveStepError(
+                    typedError(
+                      'ENVIRONMENT',
+                      'AUDIT_JOURNAL_NOT_OBSERVED',
+                      'Required audit or journal evidence was not observable for the run-owned incident.',
+                    ),
+                  );
+                }
+                return {
+                  incidentId: incident.id,
+                  status: incident.status ?? null,
+                  journalCount: journal.count,
+                };
+              }
+              case 'incident.close': {
+                if (!incident)
+                  throw new LiveStepError(
+                    typedError(
+                      'ASSERTION',
+                      'INCIDENT_NOT_CREATED',
+                      'The incident must exist before close.',
+                    ),
+                  );
+                if (!fixture.resources.closeAuthority.requesterMustHaveIncidentWrite) {
+                  throw new LiveStepError(
+                    typedError(
+                      'ENVIRONMENT',
+                      'NILES_CLOSE_AUTHORITY_UNSATISFIABLE',
+                      'NILES requires requester or opening-user close authority, but the configured requester profile does not have the required write permission.',
+                    ),
+                  );
+                }
+                incident = await live.incidentAdapter.closeIncident({
+                  environment,
+                  session: sessions!.requester,
+                  tenantId: fixture.tenantId,
+                  incidentId: incident.id,
+                  closureNote: 'NVS synthetic requester confirms service restoration.',
+                  correlationId,
+                });
+                requireLiveAssertion(
+                  incident.status === 'closed',
+                  'INCIDENT_NOT_CLOSED',
+                  'The incident did not reach closed state.',
+                );
+                return { incidentId: incident.id, status: incident.status ?? null };
+              }
+              default:
+                throw new LiveStepError(
+                  typedError(
+                    'SCENARIO_CONTRACT',
+                    'LIVE_ACTION_NOT_IMPLEMENTED',
+                    `Live API execution does not support action ${step.action}.`,
+                  ),
+                );
             }
-            default:
-              throw new LiveStepError(
-                typedError(
-                  'SCENARIO_CONTRACT',
-                  'LIVE_ACTION_NOT_IMPLEMENTED',
-                  `Live API execution does not support action ${step.action}.`,
-                ),
-              );
-          }
-        });
+          },
+          actorContext.session,
+          actorContext.actorId,
+        );
       }
 
       cleanupStatus = 'RETAINED_BY_POLICY';
       cleanupPolicy = 'RETAIN_CLOSED';
       cleanupDetails = 'Closed run-owned incident retained by policy for release evidence.';
     } catch (error) {
+      if (error instanceof LiveStatePersistenceError) {
+        throw error;
+      }
       runError = safeLiveError(error);
       if (incident && runError.code === 'NILES_CLOSE_AUTHORITY_UNSATISFIABLE' && sessions) {
         cleanupPolicy = 'DELETE_IF_RUN_OWNED';
@@ -1730,7 +2239,13 @@ export class NvsCore {
       cleanup: { attempted: cleanupStatus !== 'NOT_REQUIRED', status: cleanupStatus },
       updatedAt: completedAt,
     });
-    return (await this.bundles.saveBundle({
+    await this.liveStateRepository().save({
+      ...liveState,
+      checkpoint,
+      resourceInventory: finalInventory,
+      observations,
+    });
+    const saved = (await this.bundles.saveBundle({
       run,
       plan,
       evidenceManifest: manifest,
@@ -1738,6 +2253,8 @@ export class NvsCore {
       observations,
       checkpoint,
     })) as RunRecordV2;
+    await this.liveStateRepository().complete(input.runId);
+    return saved;
   }
 
   async createCompileOnlyRun(input: CompileOnlyRunInput): Promise<RunRecordV1> {
@@ -1826,7 +2343,8 @@ export class NvsCore {
   }
 
   async getPlan(runId: string): Promise<ExecutablePlanV1> {
-    const plan = await this.bundles.getPlan(runId);
+    const plan =
+      (await this.bundles.getPlan(runId)) ?? (await this.liveStateRepository().get(runId))?.plan;
     if (!plan) {
       throw new Error(`Plan for run "${runId}" was not found.`);
     }
@@ -1844,26 +2362,52 @@ export class NvsCore {
   async getRunProgress(runId: string): Promise<{
     schemaVersion: 'nvs.run-progress/v1';
     runId: string;
-    status: RunRecord['status'];
+    status: RunRecord['status'] | 'PREPARED' | 'BLOCKED_REQUIRES_RECOVERY';
     verdict: RunRecord['verdict'];
     observations: StepObservationV1[];
     checkpoint?: LiveRunCheckpointV1;
   }> {
-    const run = await this.getRun(runId);
-    const observations = (await this.bundles.getStepObservations?.(runId)) ?? [];
-    const checkpoint = await this.bundles.getLiveCheckpoint?.(runId);
+    const run = await this.bundles.get(runId);
+    if (run) {
+      const observations = (await this.bundles.getStepObservations?.(runId)) ?? [];
+      const checkpoint = await this.bundles.getLiveCheckpoint?.(runId);
+      return {
+        schemaVersion: 'nvs.run-progress/v1',
+        runId,
+        status: run.status,
+        verdict: run.verdict,
+        observations,
+        ...(checkpoint ? { checkpoint } : {}),
+      };
+    }
+
+    const state = await this.liveStateRepository().get(runId);
+    if (!state) {
+      throw new Error(`Run "${runId}" was not found.`);
+    }
+    const taskActive = this.liveRunTasks.has(runId) || this.activeLiveRunId === runId;
+    const checkpoint =
+      !taskActive && state.checkpoint.status !== 'COMPLETED'
+        ? liveRunCheckpointV1Schema.parse({
+            ...state.checkpoint,
+            status: 'BLOCKED_REQUIRES_RECOVERY',
+            updatedAt: this.liveClock()(),
+          })
+        : state.checkpoint;
     return {
       schemaVersion: 'nvs.run-progress/v1',
       runId,
-      status: run.status,
-      verdict: run.verdict,
-      observations,
-      ...(checkpoint ? { checkpoint } : {}),
+      status: checkpoint.status,
+      verdict: 'BLOCKED',
+      observations: state.observations,
+      checkpoint,
     };
   }
 
   async getResourceInventory(runId: string): Promise<ResourceInventoryV1> {
-    const inventory = await this.bundles.getResourceInventory?.(runId);
+    const inventory =
+      (await this.bundles.getResourceInventory?.(runId)) ??
+      (await this.liveStateRepository().get(runId))?.resourceInventory;
     if (!inventory) {
       throw new Error(`Resource inventory for run "${runId}" was not found.`);
     }

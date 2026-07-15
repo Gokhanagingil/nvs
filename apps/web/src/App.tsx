@@ -534,6 +534,30 @@ interface LaunchResult {
   inventory?: ResourceInventory;
 }
 
+interface LiveRunAccepted {
+  schemaVersion: 'nvs.live-run-accepted/v1';
+  runId: string;
+  status: 'ACCEPTED';
+}
+
+const wait = (milliseconds: number) =>
+  new Promise<void>((resolve) => {
+    window.setTimeout(resolve, milliseconds);
+  });
+
+async function pollLiveRunProgress(runId: string): Promise<RunProgress> {
+  for (let attempt = 0; attempt < 180; attempt += 1) {
+    const progress = await apiRequest<RunProgress>(
+      `/api/runs/${encodeURIComponent(runId)}/progress`,
+    );
+    if (progress.status === 'COMPLETED' || progress.status === 'BLOCKED_REQUIRES_RECOVERY') {
+      return progress;
+    }
+    await wait(1000);
+  }
+  throw new Error('Live API run did not complete before the progress polling deadline.');
+}
+
 function RunCenterPage() {
   const [data, setData] = useState<Loadable<RunFormData>>({ status: 'loading' });
   const [runType, setRunType] = useState<'COMPILE_ONLY' | 'LIVE_API'>('COMPILE_ONLY');
@@ -614,6 +638,33 @@ function RunCenterPage() {
     if (!environmentId || !scenarioId) return;
     setLaunch({ status: 'loading' });
     try {
+      if (runType === 'LIVE_API') {
+        const accepted = await apiRequest<LiveRunAccepted>('/api/runs', {
+          method: 'POST',
+          body: JSON.stringify({
+            runType,
+            environmentId,
+            scenarioId,
+            variationValues,
+            confirmRealMutation: true,
+          }),
+        });
+        const progress = await pollLiveRunProgress(accepted.runId);
+        if (progress.status === 'BLOCKED_REQUIRES_RECOVERY') {
+          throw new Error('Live API run requires operator recovery before evidence can finalize.');
+        }
+        const [run, plan, scenario, inventory] = await Promise.all([
+          apiRequest<RunRecord>(`/api/runs/${encodeURIComponent(accepted.runId)}`),
+          apiRequest<ExecutablePlan>(`/api/runs/${encodeURIComponent(accepted.runId)}/plan`),
+          apiRequest<Scenario>(`/api/scenarios/${encodeURIComponent(scenarioId)}`),
+          apiRequest<ResourceInventory>(
+            `/api/runs/${encodeURIComponent(accepted.runId)}/inventory`,
+          ),
+        ]);
+        setLaunch({ status: 'ready', data: { run, plan, scenario, progress, inventory } });
+        return;
+      }
+
       const run = await apiRequest<RunRecord>('/api/runs', {
         method: 'POST',
         body: JSON.stringify({
@@ -621,7 +672,6 @@ function RunCenterPage() {
           environmentId,
           scenarioId,
           variationValues,
-          ...(runType === 'LIVE_API' ? { confirmRealMutation: true } : {}),
         }),
       });
       const [plan, scenario, progress, inventory] = await Promise.all([
@@ -634,7 +684,16 @@ function RunCenterPage() {
           ? apiRequest<ResourceInventory>(`/api/runs/${encodeURIComponent(run.runId)}/inventory`)
           : Promise.resolve(undefined),
       ]);
-      setLaunch({ status: 'ready', data: { run, plan, scenario, progress, inventory } });
+      setLaunch({
+        status: 'ready',
+        data: {
+          run,
+          plan,
+          scenario,
+          ...(progress ? { progress } : {}),
+          ...(inventory ? { inventory } : {}),
+        },
+      });
     } catch (error) {
       setLaunch({
         status: 'error',
@@ -745,8 +804,12 @@ function RunCenterPage() {
               }
             >
               {launch?.status === 'loading'
-                ? 'Compiling business plan…'
-                : 'Launch compile-only run'}
+                ? runType === 'LIVE_API'
+                  ? 'Running live API validation...'
+                  : 'Compiling business plan...'
+                : runType === 'LIVE_API'
+                  ? 'Launch live API run'
+                  : 'Launch compile-only run'}
             </button>
           </form>
 
@@ -757,7 +820,15 @@ function RunCenterPage() {
                 <p>Select a variation and launch a local NVS compile-only run.</p>
               </section>
             )}
-            {launch?.status === 'loading' && <LoadingPanel label="Compiling deterministic plan…" />}
+            {launch?.status === 'loading' && (
+              <LoadingPanel
+                label={
+                  runType === 'LIVE_API'
+                    ? 'Live API run accepted; polling runtime progress...'
+                    : 'Compiling deterministic plan...'
+                }
+              />
+            )}
             {launch?.status === 'empty' && <EmptyPanel message="No run result was returned." />}
             {launch?.status === 'error' && (
               <ErrorPanel
@@ -915,7 +986,8 @@ function LiveRunResult({ result }: { result: LaunchResult }) {
 }
 
 function CompileOnlyResult({ result }: { result: LaunchResult }) {
-  if (result.run.runType !== 'COMPILE_ONLY') return null;
+  const run = result.run;
+  if (run.runType !== 'COMPILE_ONLY') return null;
   const sourceSteps = new Map(result.scenario.steps.map((step) => [step.id, step]));
   return (
     <>
@@ -923,7 +995,7 @@ function CompileOnlyResult({ result }: { result: LaunchResult }) {
         <div>
           <p className="eyebrow">Compilation scope only</p>
           <h2>
-            <StatusBadge value={result.run.verdict} /> Plan generated
+            <StatusBadge value={run.verdict} /> Plan generated
           </h2>
         </div>
         <strong>Not release-gate eligible · gateEligible: false</strong>
@@ -943,7 +1015,7 @@ function CompileOnlyResult({ result }: { result: LaunchResult }) {
         <ol className="progress-list">
           {result.plan.steps.map((planStep) => {
             const businessStep = sourceSteps.get(planStep.source.blueprintStepId);
-            const resultStep = result.run.stepResults.find((step) => step.stepId === planStep.id);
+            const resultStep = run.stepResults.find((step) => step.stepId === planStep.id);
             return (
               <li key={planStep.id}>
                 <span className="progress-dot" aria-hidden="true">
@@ -1024,7 +1096,14 @@ function EvidenceExplorerPage() {
         ]);
         setDetail({
           status: 'ready',
-          data: { run, evidence, plan, scenario, progress, inventory },
+          data: {
+            run,
+            evidence,
+            plan,
+            scenario,
+            ...(progress ? { progress } : {}),
+            ...(inventory ? { inventory } : {}),
+          },
         });
       })
       .catch((error: unknown) => setDetail({ status: 'error', message: errorMessage(error) }));
@@ -1105,7 +1184,8 @@ function EvidenceManifestSection({ evidence }: { evidence: EvidenceManifest }) {
 }
 
 function EvidenceDetailView({ detail }: { detail: EvidenceDetail }) {
-  if (detail.run.runType === 'LIVE_API') {
+  const run = detail.run;
+  if (run.runType === 'LIVE_API') {
     return (
       <div className="evidence-layout">
         <LiveRunResult result={detail} />
@@ -1115,16 +1195,16 @@ function EvidenceDetailView({ detail }: { detail: EvidenceDetail }) {
   }
   const businessSteps = new Map(detail.scenario.steps.map((step) => [step.id, step]));
   const typedErrors = [
-    ...(detail.run.error ? [detail.run.error] : []),
-    ...detail.run.stepResults.flatMap((step) => (step.error ? [step.error] : [])),
+    ...(run.error ? [run.error] : []),
+    ...run.stepResults.flatMap((step) => (step.error ? [step.error] : [])),
   ];
 
   return (
     <div className="evidence-layout">
       <section className="scope-warning">
         <div className="status-pair">
-          <StatusBadge value={detail.run.verdict} />
-          <StatusBadge value={detail.run.assuranceScope} />
+          <StatusBadge value={run.verdict} />
+          <StatusBadge value={run.assuranceScope} />
         </div>
         <h2>Compile-only evidence · not a NILES release verdict</h2>
         <p>
@@ -1135,19 +1215,19 @@ function EvidenceDetailView({ detail }: { detail: EvidenceDetail }) {
           <div>
             <dt>Run ID</dt>
             <dd>
-              <code>{detail.run.runId}</code>
+              <code>{run.runId}</code>
             </dd>
           </div>
           <div>
             <dt>Correlation ID</dt>
             <dd>
-              <code>{detail.run.runId}</code> <small>(compile-only run scope)</small>
+              <code>{run.runId}</code> <small>(compile-only run scope)</small>
             </dd>
           </div>
           <div>
             <dt>Plan ID</dt>
             <dd>
-              <code>{detail.run.planId}</code>
+              <code>{run.planId}</code>
             </dd>
           </div>
         </dl>
@@ -1179,7 +1259,7 @@ function EvidenceDetailView({ detail }: { detail: EvidenceDetail }) {
         <ol className="plan-entry-list">
           {detail.plan.steps.map((step) => {
             const businessStep = businessSteps.get(step.source.blueprintStepId);
-            const resultStep = detail.run.stepResults.find((result) => result.stepId === step.id);
+            const resultStep = run.stepResults.find((result) => result.stepId === step.id);
             return (
               <li key={step.id}>
                 <div>

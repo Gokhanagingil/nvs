@@ -35,6 +35,8 @@ import type {
   ActorProfileRepository,
   ActorProfileSet,
   EnvironmentRepository,
+  LiveRunState,
+  LiveRunStateRepository,
   RunBundle,
   RunBundleRepository,
   ScenarioRepository,
@@ -280,6 +282,12 @@ const ALL_BUNDLE_DOCUMENTS = [...BASE_BUNDLE_DOCUMENTS, ...EXTRA_BUNDLE_DOCUMENT
 export interface BundlePersistenceHooks {
   afterWrite?(document: BundleDocument): Promise<void> | void;
   beforeCommit?(): Promise<void> | void;
+}
+
+type LiveStateDocument = 'plan.json' | 'checkpoint.json' | 'inventory.json' | 'observations.json';
+
+export interface LiveStatePersistenceHooks {
+  afterWrite?(document: LiveStateDocument, state: LiveRunState): Promise<void> | void;
 }
 
 interface PreparedBundle {
@@ -641,6 +649,136 @@ export class FilesystemRunBundleRepository implements RunBundleRepository {
   async getLiveCheckpoint(runId: string): Promise<LiveRunCheckpointV1 | undefined> {
     const bytes = await this.readOptionalDocument(runId, 'checkpoint.json');
     return bytes ? liveRunCheckpointV1Schema.parse(JSON.parse(bytes)) : undefined;
+  }
+}
+
+let liveStateSequence = 0;
+
+export class FilesystemLiveRunStateRepository implements LiveRunStateRepository {
+  constructor(
+    private readonly artifactRoot: string,
+    private readonly hooks: LiveStatePersistenceHooks = {},
+  ) {}
+
+  private root(): string {
+    return safeChild(this.artifactRoot, 'runs', '.inflight');
+  }
+
+  private directory(runId: string): string {
+    assertSafeId(runId);
+    return safeChild(this.root(), runId);
+  }
+
+  private async writeDocument(
+    directory: string,
+    document: LiveStateDocument,
+    bytes: string,
+    state: LiveRunState,
+  ): Promise<void> {
+    liveStateSequence += 1;
+    const temporary = safeChild(directory, `.tmp-${document}-${process.pid}-${liveStateSequence}`);
+    await writeFile(temporary, bytes, { encoding: 'utf8' });
+    await rename(temporary, safeChild(directory, document));
+    await this.hooks.afterWrite?.(document, state);
+  }
+
+  async save(state: LiveRunState): Promise<void> {
+    assertSafeId(state.runId);
+    const directory = this.directory(state.runId);
+    await mkdir(directory, { recursive: true });
+    const parsedState: LiveRunState = {
+      runId: state.runId,
+      plan: executablePlanV1Schema.parse(state.plan),
+      checkpoint: liveRunCheckpointV1Schema.parse(state.checkpoint),
+      resourceInventory: resourceInventoryV1Schema.parse(state.resourceInventory),
+      observations: stepObservationV1Schema.array().parse(state.observations),
+    };
+    await this.writeDocument(
+      directory,
+      'plan.json',
+      serializeForPersistence(parsedState.plan),
+      parsedState,
+    );
+    await this.writeDocument(
+      directory,
+      'checkpoint.json',
+      serializeForPersistence(parsedState.checkpoint),
+      parsedState,
+    );
+    await this.writeDocument(
+      directory,
+      'inventory.json',
+      serializeForPersistence(parsedState.resourceInventory),
+      parsedState,
+    );
+    await this.writeDocument(
+      directory,
+      'observations.json',
+      serializeForPersistence(parsedState.observations),
+      parsedState,
+    );
+  }
+
+  async get(runId: string): Promise<LiveRunState | undefined> {
+    const directory = this.directory(runId);
+    try {
+      const [planBytes, checkpointBytes, inventoryBytes, observationsBytes] = await Promise.all([
+        readFile(safeChild(directory, 'plan.json'), 'utf8'),
+        readFile(safeChild(directory, 'checkpoint.json'), 'utf8'),
+        readFile(safeChild(directory, 'inventory.json'), 'utf8'),
+        readFile(safeChild(directory, 'observations.json'), 'utf8'),
+      ]);
+      return {
+        runId,
+        plan: executablePlanV1Schema.parse(JSON.parse(planBytes)),
+        checkpoint: liveRunCheckpointV1Schema.parse(JSON.parse(checkpointBytes)),
+        resourceInventory: resourceInventoryV1Schema.parse(JSON.parse(inventoryBytes)),
+        observations: stepObservationV1Schema.array().parse(JSON.parse(observationsBytes)),
+      };
+    } catch (error) {
+      if (isMissing(error)) {
+        return undefined;
+      }
+      throw new StorageCorruptionError('Live run state', safeChild(directory, 'checkpoint.json'));
+    }
+  }
+
+  async listActive(): Promise<LiveRunState[]> {
+    let entries;
+    try {
+      entries = await readdir(this.root(), { withFileTypes: true });
+    } catch (error) {
+      if (isMissing(error)) {
+        return [];
+      }
+      throw error;
+    }
+    const states: LiveRunState[] = [];
+    for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
+      if (!entry.isDirectory() || !SAFE_ID_PATTERN.test(entry.name)) {
+        continue;
+      }
+      const state = await this.get(entry.name);
+      if (state && state.checkpoint.status !== 'COMPLETED') {
+        states.push(state);
+      }
+    }
+    return states;
+  }
+
+  async complete(runId: string): Promise<void> {
+    const state = await this.get(runId);
+    if (!state) {
+      return;
+    }
+    await this.save({
+      ...state,
+      checkpoint: liveRunCheckpointV1Schema.parse({
+        ...state.checkpoint,
+        status: 'COMPLETED',
+        updatedAt: new Date().toISOString(),
+      }),
+    });
   }
 }
 

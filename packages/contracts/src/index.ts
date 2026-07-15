@@ -987,6 +987,8 @@ export const stepObservationV1Schema = z
     sourceStepId: safeIdSchema,
     sequence: z.number().int().positive(),
     actorId: safeIdSchema,
+    semanticActorId: safeIdSchema.optional(),
+    actorProfileId: safeIdSchema.optional(),
     action: semanticActionSchema,
     status: z.enum(['PASS', 'FAIL', 'BLOCKED', 'NOT_OBSERVED']),
     startedAt: z.iso.datetime({ offset: true }),
@@ -1149,7 +1151,7 @@ export const liveRunCheckpointV1Schema = z
     runId: safeIdSchema,
     environmentId: safeIdSchema,
     fixtureId: safeIdSchema,
-    status: z.enum(['CREATED', 'RUNNING', 'COMPLETED']),
+    status: z.enum(['PREPARED', 'CREATED', 'RUNNING', 'COMPLETED', 'BLOCKED_REQUIRES_RECOVERY']),
     incidentId: z.uuid().optional(),
     completedStepIds: z.array(safeIdSchema),
     cleanup: z

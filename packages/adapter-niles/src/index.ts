@@ -725,6 +725,7 @@ export class NilesIncidentApiAdapter implements NilesIncidentLiveAdapter {
     tenantId: string;
     correlationId: string;
     runId: string;
+    runNamespacePrefix: string;
     requesterUserId: string;
     assignmentGroupId: string;
     serviceId: string;
@@ -738,7 +739,7 @@ export class NilesIncidentApiAdapter implements NilesIncidentLiveAdapter {
       path: '/grc/itsm/incidents',
       operation: 'create incident',
       body: {
-        shortDescription: `NVS ${input.runId} payment API degradation`,
+        shortDescription: `${input.runNamespacePrefix}-${input.runId} payment API degradation`,
         description:
           'Synthetic NVS live API validation for customer-facing payment API degradation.',
         category: 'software',
@@ -753,6 +754,7 @@ export class NilesIncidentApiAdapter implements NilesIncidentLiveAdapter {
           nvs: {
             schemaVersion: 'nvs.live-incident-metadata/v1',
             runId: input.runId,
+            runNamespacePrefix: input.runNamespacePrefix,
             synthetic: true,
           },
         },
@@ -837,6 +839,30 @@ export class NilesIncidentApiAdapter implements NilesIncidentLiveAdapter {
       operation: 'add affected CI',
       body: { ciId: input.ciId, relationshipType: 'affected', impactScope: 'service-impact' },
     });
+  }
+
+  listAffectedCis(input: {
+    environment: EnvironmentDefinitionV1;
+    session: ActorSession;
+    tenantId: string;
+    incidentId: string;
+    correlationId: string;
+  }): Promise<Array<{ ciId: string }>> {
+    return this.request({
+      ...input,
+      method: 'GET',
+      path: `/grc/itsm/incidents/${input.incidentId}/affected-cis`,
+      operation: 'list affected CIs',
+    }).then((payload) =>
+      asArrayPayload(payload).flatMap((record) => {
+        const value = asRecord(record) ?? {};
+        const ciId =
+          safeString(value['ciId']) ??
+          safeString(value['configurationItemId']) ??
+          safeString(asRecord(value['ci'])?.['id']);
+        return ciId ? [{ ciId }] : [];
+      }),
+    );
   }
 
   readSlaSummary(input: {

@@ -30,6 +30,8 @@ bootstrap_digest: <digest from the latest successful plan>
 confirmation: BOOTSTRAP_M1_02B_FIXTURES
 ```
 
+`apply` is intentionally manual and must never be started from an ordinary page render, scheduled workflow, deployment hook, or automatic retry.
+
 Before either operation, the workflow verifies:
 
 - the exact deployed NVS build SHA;

@@ -1,0 +1,95 @@
+name: one-shot diagnose corrected configuration approver patch
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/one-shot-diagnose-configuration-approver-v3.yml
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: fix/bootstrap-configuration-approver
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Reproduce corrected patch sequence
+        id: reproduce
+        continue-on-error: true
+        run: |
+          set +e
+          {
+            echo '== merge current main =='
+            git fetch origin main
+            git -c user.name=nvs-diagnostic -c user.email=nvs-diagnostic@users.noreply.github.com merge --no-edit origin/main
+            echo '== correct matcher =='
+            python3 - <<'PY'
+          from pathlib import Path
+          path = Path('tools/apply-bootstrap-configuration-approver-v2.py')
+          text = path.read_text(encoding='utf-8')
+          old = "   await writeFile(temporary, `${JSON.stringify(payload, null, 2)}\\n`, {"
+          print(f'matcher_count={text.count(old)}')
+          if text.count(old) != 1:
+              raise SystemExit('escaped-newline matcher was not unique')
+          path.write_text(text.replace(old, "   await writeFile(temporary, `${JSON.stringify(payload, null, 2)}\\\\n`, {", 1), encoding='utf-8')
+          PY
+            echo '== run patch =='
+            python3 tools/apply-bootstrap-configuration-approver-v2.py
+          } >"$RUNNER_TEMP/reproduce.log" 2>&1
+          status=$?
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Publish sanitized diagnostic
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STATUS: ${{ steps.reproduce.outputs.status }}
+        run: |
+          set -euo pipefail
+          body="$RUNNER_TEMP/diagnostic.md"
+          {
+            echo '# Sanitized corrected configuration approver patch diagnostic'
+            echo
+            echo "- Sequence exit status: \`${STATUS:-unavailable}\`"
+            echo
+            echo '```text'
+            tail -n 80 "$RUNNER_TEMP/reproduce.log" \
+              | sed -E 's#(/home/runner/work/)[^ ]+#<runner-path>#g' \
+              | sed -E 's/[0-9a-f]{32,}/<hex-redacted>/g'
+            echo '```'
+            echo
+            echo 'No staging secret, credential, token, UUID, payload, or private inventory was accessed.'
+          } > "$body"
+          gh issue edit 23 --repo "$GITHUB_REPOSITORY" \
+            --title '[Closed] Corrected configuration approver patch diagnostic' \
+            --body-file "$body"
+
+  cleanup:
+    needs: diagnose
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: main
+          persist-credentials: true
+          fetch-depth: 0
+      - run: |
+          set -euo pipefail
+          git config user.name 'nvs-maintenance-bot'
+          git config user.email 'nvs-maintenance-bot@users.noreply.github.com'
+          git pull --ff-only origin main
+          rm -f .github/workflows/one-shot-diagnose-configuration-approver-v3.yml
+          if git diff --quiet --exit-code; then exit 0; fi
+          git add .github/workflows/one-shot-diagnose-configuration-approver-v3.yml
+          git commit -m 'chore: remove completed configuration approver v3 diagnostic'
+          git push origin HEAD:main

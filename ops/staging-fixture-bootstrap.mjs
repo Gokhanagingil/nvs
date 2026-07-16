@@ -377,7 +377,7 @@ function policySnapshot(serviceId) {
     businessEndHour: 17,
     businessDays: [1, 2, 3, 4, 5],
     pauseOnStates: ['on_hold'],
-    stopOnStates: ['resolved', 'closed'],
+    stopOnStates: ['closed', 'resolved'],
     warningThresholdPct: 80,
     priorityWeight: 1000,
     stopProcessing: true,

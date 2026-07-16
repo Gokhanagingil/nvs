@@ -52,6 +52,8 @@ describe('staging fixture bootstrap assets', () => {
     expect(source).toContain("acknowledgement: 'PUBLISH_SLA_POLICY'");
     expect(source).toContain('/publish-requests/${approvalId}/approve');
     expect(source).toContain("operator: 'is', value: serviceId");
+    expect(source).toContain("stopOnStates: ['closed', 'resolved']");
+    expect(source).not.toContain("stopOnStates: ['resolved', 'closed']");
     expect(source).toContain('BUILTIN_PRODUCT_DEFAULT');
     expect(source).toContain('EMPTY_CATALOG_VALIDATION_BYPASS');
     expect(source).toContain("disposition: choice.existingId ? 'REUSED' : 'PRODUCT_DEFAULT'");

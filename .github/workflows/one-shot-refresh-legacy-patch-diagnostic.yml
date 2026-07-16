@@ -20,7 +20,7 @@ jobs:
       - name: Refresh temporary sanitized diagnostic issue
         env:
           GH_TOKEN: ${{ github.token }}
-          TARGET_HEAD_SHA: '11dfb8182b3c1f7043a9fd12d314871fc88fe681'
+          TARGET_HEAD_SHA: 'c1f724f5adf43ea44a63822f2bb4202c8601777e'
         run: |
           set -euo pipefail
           repo="$GITHUB_REPOSITORY"
@@ -49,7 +49,7 @@ jobs:
           fi
           body="$RUNNER_TEMP/legacy-patch-diagnostic.md"
           {
-            echo 'Temporary sanitized diagnostic for the exact legacy assignment patch workflow run.'
+            echo 'Temporary sanitized diagnostic for the valid legacy assignment patch workflow run.'
             echo
             echo '```json'
             printf '%s\n' "$run_json"

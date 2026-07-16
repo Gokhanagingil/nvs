@@ -52,4 +52,9 @@ replaceExact(
   'active/held SLA evidence',
 );
 
+source = source.replace(
+  "await edit('config/fixtures/niles-incident.staging.example.yaml'",
+  "await edit('fixtures/niles-incident/staging.example.yaml'",
+);
+
 await writeFile(path, source, 'utf8');

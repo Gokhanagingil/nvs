@@ -202,7 +202,9 @@ async function ensureConfigurationApprover(context, current) {
           role: 'admin',
           isActive: true,
           isGlobalAdmin: false,
-          hasItsmAccess: true,
+          domainAccessGrc: false,
+          domainAccessItsm: true,
+          domainAccessSpace: false,
           mustChangePassword: false,
         },
         undefined,
@@ -255,7 +257,41 @@ async function ensureConfigurationApprover(context, current) {
         raise SystemExit(f'applyPlan helper insertion marker count={text.count(marker)}')
     text = text.replace(marker, helpers + marker, 1)
 
+# Enforce the actual frozen CreateUserDto field names and least-privilege domains.
+legacy_access = "          hasItsmAccess: true,\n"
+if legacy_access in text:
+    text = text.replace(
+        legacy_access,
+        """          domainAccessGrc: false,
+          domainAccessItsm: true,
+          domainAccessSpace: false,
+""",
+        1,
+    )
+if 'hasItsmAccess:' in text:
+    raise SystemExit('retired hasItsmAccess field remains in bootstrap source')
+for required in (
+    'domainAccessGrc: false',
+    'domainAccessItsm: true',
+    'domainAccessSpace: false',
+):
+    if required not in text:
+        raise SystemExit(f'missing least-privilege user field: {required}')
+
 target.write_text(text, encoding='utf-8')
+
+test_path = Path('tests/staging-fixture-bootstrap-assets.test.ts')
+test_text = test_path.read_text(encoding='utf-8')
+needle = "    expect(source).toContain('mustChangePassword: false');\n"
+replacement = """    expect(source).toContain('mustChangePassword: false');
+    expect(source).toContain('domainAccessGrc: false');
+    expect(source).toContain('domainAccessItsm: true');
+    expect(source).toContain('domainAccessSpace: false');
+    expect(source).not.toContain('hasItsmAccess:');
+"""
+if needle not in test_text:
+    raise SystemExit('user DTO regression insertion point was not found')
+test_path.write_text(test_text.replace(needle, replacement, 1), encoding='utf-8')
 PY
 
 rm -f \

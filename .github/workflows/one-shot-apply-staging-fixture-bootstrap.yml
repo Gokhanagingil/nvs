@@ -9,29 +9,28 @@ on:
 
 permissions:
   actions: write
-  contents: read
+  contents: write
   issues: write
 
-concurrency:
-  group: nvs-one-shot-bootstrap-apply
-  cancel-in-progress: false
-
 jobs:
-  dispatch:
-    if: github.actor != 'github-actions[bot]'
+  apply:
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
-      - name: Dispatch authorized bootstrap apply and publish sanitized result
+      - name: Check out main for self-cleanup
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: main
+          persist-credentials: true
+          fetch-depth: 0
+
+      - name: Dispatch and publish the authorized bootstrap apply
         env:
           GH_TOKEN: ${{ github.token }}
-          EXPECTED_SHA: 30617d6c576b921607c607c27a2a4d401a1303ed
-          BOOTSTRAP_DIGEST: 4853c7caa852450e9decb08d8d74985822296450a89c7a67d63d069aaa97c419
         run: |
           set -euo pipefail
           repo="$GITHUB_REPOSITORY"
-
-          previous_run_id="$(
+          previous="$(
             gh run list \
               --repo "$repo" \
               --workflow staging-fixture-bootstrap.yml \
@@ -47,12 +46,12 @@ jobs:
             --ref main \
             --field operation=apply \
             --field environment_id=staging-example \
-            --field expected_sha="$EXPECTED_SHA" \
-            --field bootstrap_digest="$BOOTSTRAP_DIGEST" \
+            --field expected_sha=30617d6c576b921607c607c27a2a4d401a1303ed \
+            --field bootstrap_digest=4853c7caa852450e9decb08d8d74985822296450a89c7a67d63d069aaa97c419 \
             --field confirmation=BOOTSTRAP_M1_02B_FIXTURES
 
           run_id=''
-          for _attempt in $(seq 1 45); do
+          for _attempt in $(seq 1 60); do
             sleep 2
             candidate="$(
               gh run list \
@@ -64,53 +63,63 @@ jobs:
                 --json databaseId \
                 --jq '.[0].databaseId // 0'
             )"
-            if [[ "$candidate" != '0' && "$candidate" != "$previous_run_id" ]]; then
+            if [[ "$candidate" != '0' && "$candidate" != "$previous" ]]; then
               run_id="$candidate"
               break
             fi
           done
-
-          if [[ -z "$run_id" ]]; then
-            echo 'The authorized staging fixture bootstrap run could not be identified.' >&2
-            exit 1
-          fi
+          [[ -n "$run_id" ]]
 
           set +e
           gh run watch "$run_id" --repo "$repo" --exit-status
-          target_status=$?
+          run_status=$?
           set -e
 
-          result_dir="$RUNNER_TEMP/bootstrap-result"
+          result_dir="$RUNNER_TEMP/bootstrap-apply"
           mkdir -p "$result_dir"
-          artifact_name="nvs-staging-fixture-bootstrap-${run_id}-1"
-          download_status=0
+          set +e
           gh run download "$run_id" \
             --repo "$repo" \
-            --name "$artifact_name" \
-            --dir "$result_dir" || download_status=$?
+            --name "nvs-staging-fixture-bootstrap-${run_id}-1" \
+            --dir "$result_dir"
+          download_status=$?
+          set -e
 
-          body="$RUNNER_TEMP/bootstrap-apply-result.md"
+          metadata="$(gh run view "$run_id" --repo "$repo" --json databaseId,status,conclusion,url,headSha,createdAt)"
+          body="$RUNNER_TEMP/bootstrap-apply.md"
           {
             echo '# Sanitized deterministic fixture bootstrap apply'
             echo
-            echo "- Workflow run ID: \`$run_id\`"
-            echo "- Workflow exit status: \`$target_status\`"
-            echo "- Authorized confirmation: \`BOOTSTRAP_M1_02B_FIXTURES\`"
+            echo "- Workflow exit status: \`$run_status\`"
+            echo '- Authorized confirmation: `BOOTSTRAP_M1_02B_FIXTURES`'
+            echo
+            echo '```json'
+            printf '%s\n' "$metadata"
+            echo '```'
             echo
             if [[ "$download_status" -eq 0 && -f "$result_dir/nvs-staging-fixture-bootstrap.md" ]]; then
               cat "$result_dir/nvs-staging-fixture-bootstrap.md"
             else
-              echo '**Result:** SANITIZED_ARTIFACT_UNAVAILABLE'
-              echo
-              echo 'The workflow completed, but its sanitized result artifact could not be downloaded.'
+              echo '**Sanitized bootstrap artifact:** unavailable'
             fi
           } > "$body"
 
-          gh api \
-            --method PATCH \
-            "repos/${repo}/issues/23" \
-            --raw-field 'title=[Closed] Sanitized deterministic fixture bootstrap apply' \
-            --raw-field "body=$(cat "$body")" \
-            >/dev/null
+          gh issue edit 23 \
+            --repo "$repo" \
+            --title '[Closed] Sanitized deterministic fixture bootstrap apply' \
+            --body-file "$body"
 
-          exit "$target_status"
+          exit "$run_status"
+
+      - name: Remove this one-shot workflow
+        if: always()
+        run: |
+          set -euo pipefail
+          git config user.name 'nvs-maintenance-bot'
+          git config user.email 'nvs-maintenance-bot@users.noreply.github.com'
+          git pull --ff-only origin main
+          rm -f .github/workflows/one-shot-apply-staging-fixture-bootstrap.yml
+          if git diff --quiet --exit-code; then exit 0; fi
+          git add .github/workflows/one-shot-apply-staging-fixture-bootstrap.yml
+          git commit -m 'chore: remove completed bootstrap apply dispatcher'
+          git push origin HEAD:main

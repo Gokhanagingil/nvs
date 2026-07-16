@@ -1,0 +1,111 @@
+name: one-shot publish latest staging result
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/one-shot-publish-latest-staging-result.yml
+
+permissions:
+  actions: read
+  contents: write
+  issues: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out main for self-cleanup
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: main
+          persist-credentials: true
+          fetch-depth: 0
+
+      - name: Publish only sanitized deployment and fixture results
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          repo="$GITHUB_REPOSITORY"
+          result_dir="$RUNNER_TEMP/latest-fixture"
+          mkdir -p "$result_dir"
+
+          deploy_json="$(
+            gh run list \
+              --repo "$repo" \
+              --workflow deploy-staging.yml \
+              --branch main \
+              --event workflow_dispatch \
+              --limit 1 \
+              --json databaseId,status,conclusion,url,headSha,createdAt \
+              --jq '.[0]'
+          )"
+          fixture_json="$(
+            gh run list \
+              --repo "$repo" \
+              --workflow staging-fixture.yml \
+              --branch main \
+              --event workflow_dispatch \
+              --limit 1 \
+              --json databaseId,status,conclusion,url,headSha,createdAt \
+              --jq '.[0]'
+          )"
+          fixture_run_id="$(printf '%s' "$fixture_json" | jq -r '.databaseId // empty')"
+          download_status=1
+          if [[ -n "$fixture_run_id" ]]; then
+            set +e
+            gh run download "$fixture_run_id" \
+              --repo "$repo" \
+              --name "nvs-staging-fixture-${fixture_run_id}-1" \
+              --dir "$result_dir"
+            download_status=$?
+            set -e
+          fi
+
+          body_file="$RUNNER_TEMP/staging-result.md"
+          {
+            echo '# Sanitized latest staging operation result'
+            echo
+            echo 'This closed scratch issue contains only safe GitHub Actions metadata and the sanitized fixture operator artifact. It contains no UUID, credential, token, raw payload, or server-owned proposal file.'
+            echo
+            echo '## Deployment'
+            echo
+            echo '```json'
+            printf '%s\n' "$deploy_json"
+            echo '```'
+            echo
+            echo '## Fixture plan'
+            echo
+            echo '```json'
+            printf '%s\n' "$fixture_json"
+            echo '```'
+            echo
+            if [[ "$download_status" -eq 0 && -f "$result_dir/nvs-staging-fixture.md" ]]; then
+              cat "$result_dir/nvs-staging-fixture.md"
+            else
+              echo '**Sanitized fixture artifact:** unavailable'
+            fi
+          } > "$body_file"
+
+          gh issue edit 23 \
+            --repo "$repo" \
+            --title '[Closed] Sanitized latest staging operation result' \
+            --body-file "$body_file"
+
+      - name: Remove this one-shot workflow
+        if: always()
+        run: |
+          set -euo pipefail
+          git config user.name 'nvs-maintenance-bot'
+          git config user.email 'nvs-maintenance-bot@users.noreply.github.com'
+          git pull --ff-only origin main
+          rm -f .github/workflows/one-shot-publish-latest-staging-result.yml
+          if git diff --quiet --exit-code; then
+            exit 0
+          fi
+          git add .github/workflows/one-shot-publish-latest-staging-result.yml
+          git commit -m 'chore: remove completed staging result publisher'
+          git push origin HEAD:main

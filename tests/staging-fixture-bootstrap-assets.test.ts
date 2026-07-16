@@ -60,6 +60,14 @@ describe('staging fixture bootstrap assets', () => {
     expect(source).toContain('includeInactive=true');
     expect(source).toContain('safeString(match?.runtimeDefinitionId)');
     expect(source).toContain('ownedBy: serviceDesk.userId');
+    expect(source).toContain('CREATE_CONFIGURATION_APPROVER');
+    expect(source).toContain('RECOVER_CONFIGURATION_APPROVER');
+    expect(source).toContain("role: 'admin'");
+    expect(source).toContain('mustChangePassword: false');
+    expect(source).toContain('APPROVER_CREDENTIAL_SCHEMA');
+    expect(source).toContain('CONFIGURATION_APPROVER_SELF_APPROVAL_FORBIDDEN');
+    expect(source).toContain('configurationApprover?.session');
+    expect(source).not.toContain('const { admin, manager }');
     expect(source).not.toContain("'/grc/itsm/choices',");
     expect(source).not.toContain('CREATE_CHOICE_');
     expect(source.match(/'x-correlation-id': randomUUID\(\)/g)).toHaveLength(2);
@@ -74,6 +82,8 @@ describe('staging fixture bootstrap assets', () => {
     expect(source).toContain('BOOTSTRAP_DIGEST_MISMATCH');
     expect(source).toContain('INVENTORY_PATH');
     expect(source).toContain('mode: 0o600');
+    expect(source).toContain("filePath.startsWith('/app/data/bootstrap/')");
+    expect(source).not.toMatch(/console\.(log|error)\([^)]*password/);
     expect(source).not.toContain("method: 'DELETE'");
     expect(source).not.toContain("'DELETE',");
     expect(workflowSource).not.toContain('/app/data/bootstrap/staging-fixture-bootstrap.json');

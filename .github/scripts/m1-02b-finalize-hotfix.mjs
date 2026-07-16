@@ -56,5 +56,9 @@ source = source.replace(
   "await edit('config/fixtures/niles-incident.staging.example.yaml'",
   "await edit('fixtures/niles-incident/staging.example.yaml'",
 );
+source = source.replace(
+  "const anchor = \"  it('classifies a real HTTP 502 as retryable upstream failure rather than malformed response', async () => {\";",
+  "const anchor = \"  it('parses affected-CI paginated object envelopes', async () => {\";",
+);
 
 await writeFile(path, source, 'utf8');

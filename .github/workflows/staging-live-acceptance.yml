@@ -74,7 +74,7 @@ jobs:
           printf '%s\n' "$SSH_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
           chmod 0600 "$HOME/.ssh/id_nvs_staging" "$HOME/.ssh/known_hosts"
 
-      - name: Transfer reviewed live acceptance runner
+      - name: Transfer reviewed live acceptance runners
         id: remote
         env:
           SSH_HOST: ${{ secrets.NVS_STAGING_SSH_HOST }}
@@ -93,8 +93,32 @@ jobs:
           remote="${SSH_USER}@${SSH_HOST}"
           remote_dir="/tmp/nvs-live-acceptance-${RUN_ID}-${RUN_ATTEMPT}"
           ssh "${ssh_options[@]}" "$remote" "install -d -m 0700 '$remote_dir'"
-          scp "${ssh_options[@]}" ops/staging-live-acceptance.py "${remote}:${remote_dir}/"
+          scp "${ssh_options[@]}" \
+            ops/staging-live-preflight.py \
+            ops/staging-live-acceptance.py \
+            "${remote}:${remote_dir}/"
           echo "remote_dir=$remote_dir" >> "$GITHUB_OUTPUT"
+
+      - name: Prove fixture readiness before mutation lease
+        env:
+          SSH_HOST: ${{ secrets.NVS_STAGING_SSH_HOST }}
+          SSH_USER: ${{ secrets.NVS_STAGING_SSH_USER }}
+          ENVIRONMENT_ID: ${{ inputs.environment_id }}
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          REMOTE_DIR: ${{ steps.remote.outputs.remote_dir }}
+        run: |
+          set -euo pipefail
+          ssh_options=(
+            -i "$HOME/.ssh/id_nvs_staging"
+            -o BatchMode=yes
+            -o IdentitiesOnly=yes
+            -o StrictHostKeyChecking=yes
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts"
+          )
+          printf -v environment_q '%q' "$ENVIRONMENT_ID"
+          printf -v expected_q '%q' "$EXPECTED_SHA"
+          ssh "${ssh_options[@]}" "${SSH_USER}@${SSH_HOST}" \
+            "python3 '$REMOTE_DIR/staging-live-preflight.py' --environment-id $environment_q --expected-sha $expected_q"
 
       - name: Execute one guarded real Incident journey
         id: live

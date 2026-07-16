@@ -18,6 +18,7 @@ const containerDiscoveryPath = path.join(root, 'ops', 'staging-fixture-discovery
 const fixturePlanPath = path.join(root, 'ops', 'staging-fixture-plan.py');
 const fixtureApplyPath = path.join(root, 'ops', 'staging-fixture-apply.py');
 const fixtureApplyGuardPath = path.join(root, 'ops', 'staging-fixture-apply-guard.py');
+const livePreflightPath = path.join(root, 'ops', 'staging-live-preflight.py');
 const liveAcceptancePath = path.join(root, 'ops', 'staging-live-acceptance.py');
 
 describe('browser-triggered staging operator assets', () => {
@@ -54,7 +55,7 @@ describe('browser-triggered staging operator assets', () => {
     expect(workflow).not.toContain('set -x');
   });
 
-  it('requires an explicit live confirmation and unconditional mutation cleanup', () => {
+  it('requires static fixture readiness, explicit live confirmation, and unconditional cleanup', () => {
     const workflow = readFileSync(acceptanceWorkflowPath, 'utf8');
 
     expect(workflow).toContain('workflow_dispatch:');
@@ -63,6 +64,8 @@ describe('browser-triggered staging operator assets', () => {
     expect(workflow).toContain('environment: staging');
     expect(workflow).toContain('RUN_M1_02B_LIVE_INCIDENT');
     expect(workflow).toContain('group: nvs-staging-control');
+    expect(workflow).toContain('staging-live-preflight.py');
+    expect(workflow).toContain('Prove fixture readiness before mutation lease');
     expect(workflow).toContain('force-disable');
     expect(workflow).toContain('if: always()');
     expect(workflow).not.toContain('pull_request:');
@@ -76,6 +79,7 @@ describe('browser-triggered staging operator assets', () => {
       fixturePlanPath,
       fixtureApplyPath,
       fixtureApplyGuardPath,
+      livePreflightPath,
       liveAcceptancePath,
     ]) {
       const python = spawnSync(
@@ -105,6 +109,7 @@ describe('browser-triggered staging operator assets', () => {
     const plan = readFileSync(fixturePlanPath, 'utf8');
     const apply = readFileSync(fixtureApplyPath, 'utf8');
     const guard = readFileSync(fixtureApplyGuardPath, 'utf8');
+    const preflight = readFileSync(livePreflightPath, 'utf8');
     const acceptance = readFileSync(liveAcceptancePath, 'utf8');
 
     expect(discovery).toContain("schemaVersion: 'nvs.staging-fixture-discovery/v1'");
@@ -116,6 +121,8 @@ describe('browser-triggered staging operator assets', () => {
     expect(plan).not.toContain('print(service)');
     expect(apply).not.toContain('NVS_ENABLE_NILES_MUTATIONS=true');
     expect(guard).toContain('fixture application requires NVS mutations to remain disabled');
+    expect(preflight).toContain('NILES_MUTATIONS_DISABLED');
+    expect(preflight).not.toContain('/auth/login');
     expect(acceptance).toContain('No credential, bearer token, raw payload, Incident UUID');
     expect(acceptance).toContain('NVS_ENABLE_NILES_MUTATIONS');
     expect(acceptance).toContain('LEASE_TTL_SECONDS');

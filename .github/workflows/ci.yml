@@ -108,16 +108,43 @@ jobs:
 
           patch = Path('tools/.tmp-apply-bootstrap-configuration-approver.py')
           text = patch.read_text(encoding='utf-8')
-          marker = '''replace_once(
+
+          def remove_to_next(text: str, start_marker: str, end_marker: str, label: str, *, skip: int = 0) -> str:
+              start = text.find(start_marker)
+              if start < 0:
+                  raise SystemExit(f'{label} start was not found')
+              end = text.find(end_marker, start + len(start_marker))
+              if end < 0:
+                  raise SystemExit(f'{label} end was not found')
+              return text[:start] + text[end + skip:]
+
+          text = remove_to_next(
+              text,
+              '''replace_once(
               bootstrap,
-              """async function atomicInventory(payload) {'''
-          start = text.find(marker)
-          if start < 0:
-              raise SystemExit('atomicInventory patch block start was not found')
-          end = text.find('\n\nreplace_once(', start + len(marker))
-          if end < 0:
-              raise SystemExit('atomicInventory patch block end was not found')
-          patch.write_text(text[:start] + text[end + 2:], encoding='utf-8')
+              """async function atomicInventory(payload) {''',
+              '\n\nreplace_once(',
+              'atomicInventory patch block',
+              skip=2,
+          )
+          text = remove_to_next(
+              text,
+              '''regex_once(
+              bootstrap,
+              r"  const adminProfile = profile\\('tenant-admin'\\);''',
+              '\nreplace_once(\n    bootstrap,\n    """    for (const session of [',
+              'legacy loadContext patch block',
+          )
+          text = remove_to_next(
+              text,
+              '''replace_once(
+              bootstrap,
+              """    for (const session of [''',
+              '\n\ntest = "tests/staging-fixture-bootstrap-assets.test.ts"',
+              'legacy session cleanup patch block',
+              skip=2,
+          )
+          patch.write_text(text, encoding='utf-8')
           PY
 
           python3 tools/.tmp-apply-bootstrap-configuration-approver.py
@@ -128,16 +155,69 @@ jobs:
 
           target = Path('ops/staging-fixture-bootstrap.mjs')
           text = target.read_text(encoding='utf-8')
+
           pattern = r"async function atomicInventory\(payload\) \{.*?\n\}\n\nasync function applyPlan"
           replacement = """async function atomicInventory(payload) {
             await writePrivateJson(INVENTORY_PATH, payload);
           }
 
           async function applyPlan"""
-          next_text, count = re.subn(pattern, replacement, text, count=1, flags=re.DOTALL)
+          text, count = re.subn(pattern, replacement, text, count=1, flags=re.DOTALL)
           if count != 1:
               raise SystemExit(f'atomicInventory source replacement count={count}')
-          target.write_text(next_text, encoding='utf-8')
+
+          old = """  const adminProfile = profile('tenant-admin');
+          const managerProfile = profile('incident-manager');
+          const serviceDeskProfile = profile('service-desk-agent');
+          if (!adminProfile || !managerProfile || !serviceDeskProfile) {
+            throw new BootstrapError(
+              'ACTOR_PROFILE_MISSING',
+              'Required staging actor profiles are unavailable.',
+            );
+          }
+          const tenantId = requireUuid('fixture tenant', adminProfile.tenantId);
+          for (const actor of [adminProfile, managerProfile, serviceDeskProfile]) {
+            if (!actor.credentialRef || actor.tenantId !== tenantId) {
+              throw new BootstrapError(
+                'ACTOR_PROFILE_INVALID',
+                'A required staging actor profile is invalid.',
+              );
+            }
+          }
+          const sessions = {
+            admin: await login(baseUrl, adminProfile, tenantId),
+            manager: await login(baseUrl, managerProfile, tenantId),
+            serviceDesk: await login(baseUrl, serviceDeskProfile, tenantId),
+          };
+          return { baseUrl, tenantId, sessions };
+          """
+          new = """  const adminProfile = profile('tenant-admin');
+          const serviceDeskProfile = profile('service-desk-agent');
+          if (!adminProfile || !serviceDeskProfile) {
+            throw new BootstrapError(
+              'ACTOR_PROFILE_MISSING',
+              'Required staging actor profiles are unavailable.',
+            );
+          }
+          const tenantId = requireUuid('fixture tenant', adminProfile.tenantId);
+          for (const actor of [adminProfile, serviceDeskProfile]) {
+            if (!actor.credentialRef || actor.tenantId !== tenantId) {
+              throw new BootstrapError(
+                'ACTOR_PROFILE_INVALID',
+                'A required staging actor profile is invalid.',
+              );
+            }
+          }
+          const sessions = {
+            admin: await login(baseUrl, adminProfile, tenantId),
+            serviceDesk: await login(baseUrl, serviceDeskProfile, tenantId),
+          };
+          return { baseUrl, tenantId, sessions };
+          """
+          if text.count(old) != 1:
+              raise SystemExit(f'loadContext source replacement count={text.count(old)}')
+          text = text.replace(old, new, 1)
+          target.write_text(text, encoding='utf-8')
           PY
 
           rm -f \

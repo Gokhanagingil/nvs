@@ -1,5 +1,5 @@
-packages/core/src/index.ts 398ms
-tests/live-incident.test.ts 158ms
+packages/core/src/index.ts 436ms
+tests/live-incident.test.ts 175ms
 $ corepack pnpm format:check && corepack pnpm lint && corepack pnpm typecheck && corepack pnpm test && corepack pnpm build && corepack pnpm test:e2e
 $ prettier --check "apps/**/*.{ts,tsx,css,json,html}" "packages/**/*.{ts,tsx,json}" "scripts/**/*.{ts,tsx}" "tests/**/*.{ts,tsx}" "e2e/**/*.{ts,tsx}" ".github/**/*.yml" "actors/**/*.yaml" "environments/**/*.yaml" "fixtures/**/*.yaml" "scenarios/**/*.yaml" "*.{ts,json,js,yaml,yml}"
 Checking formatting...

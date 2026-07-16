@@ -80,7 +80,10 @@ jobs:
           node-version: 24.18.0
           cache: pnpm
       - name: Apply final blocker fixes
-        run: node .github/scripts/m1-02b-finalize.mjs
+        run: |
+          node .github/scripts/m1-02b-finalize-hotfix.mjs
+          node .github/scripts/m1-02b-finalize.mjs
+          rm -f .github/scripts/m1-02b-finalize-hotfix.mjs
       - run: pnpm install --frozen-lockfile
       - run: pnpm exec playwright install --with-deps chromium
       - name: Verify transformed tree

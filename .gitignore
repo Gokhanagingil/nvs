@@ -10,6 +10,8 @@ environments/*.override.yaml
 actors/local/
 actors/**/*.local.yaml
 actors/**/*.override.yaml
+fixtures/**/*.local.yaml
+fixtures/**/*.override.yaml
 .env
 .env.*
 !.env.example

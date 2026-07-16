@@ -481,6 +481,55 @@ dd {
   font-size: 0.84rem;
 }
 
+.live-readiness {
+  display: grid;
+  gap: 0.8rem;
+  padding: 1rem;
+  border: 1px solid #e2bd73;
+  border-radius: 0.7rem;
+  background: var(--amber-soft);
+}
+
+.live-readiness.pass {
+  border-color: #b7d4be;
+  background: #f2faf3;
+}
+
+.live-readiness h3 {
+  margin: 0.25rem 0 0;
+  font-size: 0.95rem;
+}
+
+.live-readiness ul {
+  display: grid;
+  gap: 0.55rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.live-readiness li {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 0.45rem 0.6rem;
+  align-items: center;
+  font-size: 0.82rem;
+}
+
+.live-readiness li code {
+  grid-column: 2;
+}
+
+.checkbox-field {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 0.7rem;
+  align-items: start;
+  color: #33423b;
+  font-size: 0.86rem;
+  line-height: 1.45;
+}
+
 .state-panel {
   display: grid;
   min-height: 145px;

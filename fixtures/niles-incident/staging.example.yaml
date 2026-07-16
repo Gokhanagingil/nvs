@@ -1,0 +1,48 @@
+schemaVersion: nvs.niles-incident-fixture/v1
+id: fixture.incident-payment
+environmentId: staging-example
+enabled: false
+tenantId: 33333333-3333-4333-8333-333333333333
+runNamespacePrefix: nvs-m1-02b
+scenarioAllowlist:
+  - scenarioId: payment-api-service-degradation
+    variationValues:
+      journey: normal
+resources:
+  assignmentGroup:
+    id: 44444444-4444-4444-8444-444444444444
+    label: Synthetic Service Desk group
+  service:
+    id: 55555555-5555-4555-8555-555555555555
+    label: Synthetic Payment API service
+  offering:
+    id: 66666666-6666-4666-8666-666666666666
+    label: Synthetic payment transaction offering
+  configurationItem:
+    id: 77777777-7777-4777-8777-777777777777
+    label: Synthetic Payment API CI
+  affectedCi:
+    relationshipType: affected_by
+    impactScope: service_impacting
+  impact: high
+  urgency: high
+  expectedPriority: p1
+  hold:
+    pendingReason: pending_external_dependency
+    pendingReasonDetail: Waiting for payment provider diagnostics.
+  resolutionNotes: Synthetic provider remediation restored payment authorization successfully.
+  closeAuthority:
+    strategy: BLOCK_IF_UNSATISFIABLE
+    requesterMustHaveIncidentWrite: false
+  sla:
+    required: true
+    policyRef: fixture.payment-api-sla
+    objectiveTypes: [response, resolution]
+cleanup:
+  onPass: RETAIN_CLOSED
+  onFail: RETAIN_FOR_DIAGNOSIS
+  onBlockedBeforeClose: DELETE_IF_RUN_OWNED
+provenance:
+  source: Sanitized M1-02B fixture shape; replace UUIDs only in non-committed overrides.
+  grcCommit: 33af470e10fa753b79e092d9a99ef4f570854b10
+  reviewedAt: 2026-07-15T00:00:00+00:00

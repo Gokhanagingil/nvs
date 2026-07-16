@@ -10,6 +10,12 @@ import {
   type ActorSession,
   type AuthenticationCredential,
   type EnvironmentProbe,
+  type NilesFixtureResource,
+  type NilesIncidentLiveAdapter,
+  type NilesIncidentRecord,
+  type NilesJournalSummary,
+  type NilesSlaSummary,
+  type NilesTransportEvidence,
 } from '@nvs/core';
 
 export type FetchImplementation = (
@@ -71,9 +77,13 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
     : undefined;
 }
 
-function unwrapPayload(value: unknown): Record<string, unknown> | undefined {
+function unwrapPayload(value: unknown): unknown {
   const root = asRecord(value);
-  return asRecord(root?.['data']) ?? root;
+  return root && 'data' in root ? root['data'] : value;
+}
+
+function payloadObject(value: unknown): Record<string, unknown> | undefined {
+  return asRecord(unwrapPayload(value));
 }
 
 async function readJson(response: Response): Promise<unknown> {
@@ -105,7 +115,7 @@ async function optionalReadiness(
       );
       return {
         response,
-        payload: response.ok ? unwrapPayload(await readJson(response)) : undefined,
+        payload: response.ok ? payloadObject(await readJson(response)) : undefined,
       };
     });
     if (!response.ok) {
@@ -229,7 +239,7 @@ async function optionalVersion(
       );
       return {
         response,
-        payload: response.ok ? unwrapPayload(await readJson(response)) : undefined,
+        payload: response.ok ? payloadObject(await readJson(response)) : undefined,
       };
     });
     if (!response.ok) {
@@ -581,5 +591,643 @@ export class NilesAuthenticationAdapter implements ActorAuthenticator {
       input.correlationId,
       accessToken,
     );
+  }
+}
+
+class NilesLiveAdapterOperationError extends Error {
+  readonly code: string;
+  readonly category: 'PRODUCT' | 'ADAPTER' | 'ENVIRONMENT';
+  readonly retryable: boolean;
+
+  constructor(
+    readonly status: number | undefined,
+    operation: string,
+    readonly transport?: NilesTransportEvidence,
+    kind?: 'network' | 'timeout' | 'malformed',
+  ) {
+    super(`NILES live API operation failed: ${operation}.`);
+    this.name = 'NilesLiveAdapterOperationError';
+    if (kind === 'timeout') {
+      this.code = 'NILES_TIMEOUT';
+      this.category = 'ADAPTER';
+      this.retryable = true;
+    } else if (kind === 'network') {
+      this.code = 'NILES_NETWORK_FAILURE';
+      this.category = 'ADAPTER';
+      this.retryable = true;
+    } else if (kind === 'malformed') {
+      this.code = 'NILES_MALFORMED_RESPONSE';
+      this.category = 'ADAPTER';
+      this.retryable = false;
+    } else if (status === 400) {
+      this.code = 'NILES_PRODUCT_RULE_REJECTED';
+      this.category = 'PRODUCT';
+      this.retryable = false;
+    } else if (status === 401 || status === 403) {
+      this.code = 'NILES_AUTHORIZATION_DENIED';
+      this.category = 'ENVIRONMENT';
+      this.retryable = false;
+    } else if (status === 404) {
+      this.code = 'NILES_RESOURCE_MISSING';
+      this.category = 'ENVIRONMENT';
+      this.retryable = false;
+    } else if (status === 409) {
+      this.code = 'NILES_CONFLICT';
+      this.category = 'PRODUCT';
+      this.retryable = false;
+    } else if (status === 429) {
+      this.code = 'NILES_RATE_LIMITED';
+      this.category = 'ADAPTER';
+      this.retryable = true;
+    } else if (typeof status === 'number' && status >= 500) {
+      this.code = 'NILES_UPSTREAM_FAILURE';
+      this.category = 'ADAPTER';
+      this.retryable = true;
+    } else {
+      this.code = 'NILES_LIVE_HTTP_FAILURE';
+      this.category = 'ADAPTER';
+      this.retryable = false;
+    }
+  }
+}
+
+function safeString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function normalizeIncident(
+  value: unknown,
+  transport?: NilesTransportEvidence,
+): NilesIncidentRecord {
+  const payload = payloadObject(value);
+  const id = safeString(payload?.['id']);
+  if (!id || !UUID_PATTERN.test(id)) {
+    throw new NilesLiveAdapterOperationError(
+      transport?.httpStatus,
+      'normalize incident',
+      transport,
+      'malformed',
+    );
+  }
+  const number = safeString(payload?.['number']);
+  const status = safeString(payload?.['status']);
+  const priority = safeString(payload?.['priority']);
+  const requesterId = safeString(payload?.['requesterId']);
+  const assignmentGroupId = safeString(payload?.['assignmentGroupId']);
+  const assignedTo = safeString(payload?.['assignedTo']);
+  const incident: NilesIncidentRecord = { id };
+  if (number) incident.number = number;
+  if (status && ['open', 'in_progress', 'on_hold', 'resolved', 'closed'].includes(status)) {
+    incident.status = status as NonNullable<NilesIncidentRecord['status']>;
+  }
+  if (priority && ['p1', 'p2', 'p3', 'p4'].includes(priority)) {
+    incident.priority = priority as NonNullable<NilesIncidentRecord['priority']>;
+  }
+  if (requesterId) incident.requesterId = requesterId;
+  if (assignmentGroupId) incident.assignmentGroupId = assignmentGroupId;
+  if (assignedTo) incident.assignedTo = assignedTo;
+  return incident;
+}
+
+function normalizeResource(
+  value: unknown,
+  expectedId: string,
+  operation: string,
+  transport?: NilesTransportEvidence,
+): NilesFixtureResource {
+  const payload = payloadObject(value);
+  const id = safeString(payload?.['id']);
+  if (!id || id !== expectedId) {
+    throw new NilesLiveAdapterOperationError(
+      transport?.httpStatus,
+      operation,
+      transport,
+      'malformed',
+    );
+  }
+  const label = safeString(payload?.['name']) ?? safeString(payload?.['displayName']);
+  const serviceId = safeString(payload?.['serviceId']);
+  return { id, ...(label ? { label } : {}), ...(serviceId ? { serviceId } : {}) };
+}
+
+function asArrayPayload(value: unknown): unknown[] {
+  const payload = unwrapPayload(value);
+  if (Array.isArray(payload)) {
+    return payload;
+  }
+  const items = asRecord(payload)?.['items'];
+  if (Array.isArray(items)) {
+    return items;
+  }
+  return [];
+}
+
+export class NilesIncidentApiAdapter implements NilesIncidentLiveAdapter {
+  constructor(
+    private readonly fetchImplementation: FetchImplementation = fetch,
+    private readonly timeoutMs = DEFAULT_AUTHENTICATION_TIMEOUT_MS,
+  ) {}
+
+  private async request(input: {
+    environment: EnvironmentDefinitionV1;
+    session: ActorSession;
+    tenantId: string;
+    correlationId: string;
+    method: 'GET' | 'POST' | 'DELETE';
+    path: string;
+    pathTemplate: string;
+    operation: string;
+    body?: unknown;
+  }): Promise<{ payload: unknown; transport: NilesTransportEvidence }> {
+    let response: Response;
+    const startedAt = performance.now();
+    const transport = (httpStatus?: number): NilesTransportEvidence => ({
+      method: input.method,
+      pathTemplate: input.pathTemplate,
+      ...(httpStatus !== undefined ? { httpStatus } : {}),
+      durationMs: Math.max(0, Math.round(performance.now() - startedAt)),
+      correlationId: input.correlationId,
+    });
+    try {
+      response = await withAuthenticationTimeout(this.timeoutMs, (signal) =>
+        input.session.withAuthorization((authorization) =>
+          this.fetchImplementation(new URL(input.path, input.environment.baseUrl), {
+            method: input.method,
+            headers: {
+              accept: 'application/json',
+              authorization,
+              'x-tenant-id': input.tenantId,
+              'x-correlation-id': input.correlationId,
+              ...(input.body ? { 'content-type': 'application/json' } : {}),
+            },
+            ...(input.body ? { body: JSON.stringify(input.body) } : {}),
+            signal,
+          }),
+        ),
+      );
+    } catch (error) {
+      throw new NilesLiveAdapterOperationError(
+        undefined,
+        input.operation,
+        transport(),
+        error instanceof AuthenticationRequestTimeoutError ||
+          (error instanceof Error && error.name === 'AbortError')
+          ? 'timeout'
+          : 'network',
+      );
+    }
+    if (!response.ok) {
+      throw new NilesLiveAdapterOperationError(
+        response.status,
+        input.operation,
+        transport(response.status),
+      );
+    }
+    return {
+      payload: await readJson(response),
+      transport: transport(response.status),
+    };
+  }
+
+  verifyResource(input: {
+    environment: EnvironmentDefinitionV1;
+    session: ActorSession;
+    tenantId: string;
+    kind: 'ASSIGNMENT_GROUP' | 'SERVICE' | 'OFFERING' | 'CI';
+    id: string;
+    correlationId: string;
+  }): Promise<NilesFixtureResource> {
+    const path =
+      input.kind === 'ASSIGNMENT_GROUP'
+        ? `/grc/groups/${input.id}`
+        : input.kind === 'SERVICE'
+          ? `/grc/cmdb/services/${input.id}`
+          : input.kind === 'OFFERING'
+            ? `/grc/cmdb/service-offerings/${input.id}`
+            : `/grc/cmdb/cis/${input.id}`;
+    const pathTemplate =
+      input.kind === 'ASSIGNMENT_GROUP'
+        ? '/grc/groups/:id'
+        : input.kind === 'SERVICE'
+          ? '/grc/cmdb/services/:id'
+          : input.kind === 'OFFERING'
+            ? '/grc/cmdb/service-offerings/:id'
+            : '/grc/cmdb/cis/:id';
+    return this.request({
+      ...input,
+      method: 'GET',
+      path,
+      pathTemplate,
+      operation: `verify ${input.kind}`,
+    }).then((response) => ({
+      ...normalizeResource(response.payload, input.id, `verify ${input.kind}`, response.transport),
+      transport: response.transport,
+    }));
+  }
+
+  readChoiceValues(input: {
+    environment: EnvironmentDefinitionV1;
+    session: ActorSession;
+    tenantId: string;
+    table: 'itsm_incidents' | 'itsm_incident_ci';
+    field: 'pendingReason' | 'relationshipType' | 'impactScope';
+    correlationId: string;
+  }): Promise<{ values: string[]; transport?: NilesTransportEvidence }> {
+    const query = new URLSearchParams({ table: input.table, field: input.field });
+    return this.request({
+      ...input,
+      method: 'GET',
+      path: `/grc/itsm/choices?${query.toString()}`,
+      pathTemplate: '/grc/itsm/choices?table=:table&field=:field',
+      operation: `read ${input.table}.${input.field} choices`,
+    }).then((response) => ({
+      values: asArrayPayload(response.payload).flatMap((entry) => {
+        const value = safeString(asRecord(entry)?.['value']);
+        return value ? [value] : [];
+      }),
+      transport: response.transport,
+    }));
+  }
+
+  createIncident(input: {
+    environment: EnvironmentDefinitionV1;
+    session: ActorSession;
+    tenantId: string;
+    correlationId: string;
+    runId: string;
+    runNamespacePrefix: string;
+    requesterUserId: string;
+    assignmentGroupId: string;
+    serviceId: string;
+    offeringId?: string;
+    impact: 'low' | 'medium' | 'high';
+    urgency: 'low' | 'medium' | 'high';
+  }): Promise<NilesIncidentRecord> {
+    return this.request({
+      ...input,
+      method: 'POST',
+      path: '/grc/itsm/incidents',
+      pathTemplate: '/grc/itsm/incidents',
+      operation: 'create incident',
+      body: {
+        shortDescription: `${input.runNamespacePrefix}-${input.runId} payment API degradation`,
+        description:
+          'Synthetic NVS live API validation for customer-facing payment API degradation.',
+        category: 'software',
+        source: 'user',
+        impact: input.impact,
+        urgency: input.urgency,
+        requesterId: input.requesterUserId,
+        assignmentGroupId: input.assignmentGroupId,
+        serviceId: input.serviceId,
+        ...(input.offeringId ? { offeringId: input.offeringId } : {}),
+        metadata: {
+          nvs: {
+            schemaVersion: 'nvs.live-incident-metadata/v1',
+            runId: input.runId,
+            runNamespacePrefix: input.runNamespacePrefix,
+            synthetic: true,
+          },
+        },
+      },
+    }).then((response) => ({
+      ...normalizeIncident(response.payload, response.transport),
+      transport: response.transport,
+    }));
+  }
+
+  readIncident(input: {
+    environment: EnvironmentDefinitionV1;
+    session: ActorSession;
+    tenantId: string;
+    incidentId: string;
+    correlationId: string;
+  }): Promise<NilesIncidentRecord> {
+    return this.request({
+      ...input,
+      method: 'GET',
+      path: `/grc/itsm/incidents/${input.incidentId}`,
+      pathTemplate: '/grc/itsm/incidents/:incidentId',
+      operation: 'read incident',
+    }).then((response) => ({
+      ...normalizeIncident(response.payload, response.transport),
+      transport: response.transport,
+    }));
+  }
+
+  assignIncident(input: {
+    environment: EnvironmentDefinitionV1;
+    session: ActorSession;
+    tenantId: string;
+    incidentId: string;
+    assignmentGroupId: string;
+    correlationId: string;
+  }): Promise<NilesIncidentRecord> {
+    return this.request({
+      ...input,
+      method: 'POST',
+      path: `/grc/itsm/incidents/${input.incidentId}/assign`,
+      pathTemplate: '/grc/itsm/incidents/:incidentId/assign',
+      operation: 'assign incident',
+      body: { assignmentGroupId: input.assignmentGroupId },
+    }).then((response) => ({
+      ...normalizeIncident(response.payload, response.transport),
+      transport: response.transport,
+    }));
+  }
+
+  takeOwnership(input: {
+    environment: EnvironmentDefinitionV1;
+    session: ActorSession;
+    tenantId: string;
+    incidentId: string;
+    correlationId: string;
+  }): Promise<NilesIncidentRecord> {
+    return this.request({
+      ...input,
+      method: 'POST',
+      path: `/grc/itsm/incidents/${input.incidentId}/take-ownership`,
+      pathTemplate: '/grc/itsm/incidents/:incidentId/take-ownership',
+      operation: 'take ownership',
+    }).then((response) => ({
+      ...normalizeIncident(response.payload, response.transport),
+      transport: response.transport,
+    }));
+  }
+
+  startWork(input: {
+    environment: EnvironmentDefinitionV1;
+    session: ActorSession;
+    tenantId: string;
+    incidentId: string;
+    correlationId: string;
+  }): Promise<NilesIncidentRecord> {
+    return this.request({
+      ...input,
+      method: 'POST',
+      path: `/grc/itsm/incidents/${input.incidentId}/start-work`,
+      pathTemplate: '/grc/itsm/incidents/:incidentId/start-work',
+      operation: 'start work',
+    }).then((response) => ({
+      ...normalizeIncident(response.payload, response.transport),
+      transport: response.transport,
+    }));
+  }
+
+  async addAffectedCi(input: {
+    environment: EnvironmentDefinitionV1;
+    session: ActorSession;
+    tenantId: string;
+    incidentId: string;
+    ciId: string;
+    relationshipType: string;
+    impactScope?: string;
+    correlationId: string;
+  }): Promise<NilesTransportEvidence> {
+    const response = await this.request({
+      ...input,
+      method: 'POST',
+      path: `/grc/itsm/incidents/${input.incidentId}/affected-cis`,
+      pathTemplate: '/grc/itsm/incidents/:incidentId/affected-cis',
+      operation: 'add affected CI',
+      body: {
+        ciId: input.ciId,
+        relationshipType: input.relationshipType,
+        ...(input.impactScope ? { impactScope: input.impactScope } : {}),
+      },
+    });
+    return response.transport;
+  }
+
+  listAffectedCis(input: {
+    environment: EnvironmentDefinitionV1;
+    session: ActorSession;
+    tenantId: string;
+    incidentId: string;
+    correlationId: string;
+  }): Promise<{ items: Array<{ ciId: string }>; transport: NilesTransportEvidence }> {
+    return this.request({
+      ...input,
+      method: 'GET',
+      path: `/grc/itsm/incidents/${input.incidentId}/affected-cis`,
+      pathTemplate: '/grc/itsm/incidents/:incidentId/affected-cis',
+      operation: 'list affected CIs',
+    }).then((response) => ({
+      transport: response.transport,
+      items: asArrayPayload(response.payload).flatMap((record) => {
+        const value = asRecord(record) ?? {};
+        const ciId =
+          safeString(value['ciId']) ??
+          safeString(value['configurationItemId']) ??
+          safeString(asRecord(value['ci'])?.['id']);
+        return ciId ? [{ ciId }] : [];
+      }),
+    }));
+  }
+
+  readSlaSummary(input: {
+    environment: EnvironmentDefinitionV1;
+    session: ActorSession;
+    tenantId: string;
+    incidentId: string;
+    correlationId: string;
+  }): Promise<NilesSlaSummary> {
+    return this.request({
+      ...input,
+      method: 'GET',
+      path: `/grc/itsm/sla/records/INCIDENT/${input.incidentId}`,
+      pathTemplate: '/grc/itsm/sla/records/INCIDENT/:incidentId',
+      operation: 'read SLA summary',
+    }).then((response) => ({
+      transport: response.transport,
+      records: asArrayPayload(response.payload).map((record) => {
+        const value = asRecord(record) ?? {};
+        const summary: NilesSlaSummary['records'][number] = {
+          id: safeString(value['id']) ?? 'unknown',
+        };
+        const objectiveType = safeString(value['objectiveType']);
+        const status = safeString(value['status']);
+        const policyRef = safeString(value['policyRef']) ?? safeString(value['policyId']);
+        if (objectiveType) summary.objectiveType = objectiveType;
+        if (status) summary.status = status;
+        if (policyRef) summary.policyRef = policyRef;
+        if (typeof value['breached'] === 'boolean') summary.breached = value['breached'];
+        const pauseAt = safeString(value['pauseAt']);
+        const stopAt = safeString(value['stopAt']);
+        if (pauseAt) summary.pauseAt = pauseAt;
+        if (stopAt) summary.stopAt = stopAt;
+        for (const key of [
+          'elapsedSeconds',
+          'remainingSeconds',
+          'pausedDurationSeconds',
+        ] as const) {
+          if (typeof value[key] === 'number' && Number.isFinite(value[key])) {
+            summary[key] = value[key];
+          }
+        }
+        return summary;
+      }),
+    }));
+  }
+
+  readJournalSummary(input: {
+    environment: EnvironmentDefinitionV1;
+    session: ActorSession;
+    tenantId: string;
+    incidentId: string;
+    correlationId: string;
+  }): Promise<NilesJournalSummary> {
+    return this.request({
+      ...input,
+      method: 'GET',
+      path: `/grc/itsm/incidents/${input.incidentId}/journal`,
+      pathTemplate: '/grc/itsm/incidents/:incidentId/journal',
+      operation: 'read journal entries',
+    }).then((response) => {
+      const entries = asArrayPayload(response.payload).flatMap((entry) => {
+        const value = asRecord(entry) ?? {};
+        const id = safeString(value['id']);
+        const type = safeString(value['type']);
+        const message = safeString(value['message']);
+        const createdBy = safeString(value['createdBy']);
+        const createdAt = safeString(value['createdAt']);
+        return id
+          ? [
+              {
+                id,
+                ...(type ? { type } : {}),
+                ...(message ? { message } : {}),
+                ...(createdBy ? { createdBy } : {}),
+                ...(createdAt ? { createdAt } : {}),
+              },
+            ]
+          : [];
+      });
+      const value = payloadObject(response.payload);
+      return {
+        count: entries.length || (typeof value?.['count'] === 'number' ? value['count'] : 0),
+        entries,
+        transport: response.transport,
+      };
+    });
+  }
+
+  holdIncident(input: {
+    environment: EnvironmentDefinitionV1;
+    session: ActorSession;
+    tenantId: string;
+    incidentId: string;
+    pendingReason: string;
+    pendingReasonDetail: string;
+    correlationId: string;
+  }): Promise<NilesIncidentRecord> {
+    return this.request({
+      ...input,
+      method: 'POST',
+      path: `/grc/itsm/incidents/${input.incidentId}/hold`,
+      pathTemplate: '/grc/itsm/incidents/:incidentId/hold',
+      operation: 'hold incident',
+      body: {
+        pendingReason: input.pendingReason,
+        pendingReasonDetail: input.pendingReasonDetail,
+      },
+    }).then((response) => ({
+      ...normalizeIncident(response.payload, response.transport),
+      transport: response.transport,
+    }));
+  }
+
+  resumeIncident(input: {
+    environment: EnvironmentDefinitionV1;
+    session: ActorSession;
+    tenantId: string;
+    incidentId: string;
+    correlationId: string;
+  }): Promise<NilesIncidentRecord> {
+    return this.request({
+      ...input,
+      method: 'POST',
+      path: `/grc/itsm/incidents/${input.incidentId}/resume`,
+      pathTemplate: '/grc/itsm/incidents/:incidentId/resume',
+      operation: 'resume incident',
+      body: { status: 'in_progress' },
+    }).then((response) => ({
+      ...normalizeIncident(response.payload, response.transport),
+      transport: response.transport,
+    }));
+  }
+
+  resolveIncident(input: {
+    environment: EnvironmentDefinitionV1;
+    session: ActorSession;
+    tenantId: string;
+    incidentId: string;
+    resolutionNotes: string;
+    correlationId: string;
+  }): Promise<NilesIncidentRecord> {
+    return this.request({
+      ...input,
+      method: 'POST',
+      path: `/grc/itsm/incidents/${input.incidentId}/resolve`,
+      pathTemplate: '/grc/itsm/incidents/:incidentId/resolve',
+      operation: 'resolve incident',
+      body: { resolutionNotes: input.resolutionNotes },
+    }).then((response) => ({
+      ...normalizeIncident(response.payload, response.transport),
+      transport: response.transport,
+    }));
+  }
+
+  closeIncident(input: {
+    environment: EnvironmentDefinitionV1;
+    session: ActorSession;
+    tenantId: string;
+    incidentId: string;
+    closureNote: string;
+    correlationId: string;
+  }): Promise<NilesIncidentRecord> {
+    return this.request({
+      ...input,
+      method: 'POST',
+      path: `/grc/itsm/incidents/${input.incidentId}/close`,
+      pathTemplate: '/grc/itsm/incidents/:incidentId/close',
+      operation: 'close incident',
+      body: { closureNote: input.closureNote },
+    }).then((response) => ({
+      ...normalizeIncident(response.payload, response.transport),
+      transport: response.transport,
+    }));
+  }
+
+  async softDeleteIncident(input: {
+    environment: EnvironmentDefinitionV1;
+    session: ActorSession;
+    tenantId: string;
+    incidentId: string;
+    correlationId: string;
+  }): Promise<NilesTransportEvidence> {
+    const response = await this.request({
+      ...input,
+      method: 'DELETE',
+      path: `/grc/itsm/incidents/${input.incidentId}`,
+      pathTemplate: '/grc/itsm/incidents/:incidentId',
+      operation: 'soft delete incident',
+    });
+    return response.transport;
+  }
+
+  async verifyIncidentDeleted(input: {
+    environment: EnvironmentDefinitionV1;
+    session: ActorSession;
+    tenantId: string;
+    incidentId: string;
+    correlationId: string;
+  }): Promise<boolean> {
+    try {
+      await this.readIncident(input);
+      return false;
+    } catch (error) {
+      return error instanceof NilesLiveAdapterOperationError && error.status === 404;
+    }
   }
 }

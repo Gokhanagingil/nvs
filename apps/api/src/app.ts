@@ -1,17 +1,21 @@
+import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import {
+  NilesIncidentApiAdapter,
   NilesAuthenticationAdapter,
   NilesReadOnlyAdapter,
   type FetchImplementation,
 } from '@nvs/adapter-niles';
 import { safeIdSchema } from '@nvs/contracts';
-import { AuthenticationBlockedError, NvsCore } from '@nvs/core';
+import { AuthenticationBlockedError, LiveRunBlockedError, NvsCore } from '@nvs/core';
 import { DomainPolicyError } from '@nvs/domain';
 import { EnvironmentVariableSecretProvider } from '@nvs/secret-provider-environment';
 import {
   FilesystemActorProfileRepository,
   FilesystemEnvironmentRepository,
+  FilesystemLiveRunStateRepository,
+  FilesystemNilesIncidentFixtureRepository,
   FilesystemRunBundleRepository,
   FilesystemScenarioRepository,
   RunIdAlreadyExistsError,
@@ -34,15 +38,27 @@ const compileBodySchema = z
     variationValues: z.record(safeIdSchema, safeIdSchema).default({}),
   })
   .strict();
-const createRunBodySchema = z
-  .object({
-    runType: z.literal('COMPILE_ONLY'),
-    runId: safeIdSchema.optional(),
-    environmentId: safeIdSchema,
-    scenarioId: safeIdSchema,
-    variationValues: z.record(safeIdSchema, safeIdSchema).default({}),
-  })
-  .strict();
+const createRunBodySchema = z.discriminatedUnion('runType', [
+  z
+    .object({
+      runType: z.literal('COMPILE_ONLY'),
+      runId: safeIdSchema.optional(),
+      environmentId: safeIdSchema,
+      scenarioId: safeIdSchema,
+      variationValues: z.record(safeIdSchema, safeIdSchema).default({}),
+    })
+    .strict(),
+  z
+    .object({
+      runType: z.literal('LIVE_API'),
+      runId: safeIdSchema.optional(),
+      environmentId: safeIdSchema,
+      scenarioId: safeIdSchema,
+      variationValues: z.record(safeIdSchema, safeIdSchema).default({}),
+      confirmRealMutation: z.literal(true),
+    })
+    .strict(),
+]);
 const emptyBodySchema = z.object({}).strict();
 
 export interface BuildAppOptions {
@@ -55,10 +71,8 @@ export interface BuildAppOptions {
   logger?: boolean;
 }
 
-let runSequence = 0;
 function defaultRunId(): string {
-  runSequence += 1;
-  return `run_${Date.now().toString(36)}_${runSequence.toString(36)}`;
+  return `run_${randomUUID().replaceAll('-', '')}`;
 }
 
 export function createCore(rootDir: string, fetchImplementation?: FetchImplementation): NvsCore {
@@ -81,6 +95,14 @@ export function createCore(rootDir: string, fetchImplementation?: FetchImplement
       profiles: new FilesystemActorProfileRepository(path.join(runtimePaths.configDir, 'actors')),
       secrets: new EnvironmentVariableSecretProvider(),
       authenticator: new NilesAuthenticationAdapter(fetchImplementation, authenticationTimeout),
+    },
+    {
+      fixtures: new FilesystemNilesIncidentFixtureRepository(
+        path.join(runtimePaths.configDir, 'fixtures', 'niles-incident'),
+      ),
+      incidentAdapter: new NilesIncidentApiAdapter(fetchImplementation, authenticationTimeout),
+      state: new FilesystemLiveRunStateRepository(runtimePaths.dataDir),
+      mutationsEnabled: () => process.env['NVS_ENABLE_NILES_MUTATIONS'] === 'true',
     },
   );
 }
@@ -116,6 +138,23 @@ function safeError(error: unknown): {
   if (error instanceof AuthenticationBlockedError) {
     return {
       statusCode: error.category === 'ENVIRONMENT' ? 403 : 502,
+      body: {
+        error: {
+          code: error.code,
+          category: error.category,
+          message: error.message,
+        },
+      },
+    };
+  }
+  if (error instanceof LiveRunBlockedError) {
+    return {
+      statusCode:
+        error.code === 'LIVE_RUN_IN_PROGRESS' ||
+        error.code === 'LIVE_RUN_REQUIRES_RECOVERY' ||
+        error.code === 'RUN_ID_ALREADY_EXISTS'
+          ? 409
+          : 403,
       body: {
         error: {
           code: error.code,
@@ -262,6 +301,38 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     return core.runAuthenticationPreflight(id);
   });
 
+  app.get('/api/environments/:id/execution-readiness', async (request) => {
+    const { id } = idParamsSchema.parse(request.params);
+    const query = z
+      .object({
+        scenarioId: safeIdSchema.optional(),
+        journey: safeIdSchema.optional(),
+      })
+      .strict()
+      .parse(request.query);
+    return core.executionReadiness({
+      environmentId: id,
+      ...(query.scenarioId ? { scenarioId: query.scenarioId } : {}),
+      ...(query.journey ? { variationValues: { journey: query.journey } } : {}),
+    });
+  });
+
+  app.post('/api/environments/:id/execution-readiness/confirm', async (request) => {
+    const { id } = idParamsSchema.parse(request.params);
+    const body = z
+      .object({
+        scenarioId: safeIdSchema.optional(),
+        variationValues: z.record(safeIdSchema, safeIdSchema).optional(),
+      })
+      .strict()
+      .parse(request.body ?? {});
+    return core.confirmExecutionReadiness({
+      environmentId: id,
+      ...(body.scenarioId ? { scenarioId: body.scenarioId } : {}),
+      ...(body.variationValues ? { variationValues: body.variationValues } : {}),
+    });
+  });
+
   app.get('/api/scenarios', async () => ({ items: await core.listScenarios() }));
 
   app.get('/api/scenarios/:id', async (request) => {
@@ -277,18 +348,33 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
 
   app.post('/api/runs', async (request, reply) => {
     const body = createRunBodySchema.parse(request.body);
-    const run = await core.createCompileOnlyRun({
-      runId: body.runId ?? idFactory(),
+    const runId = body.runId ?? idFactory();
+    if (body.runType === 'COMPILE_ONLY') {
+      const run = await core.createCompileOnlyRun({
+        runId,
+        environmentId: body.environmentId,
+        scenarioId: body.scenarioId,
+        variationValues: body.variationValues,
+        now: clock(),
+      });
+      void reply.status(201);
+      return run;
+    }
+    const accepted = await core.startLiveApiRun({
+      runId,
       environmentId: body.environmentId,
       scenarioId: body.scenarioId,
       variationValues: body.variationValues,
+      confirmRealMutation: body.confirmRealMutation,
       now: clock(),
     });
-    void reply.status(201);
-    return run;
+    void reply.status(202);
+    return accepted;
   });
 
   app.get('/api/runs', async () => ({ items: await core.listRuns() }));
+
+  app.get('/api/runs/live-active', async () => ({ items: await core.listActiveLiveRuns() }));
 
   app.get('/api/runs/:id', async (request) => {
     const { id } = idParamsSchema.parse(request.params);
@@ -303,6 +389,16 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   app.get('/api/runs/:id/evidence', async (request) => {
     const { id } = idParamsSchema.parse(request.params);
     return core.getEvidence(id);
+  });
+
+  app.get('/api/runs/:id/progress', async (request) => {
+    const { id } = idParamsSchema.parse(request.params);
+    return core.getRunProgress(id);
+  });
+
+  app.get('/api/runs/:id/inventory', async (request) => {
+    const { id } = idParamsSchema.parse(request.params);
+    return core.getResourceInventory(id);
   });
 
   app.get('/api/coverage', async () => core.coverage());

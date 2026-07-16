@@ -1,6 +1,6 @@
 schemaVersion: nvs.blueprint/v1
 id: payment-api-service-degradation
-version: 1.0.0
+version: 1.1.0
 title: Payment API service degradation through restoration and closure
 narrative: >-
   A customer-facing payment/API service suffers severe degradation during an active support
@@ -8,10 +8,11 @@ narrative: >-
   operational ownership, relates the affected service and CI context where supported, observes
   the applicable response and resolution SLA, places the incident on hold while waiting for an
   external provider, resumes work, restores service, records resolution evidence, resolves the
-  incident, and closes it under the correct authority.
+  incident, and has the requester confirm closure under the correct authority.
 objective: >-
   Demonstrate the approved Incident, SLA, authorization, tenant-isolation, evidence, and cleanup
-  intent as a deterministic semantic plan without executing any NILES mutation in M1-01.
+  intent as a deterministic semantic plan and, for the allowlisted M1-02B variation, as a guarded
+  live NILES Incident API journey in an approved non-production environment.
 domain: itsm
 process: incident
 riskTags:
@@ -22,9 +23,9 @@ riskTags:
   - tenant-isolation
 reviewState: approved
 provenance:
-  source: NVS M1-01 approved vertical-slice narrative
+  source: NVS M1-02B approved live Incident API narrative
   approvedBy: Product Owner
-  reviewedAt: 2026-07-14T12:00:00+00:00
+  reviewedAt: 2026-07-15T00:00:00+00:00
 actors:
   - id: requester
     name: Payment operations requester
@@ -36,7 +37,7 @@ actors:
     authProfileRef: actor.service-desk
   - id: incident-manager
     name: Incident manager
-    persona: Reviews restoration evidence and closes the resolved incident under approved authority.
+    persona: Reviews restoration evidence and authorization audit before requester closure.
     authProfileRef: actor.incident-manager
   - id: insufficient-role-user
     name: Insufficiently privileged user
@@ -157,6 +158,20 @@ steps:
         statement: Operational ownership is visible on the incident.
     evidence:
       - Ownership state and authorization decision.
+  - id: start-restoration-work
+    title: Start active restoration work
+    narrative: Service Desk moves the accepted incident into active restoration work.
+    actor: service-desk-agent
+    action: incident.start_work
+    inputs:
+      assignmentGroup: ${assignment-group}
+    expectations:
+      - kind: STATE
+        statement: The incident is in active restoration work.
+      - kind: AUDIT
+        statement: Work-start evidence is attributable to the acting Service Desk agent.
+    evidence:
+      - Active work state and correlated lifecycle evidence.
   - id: link-service-context
     title: Relate service, offering, and configuration item context
     narrative: Service Desk links the affected business and technical service context where supported.
@@ -255,8 +270,8 @@ steps:
       - Correlated lifecycle audit and event observations.
   - id: close-resolved-incident
     title: Close the resolved incident under the correct authority
-    narrative: The authorized incident manager closes the incident after reviewing resolution evidence.
-    actor: incident-manager
+    narrative: The requester confirms service restoration and closes the incident after review evidence is available.
+    actor: requester
     action: incident.close
     inputs:
       closureAuthority: ${closure-authority}
@@ -292,6 +307,7 @@ variationDimensions:
             - triage-impact
             - assign-service-desk
             - take-ownership
+            - start-restoration-work
             - link-service-context
             - observe-active-sla
             - hold-for-provider
@@ -333,10 +349,13 @@ variationDimensions:
           expectedOutcome: SLA_VALIDATION
 evidenceRequirements:
   - Compiled plan with stable source links and no runner mechanics.
+  - Live API run record, step observations, resource inventory, and checkpoint when the guarded
+    allowlisted journey is explicitly confirmed.
   - Actor, variation, semantic action, assertion, and evidence-request declarations.
   - Sanitization metadata proving secret-bearing fields are excluded from persisted artifacts.
-  - Cleanup intent and explicit compile-only assurance scope.
+  - Cleanup intent and explicit assurance scope for compile-only or live API execution.
 cleanup:
   isolation: RUN_NAMESPACE
-  intent: Remove only records owned by the deterministic run namespace after executable slices are introduced.
+  intent: Retain closed run-owned records on PASS; delete run-owned resolved records when close
+    authority is unsatisfiable before closure; retain failures for diagnosis.
   retainOnFailure: true

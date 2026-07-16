@@ -33,6 +33,7 @@ sudo install -d -m 0750 -o nvsdeploy -g 10001 \
   /opt/nvs/config/actors/mappings \
   /opt/nvs/config/actors/profiles \
   /opt/nvs/config/environments \
+  /opt/nvs/config/fixtures/niles-incident \
   /opt/nvs/config/scenarios
 sudo install -d -m 0750 -o 10001 -g 10001 /opt/nvs/data
 ```
@@ -64,9 +65,10 @@ Bootstrap non-secret configuration from reviewed templates, then replace every s
 2. Copy only the `staging-*` actor profiles into `/opt/nvs/config/actors/profiles/`.
 3. Copy `actors/mappings/staging-example.yaml` into `/opt/nvs/config/actors/mappings/staging.yaml` (or an equivalent staging environment id mapping).
 4. Copy `environments/staging.example.yaml` to `/opt/nvs/config/environments/staging.yaml`.
-5. Set the staging NILES `baseUrl` to `http://backend:3002` for internal Docker-network reachability. Do not point NVS at public NILES URLs that return Cloudflare managed-challenge responses to automation.
-6. Replace all sanitized tenant UUIDs. Do not leave template tenant IDs unchanged.
-7. Enable the environment only after review.
+5. Copy `fixtures/niles-incident/staging.example.yaml` to `/opt/nvs/config/fixtures/niles-incident/staging.yaml`.
+6. Set the staging NILES `baseUrl` to `http://backend:3002` for internal Docker-network reachability. Do not point NVS at public NILES URLs that return Cloudflare managed-challenge responses to automation.
+7. Replace all sanitized tenant, group, service, offering, CI, and SLA fixture references. Do not leave template UUIDs unchanged.
+8. Enable the environment and fixture only after review.
 
 Required tenant assignment for staging actors:
 
@@ -118,6 +120,22 @@ Verify the NILES backend service lists the alias `backend`. A temporary containe
 Public NILES endpoints (`https://niles-grc.com`, `https://api.niles-grc.com`) remain Cloudflare-protected. Do not weaken managed-challenge protection merely to support NVS automation. The NILES backend must not be published on a broad or public host interface.
 
 Authentication preflight is the explicit connectivity and authentication acceptance step after deployment. Run it only after NVS is healthy and the internal `baseUrl` is configured.
+
+## 2b. Guarded live Incident API execution
+
+Live Incident API execution is disabled by default. To run the M1-02B live slice on approved non-production staging, all of these must be true:
+
+- `/opt/nvs/config/environments/staging.yaml` is enabled, classified as `staging` or another non-production kind, and has `execution.schemaVersion: nvs.environment-execution-policy/v1`;
+- `execution.liveApiEnabled` is `true`, `allowedRunTypes` includes `LIVE_API`, and the allowlist contains only `payment-api-service-degradation` with `journey: normal`;
+- `/opt/nvs/config/fixtures/niles-incident/staging.yaml` is enabled, references the same environment id, and contains only non-secret UUID/resource references;
+- `/opt/nvs/.env` contains `NVS_ENABLE_NILES_MUTATIONS=true`;
+- requester, service desk, incident manager, and tenant admin actor credentials are configured and authenticate into the fixture tenant;
+- the Run Center operator or API caller supplies `confirmRealMutation: true`;
+- no other live API run is in progress.
+
+Live `POST /api/runs` returns `202` with a `runId`; operators must watch `GET /api/runs/:id/progress` until `COMPLETED` before using the evidence bundle. If NVS restarts with a durable `runs/.inflight/<runId>` checkpoint that has not been promoted to a final bundle, readiness blocks new live runs with `LIVE_RUN_REQUIRES_RECOVERY`; inspect that checkpoint and inventory to locate any run-owned Incident before deciding whether to clean up or retain it.
+
+Do not enable `NVS_ENABLE_NILES_MUTATIONS` for production. Do not use this switch to bypass missing fixture readiness. If close authority is unsatisfiable for the configured requester profile, NVS records `BLOCKED` with `NILES_CLOSE_AUTHORITY_UNSATISFIABLE`, attempts verified run-owned soft delete while the incident remains deletable, and does not mark the run `PASS`.
 
 ## 3. Pinned SSH trust and GitHub environment
 

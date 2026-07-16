@@ -12,4 +12,9 @@ capabilities:
   openApi: false
   version: true
 authProfileRef: niles.production-readonly
+execution:
+  schemaVersion: nvs.environment-execution-policy/v1
+  liveApiEnabled: false
+  allowedRunTypes: [COMPILE_ONLY]
+  liveRunAllowlist: []
 enabled: true

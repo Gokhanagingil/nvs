@@ -50,6 +50,36 @@ const safeBaseUrlSchema = z.url().superRefine((value, context) => {
   }
 });
 
+export const runTypeSchema = z.enum(['COMPILE_ONLY', 'LIVE_API']);
+export type RunType = z.infer<typeof runTypeSchema>;
+
+const liveRunAllowlistEntrySchema = z
+  .object({
+    scenarioId: safeIdSchema,
+    variationValues: z.record(safeIdSchema, safeIdSchema),
+  })
+  .strict();
+
+const environmentExecutionPolicyV1Schema = z
+  .object({
+    schemaVersion: z.literal('nvs.environment-execution-policy/v1'),
+    liveApiEnabled: z.boolean(),
+    allowedRunTypes: z.array(runTypeSchema).min(1),
+    fixtureProfileRef: symbolicRefSchema.optional(),
+    liveRunAllowlist: z.array(liveRunAllowlistEntrySchema),
+  })
+  .strict()
+  .superRefine((policy, context) => {
+    if (policy.liveApiEnabled && !policy.allowedRunTypes.includes('LIVE_API')) {
+      context.addIssue({
+        code: 'custom',
+        path: ['allowedRunTypes'],
+        message: 'live API policy must allow LIVE_API when liveApiEnabled is true',
+      });
+    }
+  });
+export type EnvironmentExecutionPolicyV1 = z.infer<typeof environmentExecutionPolicyV1Schema>;
+
 export const environmentDefinitionV1Schema = z
   .object({
     schemaVersion: z.literal('nvs.environment/v1'),
@@ -70,6 +100,7 @@ export const environmentDefinitionV1Schema = z
       })
       .strict(),
     authProfileRef: symbolicRefSchema.optional(),
+    execution: environmentExecutionPolicyV1Schema.optional(),
     enabled: z.boolean(),
   })
   .strict()
@@ -160,6 +191,7 @@ export const semanticActionSchema = z.enum([
   'incident.triage',
   'incident.assign',
   'incident.take_ownership',
+  'incident.start_work',
   'incident.link_service_context',
   'incident.hold',
   'incident.resume',
@@ -523,6 +555,136 @@ export const typedErrorSchema = z
   .strict();
 export type TypedError = z.infer<typeof typedErrorSchema>;
 
+const incidentImpactSchema = z.enum(['low', 'medium', 'high']);
+const incidentUrgencySchema = z.enum(['low', 'medium', 'high']);
+const incidentStatusSchema = z.enum(['open', 'in_progress', 'on_hold', 'resolved', 'closed']);
+
+const fixtureResourceRefSchema = z
+  .object({
+    id: z.uuid(),
+    label: z.string().min(1).max(160).optional(),
+  })
+  .strict();
+
+export const nilesIncidentFixtureV1Schema = z
+  .object({
+    schemaVersion: z.literal('nvs.niles-incident-fixture/v1'),
+    id: safeIdSchema,
+    environmentId: safeIdSchema,
+    enabled: z.boolean(),
+    tenantId: z.uuid(),
+    runNamespacePrefix: safeIdSchema,
+    scenarioAllowlist: z.array(liveRunAllowlistEntrySchema).min(1),
+    resources: z
+      .object({
+        assignmentGroup: fixtureResourceRefSchema,
+        service: fixtureResourceRefSchema,
+        offering: fixtureResourceRefSchema.optional(),
+        configurationItem: fixtureResourceRefSchema.optional(),
+        affectedCi: z
+          .object({
+            relationshipType: z.string().min(1).max(80).default('affected_by'),
+            impactScope: z.string().min(1).max(120).optional(),
+          })
+          .strict()
+          .default({ relationshipType: 'affected_by', impactScope: 'service_impacting' }),
+        impact: incidentImpactSchema,
+        urgency: incidentUrgencySchema,
+        expectedPriority: z.enum(['p1', 'p2', 'p3', 'p4']).optional(),
+        hold: z
+          .object({
+            pendingReason: z.string().min(1).max(100),
+            pendingReasonDetail: z.string().min(12).max(500),
+          })
+          .strict(),
+        resolutionNotes: z.string().min(20).max(1000),
+        closeAuthority: z
+          .object({
+            strategy: z.enum(['REQUESTER_CONFIRMATION', 'BLOCK_IF_UNSATISFIABLE']),
+            requesterMustHaveIncidentWrite: z.boolean(),
+          })
+          .strict(),
+        sla: z
+          .object({
+            required: z.boolean(),
+            policyRef: symbolicRefSchema.optional(),
+            objectiveTypes: z.array(z.enum(['response', 'resolution'])).default([]),
+          })
+          .strict(),
+      })
+      .strict(),
+    cleanup: z
+      .object({
+        onPass: z.literal('RETAIN_CLOSED'),
+        onFail: z.literal('RETAIN_FOR_DIAGNOSIS'),
+        onBlockedBeforeClose: z.literal('DELETE_IF_RUN_OWNED'),
+      })
+      .strict(),
+    provenance: z
+      .object({
+        source: z.string().min(1).max(240),
+        grcCommit: z.string().regex(/^[a-f0-9]{7,40}$/i),
+        reviewedAt: z.iso.datetime({ offset: true }).optional(),
+      })
+      .strict(),
+  })
+  .strict()
+  .superRefine((fixture, context) => {
+    if (fixture.resources.closeAuthority.strategy === 'REQUESTER_CONFIRMATION') {
+      return;
+    }
+    if (fixture.resources.closeAuthority.requesterMustHaveIncidentWrite) {
+      context.addIssue({
+        code: 'custom',
+        path: ['resources', 'closeAuthority', 'requesterMustHaveIncidentWrite'],
+        message: 'BLOCK_IF_UNSATISFIABLE is only valid when requester write authority is absent',
+      });
+    }
+  });
+export type NilesIncidentFixtureV1 = z.infer<typeof nilesIncidentFixtureV1Schema>;
+
+export const readinessCheckStatusSchema = z.enum(['PASS', 'BLOCKED', 'NOT_CHECKED']);
+export const executionReadinessV1Schema = z
+  .object({
+    schemaVersion: z.literal('nvs.execution-readiness/v1'),
+    environmentId: safeIdSchema,
+    runType: z.literal('LIVE_API'),
+    scenarioId: safeIdSchema.optional(),
+    variationValues: z.record(safeIdSchema, safeIdSchema).optional(),
+    confirmed: z.boolean().default(false),
+    staticEligible: z.boolean().default(false),
+    verdict: z.enum(['PASS', 'BLOCKED']),
+    mutationEligible: z.boolean(),
+    gateEligible: z.literal(false),
+    checks: z.array(
+      z
+        .object({
+          id: safeIdSchema,
+          status: readinessCheckStatusSchema,
+          message: z.string().min(1).max(300),
+          code: z
+            .string()
+            .min(1)
+            .max(100)
+            .regex(/^[A-Z0-9_]+$/)
+            .optional(),
+        })
+        .strict(),
+    ),
+    error: typedErrorSchema.optional(),
+  })
+  .strict()
+  .superRefine((readiness, context) => {
+    if (readiness.verdict === 'PASS' && readiness.error) {
+      context.addIssue({
+        code: 'custom',
+        path: ['error'],
+        message: 'PASS readiness cannot include an error',
+      });
+    }
+  });
+export type ExecutionReadinessV1 = z.infer<typeof executionReadinessV1Schema>;
+
 export const actorCredentialConfigurationSchema = z.enum([
   'NOT_CONFIGURED',
   'CONFIGURED',
@@ -768,6 +930,298 @@ export const runRecordV1Schema = z
 
 export type RunRecordV1 = z.infer<typeof runRecordV1Schema>;
 
+export const resourceDispositionSchema = z.enum([
+  'NONE',
+  'VERIFIED_EXISTING',
+  'CREATED',
+  'UPDATED',
+  'RESOLVED',
+  'DELETED',
+  'RETAINED_CLOSED',
+  'RETAINED_FOR_DIAGNOSIS',
+  'UNKNOWN',
+]);
+export type ResourceDisposition = z.infer<typeof resourceDispositionSchema>;
+
+const inventoryResourceSchema = z
+  .object({
+    kind: z.enum(['TENANT', 'ASSIGNMENT_GROUP', 'SERVICE', 'OFFERING', 'CI', 'INCIDENT', 'SLA']),
+    id: z.string().min(1).max(160),
+    label: z.string().min(1).max(160).optional(),
+    disposition: resourceDispositionSchema,
+  })
+  .strict();
+
+const sanitizedTransportEvidenceSchema = z
+  .object({
+    method: z.enum(['GET', 'POST', 'DELETE']),
+    pathTemplate: z.string().min(1).max(200),
+    httpStatus: z.number().int().min(0).max(599).optional(),
+    durationMs: z.number().finite().nonnegative(),
+    correlationId: safeIdSchema,
+  })
+  .strict();
+
+export const resourceInventoryV1Schema = z
+  .object({
+    schemaVersion: z.literal('nvs.resource-inventory/v1'),
+    runId: safeIdSchema,
+    environmentId: safeIdSchema,
+    tenantId: z.uuid(),
+    scenario: z
+      .object({
+        id: safeIdSchema,
+        version: z.string().min(1).max(80),
+      })
+      .strict()
+      .optional(),
+    createdAt: z.iso.datetime({ offset: true }).optional(),
+    createdBy: z
+      .object({
+        semanticActorId: safeIdSchema,
+        operationalActorId: safeIdSchema,
+      })
+      .strict()
+      .optional(),
+    incident: z
+      .object({
+        id: z.uuid(),
+        number: z.string().min(1).max(80).optional(),
+        status: incidentStatusSchema.optional(),
+        disposition: resourceDispositionSchema,
+      })
+      .strict()
+      .optional(),
+    creationOutcome: z
+      .object({
+        kind: z.literal('INCIDENT_CREATE'),
+        status: z.literal('UNKNOWN'),
+        runId: safeIdSchema,
+        runNamespacePrefix: safeIdSchema,
+        marker: z.string().min(1).max(200),
+        tenantId: z.uuid(),
+        correlationId: safeIdSchema,
+        transport: sanitizedTransportEvidenceSchema.optional(),
+      })
+      .strict()
+      .optional(),
+    resources: z.array(inventoryResourceSchema),
+    updatedAt: z.iso.datetime({ offset: true }),
+  })
+  .strict();
+export type ResourceInventoryV1 = z.infer<typeof resourceInventoryV1Schema>;
+
+const observationValueSchema = z.union([
+  z.string().max(500),
+  z.number().finite(),
+  z.boolean(),
+  z.null(),
+  z.array(sanitizedTransportEvidenceSchema),
+]);
+
+export const stepObservationV1Schema = z
+  .object({
+    schemaVersion: z.literal('nvs.step-observation/v1'),
+    id: safeIdSchema,
+    runId: safeIdSchema,
+    stepId: safeIdSchema,
+    sourceStepId: safeIdSchema,
+    sequence: z.number().int().positive(),
+    actorId: safeIdSchema,
+    semanticActorId: safeIdSchema.optional(),
+    actorProfileId: safeIdSchema.optional(),
+    action: semanticActionSchema,
+    status: z.enum(['PASS', 'FAIL', 'BLOCKED', 'NOT_OBSERVED']),
+    startedAt: z.iso.datetime({ offset: true }),
+    completedAt: z.iso.datetime({ offset: true }),
+    correlationId: safeIdSchema,
+    evidence: z.record(z.string().min(1).max(80), observationValueSchema),
+    error: typedErrorSchema.optional(),
+  })
+  .strict()
+  .superRefine((observation, context) => {
+    if (observation.status === 'PASS' && observation.error) {
+      context.addIssue({
+        code: 'custom',
+        path: ['error'],
+        message: 'a PASS observation cannot include an error',
+      });
+    }
+    if (
+      observation.status !== 'PASS' &&
+      observation.status !== 'NOT_OBSERVED' &&
+      !observation.error
+    ) {
+      context.addIssue({
+        code: 'custom',
+        path: ['error'],
+        message: 'a failed or blocked observation requires a typed error',
+      });
+    }
+  });
+export type StepObservationV1 = z.infer<typeof stepObservationV1Schema>;
+
+const liveStepResultV2Schema = z
+  .object({
+    stepId: safeIdSchema,
+    executionStatus: z.enum(['PASS', 'FAIL', 'BLOCKED', 'NOT_OBSERVED']),
+    required: z.boolean().default(true),
+    observationId: safeIdSchema.optional(),
+    error: typedErrorSchema.optional(),
+  })
+  .strict()
+  .superRefine((step, context) => {
+    if (step.executionStatus === 'PASS' && step.error) {
+      context.addIssue({
+        code: 'custom',
+        path: ['error'],
+        message: 'a passed live step cannot include an error',
+      });
+    }
+    if (step.executionStatus !== 'PASS' && step.executionStatus !== 'NOT_OBSERVED' && !step.error) {
+      context.addIssue({
+        code: 'custom',
+        path: ['error'],
+        message: 'a failed or blocked live step requires an error',
+      });
+    }
+  });
+
+export const runRecordV2Schema = z
+  .object({
+    schemaVersion: z.literal('nvs.run/v2'),
+    runId: safeIdSchema,
+    runType: z.literal('LIVE_API'),
+    status: z.enum(['CREATED', 'RUNNING', 'COMPLETED']),
+    verdict: verdictSchema,
+    gateEligible: z.boolean(),
+    assuranceScope: z.literal('LIVE_NILES_INCIDENT_API'),
+    environmentId: safeIdSchema,
+    scenario: z.object({ id: safeIdSchema, version: z.string() }).strict(),
+    variationValues: z.record(safeIdSchema, safeIdSchema),
+    planId: safeIdSchema,
+    fixtureId: safeIdSchema,
+    target: z
+      .object({
+        version: z.string().max(120).optional(),
+        commit: z.string().max(120).optional(),
+      })
+      .strict()
+      .optional(),
+    toolVersions: z
+      .object({
+        nvs: z.string().min(1),
+        node: z.string().min(1),
+        contracts: z.literal('v2'),
+      })
+      .strict(),
+    timestamps: z
+      .object({
+        createdAt: z.iso.datetime({ offset: true }),
+        completedAt: z.iso.datetime({ offset: true }),
+      })
+      .strict(),
+    stepResults: z.array(liveStepResultV2Schema).min(1),
+    error: typedErrorSchema.optional(),
+    evidence: z.array(evidenceEntryV1Schema),
+    sanitization: sanitizationSchema,
+    cleanup: z
+      .object({
+        status: z.enum(['CLEAN', 'RETAINED_BY_POLICY', 'PARTIAL', 'UNKNOWN', 'NOT_REQUIRED']),
+        policy: z.enum(['RETAIN_CLOSED', 'RETAIN_FOR_DIAGNOSIS', 'DELETE_IF_RUN_OWNED']),
+        details: z.string().max(400).optional(),
+        error: typedErrorSchema.optional(),
+      })
+      .strict(),
+    resourceInventory: resourceInventoryV1Schema,
+  })
+  .strict()
+  .superRefine((run, context) => {
+    validateBundleIndex(run.runId, run.evidence, context, ['evidence']);
+    if (run.verdict === 'PASS' && run.error) {
+      context.addIssue({
+        code: 'custom',
+        path: ['error'],
+        message: 'PASS cannot include an error',
+      });
+    }
+    if (run.verdict === 'PASS') {
+      if (
+        run.stepResults.some(
+          (step) =>
+            step.executionStatus !== 'PASS' &&
+            !(step.executionStatus === 'NOT_OBSERVED' && !step.required),
+        )
+      ) {
+        context.addIssue({
+          code: 'custom',
+          path: ['stepResults'],
+          message: 'a PASS live run requires every runtime step to pass',
+        });
+      }
+      if (
+        run.cleanup.status !== 'RETAINED_BY_POLICY' ||
+        run.cleanup.policy !== 'RETAIN_CLOSED' ||
+        run.resourceInventory.incident?.disposition !== 'RETAINED_CLOSED'
+      ) {
+        context.addIssue({
+          code: 'custom',
+          path: ['cleanup'],
+          message: 'a PASS live run requires known retained-closed incident disposition',
+        });
+      }
+    }
+    if (run.verdict !== 'PASS' && !run.error) {
+      context.addIssue({
+        code: 'custom',
+        path: ['error'],
+        message: 'a non-PASS live run requires a typed error',
+      });
+    }
+    if (
+      run.resourceInventory.runId !== run.runId ||
+      run.resourceInventory.environmentId !== run.environmentId
+    ) {
+      context.addIssue({
+        code: 'custom',
+        path: ['resourceInventory'],
+        message: 'run and resource inventory identifiers must match',
+      });
+    }
+  });
+export type RunRecordV2 = z.infer<typeof runRecordV2Schema>;
+
+export const runRecordSchema = z.union([runRecordV1Schema, runRecordV2Schema]);
+export type RunRecord = z.infer<typeof runRecordSchema>;
+
+export const liveRunCheckpointV1Schema = z
+  .object({
+    schemaVersion: z.literal('nvs.live-run-checkpoint/v1'),
+    runId: safeIdSchema,
+    environmentId: safeIdSchema,
+    fixtureId: safeIdSchema,
+    status: z.enum([
+      'PREPARED',
+      'CREATED',
+      'RUNNING',
+      'FINALIZING',
+      'COMPLETED',
+      'RECOVERY_REQUIRED',
+    ]),
+    incidentId: z.uuid().optional(),
+    completedStepIds: z.array(safeIdSchema),
+    error: typedErrorSchema.optional(),
+    cleanup: z
+      .object({
+        attempted: z.boolean(),
+        status: z.enum(['NOT_REQUIRED', 'CLEAN', 'RETAINED_BY_POLICY', 'PARTIAL', 'UNKNOWN']),
+      })
+      .strict(),
+    updatedAt: z.iso.datetime({ offset: true }),
+  })
+  .strict();
+export type LiveRunCheckpointV1 = z.infer<typeof liveRunCheckpointV1Schema>;
+
 export const probeResultV1Schema = z
   .object({
     environmentId: safeIdSchema,
@@ -878,4 +1332,13 @@ export function parseActorProfile(value: unknown): ActorProfileV1 {
 export function parseEnvironmentActorMap(value: unknown): EnvironmentActorMapV1 {
   assertNoObviousSecretFields(value);
   return environmentActorMapV1Schema.parse(value);
+}
+
+export function parseNilesIncidentFixture(value: unknown): NilesIncidentFixtureV1 {
+  assertNoObviousSecretFields(value);
+  return nilesIncidentFixtureV1Schema.parse(value);
+}
+
+export function parseRunRecord(value: unknown): RunRecord {
+  return runRecordSchema.parse(value);
 }

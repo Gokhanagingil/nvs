@@ -8,11 +8,16 @@ import {
   environmentActorMapV1Schema,
   evidenceManifestV1Schema,
   executablePlanV1Schema,
+  liveRunCheckpointV1Schema,
+  nilesIncidentFixtureV1Schema,
   parseActorProfile,
   parseBusinessBlueprint,
   parseEnvironmentDefinition,
   parseEnvironmentActorMap,
-  runRecordV1Schema,
+  parseNilesIncidentFixture,
+  resourceInventoryV1Schema,
+  runRecordSchema,
+  stepObservationV1Schema,
   type ActorPersona,
   type ActorProfileV1,
   type BusinessBlueprintV1,
@@ -20,12 +25,18 @@ import {
   type EnvironmentActorMapV1,
   type EvidenceManifestV1,
   type ExecutablePlanV1,
-  type RunRecordV1,
+  type LiveRunCheckpointV1,
+  type NilesIncidentFixtureV1,
+  type ResourceInventoryV1,
+  type RunRecord,
+  type StepObservationV1,
 } from '@nvs/contracts';
 import type {
   ActorProfileRepository,
   ActorProfileSet,
   EnvironmentRepository,
+  LiveRunState,
+  LiveRunStateRepository,
   RunBundle,
   RunBundleRepository,
   ScenarioRepository,
@@ -257,23 +268,40 @@ export class FilesystemActorProfileRepository implements ActorProfileRepository 
   }
 }
 
-type BundleDocument = 'plan.json' | 'run.json' | 'evidence.json';
+type BundleDocument =
+  | 'plan.json'
+  | 'run.json'
+  | 'evidence.json'
+  | 'inventory.json'
+  | 'observations.json'
+  | 'checkpoint.json';
+const BASE_BUNDLE_DOCUMENTS = ['plan.json', 'run.json', 'evidence.json'] as const;
+const EXTRA_BUNDLE_DOCUMENTS = ['inventory.json', 'observations.json', 'checkpoint.json'] as const;
+const ALL_BUNDLE_DOCUMENTS = [...BASE_BUNDLE_DOCUMENTS, ...EXTRA_BUNDLE_DOCUMENTS] as const;
 
 export interface BundlePersistenceHooks {
   afterWrite?(document: BundleDocument): Promise<void> | void;
   beforeCommit?(): Promise<void> | void;
+  beforePromote?(document: BundleDocument | '.committed'): Promise<void> | void;
+}
+
+type LiveStateDocument = 'plan.json' | 'checkpoint.json' | 'inventory.json' | 'observations.json';
+
+export interface LiveStatePersistenceHooks {
+  afterWrite?(document: LiveStateDocument, state: LiveRunState): Promise<void> | void;
 }
 
 interface PreparedBundle {
-  run: RunRecordV1;
+  run: RunRecord;
   plan: ExecutablePlanV1;
   evidenceManifest: EvidenceManifestV1;
-  bytes: Record<BundleDocument, string>;
+  bytes: Partial<Record<BundleDocument, string>> &
+    Record<(typeof BASE_BUNDLE_DOCUMENTS)[number], string>;
   commitMarkerBytes: string;
 }
 
 interface CommittedBundle {
-  run: RunRecordV1;
+  run: RunRecord;
   plan: ExecutablePlanV1;
   evidenceManifest: EvidenceManifestV1;
 }
@@ -292,7 +320,7 @@ function withoutSha256(entry: EvidenceManifestV1['entries'][number]) {
 function prepareBundle(bundle: RunBundle): PreparedBundle {
   assertSafeId(bundle.run.runId);
   const plan = executablePlanV1Schema.parse(bundle.plan);
-  const baseRun = runRecordV1Schema.parse(bundle.run);
+  const baseRun = runRecordSchema.parse(bundle.run);
   const baseManifest = evidenceManifestV1Schema.parse(bundle.evidenceManifest);
   if (
     baseRun.runId !== baseManifest.runId ||
@@ -305,40 +333,63 @@ function prepareBundle(bundle: RunBundle): PreparedBundle {
 
   const planBytes = serializeForPersistence(plan);
   const planHash = sha256(planBytes);
+  const extraBytes: Partial<Record<BundleDocument, string>> = {};
+  const extraHashes: Partial<Record<BundleDocument, string>> = {};
+  if (bundle.resourceInventory) {
+    const inventoryBytes = serializeForPersistence(
+      resourceInventoryV1Schema.parse(bundle.resourceInventory),
+    );
+    extraBytes['inventory.json'] = inventoryBytes;
+    extraHashes['inventory.json'] = sha256(inventoryBytes);
+  }
+  if (bundle.observations) {
+    const observationBytes = serializeForPersistence(
+      bundle.observations.map((observation) => stepObservationV1Schema.parse(observation)),
+    );
+    extraBytes['observations.json'] = observationBytes;
+    extraHashes['observations.json'] = sha256(observationBytes);
+  }
+  if (bundle.checkpoint) {
+    const checkpointBytes = serializeForPersistence(
+      liveRunCheckpointV1Schema.parse(bundle.checkpoint),
+    );
+    extraBytes['checkpoint.json'] = checkpointBytes;
+    extraHashes['checkpoint.json'] = sha256(checkpointBytes);
+  }
+  const hashByDocument: Partial<Record<BundleDocument, string>> = {
+    'plan.json': planHash,
+    ...extraHashes,
+  };
   const runWithExactPlanHash = {
     ...baseRun,
     evidence: baseRun.evidence.map((entry) => {
       const withoutHash = withoutSha256(entry);
-      return entry.id === 'compiled-plan' ? { ...withoutHash, sha256: planHash } : withoutHash;
+      const document = path.basename(entry.path) as BundleDocument;
+      const hash = hashByDocument[document];
+      return hash ? { ...withoutHash, sha256: hash } : withoutHash;
     }),
   };
   const runBytes = serializeForPersistence(runWithExactPlanHash);
   const runHash = sha256(runBytes);
+  hashByDocument['run.json'] = runHash;
   const manifestWithExactHashes = {
     ...baseManifest,
     entries: baseManifest.entries.map((entry) => {
       const withoutHash = withoutSha256(entry);
-      if (entry.id === 'compiled-plan') {
-        return { ...withoutHash, sha256: planHash };
-      }
-      if (entry.id === 'run-record') {
-        return { ...withoutHash, sha256: runHash };
-      }
-      return withoutHash;
+      const document = path.basename(entry.path) as BundleDocument;
+      const hash = hashByDocument[document];
+      return hash ? { ...withoutHash, sha256: hash } : withoutHash;
     }),
   };
   const evidenceBytes = serializeForPersistence(manifestWithExactHashes);
+  hashByDocument['evidence.json'] = sha256(evidenceBytes);
   const commitMarkerBytes = serializeForPersistence({
     schemaVersion: 'nvs.run-bundle-commit/v1',
-    hashes: {
-      'plan.json': planHash,
-      'run.json': runHash,
-      'evidence.json': sha256(evidenceBytes),
-    },
+    hashes: hashByDocument,
   });
 
   const persistedPlan = executablePlanV1Schema.parse(JSON.parse(planBytes));
-  const persistedRun = runRecordV1Schema.parse(JSON.parse(runBytes));
+  const persistedRun = runRecordSchema.parse(JSON.parse(runBytes));
   const persistedManifest = evidenceManifestV1Schema.parse(JSON.parse(evidenceBytes));
 
   return {
@@ -349,12 +400,16 @@ function prepareBundle(bundle: RunBundle): PreparedBundle {
       'plan.json': planBytes,
       'run.json': runBytes,
       'evidence.json': evidenceBytes,
+      ...extraBytes,
     },
     commitMarkerBytes,
   };
 }
 
-function parseCommitMarker(value: string): Record<BundleDocument, string> {
+function parseCommitMarker(
+  value: string,
+): Partial<Record<BundleDocument, string>> &
+  Record<(typeof BASE_BUNDLE_DOCUMENTS)[number], string> {
   const parsed = JSON.parse(value) as {
     schemaVersion?: unknown;
     hashes?: Partial<Record<BundleDocument, unknown>>;
@@ -363,15 +418,23 @@ function parseCommitMarker(value: string): Record<BundleDocument, string> {
   if (
     parsed.schemaVersion !== 'nvs.run-bundle-commit/v1' ||
     !hashes ||
-    !['plan.json', 'run.json', 'evidence.json'].every(
-      (document) =>
-        typeof hashes[document as BundleDocument] === 'string' &&
-        /^[a-f0-9]{64}$/.test(hashes[document as BundleDocument] as string),
+    !BASE_BUNDLE_DOCUMENTS.every(
+      (document) => typeof hashes[document] === 'string' && /^[a-f0-9]{64}$/.test(hashes[document]),
     )
   ) {
     throw new Error('Invalid run bundle commit marker.');
   }
-  return hashes as Record<BundleDocument, string>;
+  for (const [document, hash] of Object.entries(hashes)) {
+    if (
+      !(ALL_BUNDLE_DOCUMENTS as readonly string[]).includes(document) ||
+      typeof hash !== 'string' ||
+      !/^[a-f0-9]{64}$/.test(hash)
+    ) {
+      throw new Error('Invalid run bundle commit marker.');
+    }
+  }
+  return hashes as Partial<Record<BundleDocument, string>> &
+    Record<(typeof BASE_BUNDLE_DOCUMENTS)[number], string>;
 }
 
 function isAlreadyExists(error: unknown): boolean {
@@ -383,13 +446,71 @@ function isAlreadyExists(error: unknown): boolean {
 }
 
 export class FilesystemRunBundleRepository implements RunBundleRepository {
+  private readonly reservedRunIds = new Set<string>();
+
   constructor(
     private readonly artifactRoot: string,
     private readonly hooks: BundlePersistenceHooks = {},
   ) {}
 
-  async saveBundle(bundle: RunBundle): Promise<RunRecordV1> {
+  async reserveRunId(runId: string): Promise<void> {
+    assertSafeId(runId);
+    const runsRoot = safeChild(this.artifactRoot, 'runs');
+    const finalDirectory = safeChild(runsRoot, runId);
+    const inflightDirectory = safeChild(runsRoot, '.inflight', runId);
+    await mkdir(runsRoot, { recursive: true });
+    try {
+      await readdir(inflightDirectory);
+      throw new RunIdAlreadyExistsError();
+    } catch (error) {
+      if (!isMissing(error)) {
+        throw error;
+      }
+    }
+    try {
+      await mkdir(finalDirectory);
+      await writeFile(
+        safeChild(finalDirectory, '.reserved'),
+        serializeForPersistence({
+          schemaVersion: 'nvs.run-namespace-reservation/v1',
+          runId,
+          reservedAt: new Date().toISOString(),
+          pid: process.pid,
+        }),
+        { encoding: 'utf8', flag: 'wx' },
+      );
+      this.reservedRunIds.add(runId);
+    } catch (error) {
+      if (isAlreadyExists(error)) {
+        throw new RunIdAlreadyExistsError();
+      }
+      await rm(finalDirectory, { recursive: true, force: true }).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  async releaseRunId(runId: string): Promise<void> {
+    assertSafeId(runId);
+    if (!this.reservedRunIds.has(runId)) {
+      return;
+    }
+    const finalDirectory = safeChild(this.artifactRoot, 'runs', runId);
+    try {
+      await readFile(safeChild(finalDirectory, '.reserved'), 'utf8');
+    } catch (error) {
+      if (isMissing(error)) {
+        this.reservedRunIds.delete(runId);
+        return;
+      }
+      throw error;
+    }
+    await rm(finalDirectory, { recursive: true, force: true });
+    this.reservedRunIds.delete(runId);
+  }
+
+  async saveBundle(bundle: RunBundle): Promise<RunRecord> {
     const prepared = prepareBundle(bundle);
+    const documents = ALL_BUNDLE_DOCUMENTS.filter((document) => prepared.bytes[document]);
     const runsRoot = safeChild(this.artifactRoot, 'runs');
     const finalDirectory = safeChild(runsRoot, prepared.run.runId);
     const stagingRoot = safeChild(runsRoot, '.staging');
@@ -399,12 +520,13 @@ export class FilesystemRunBundleRepository implements RunBundleRepository {
       `${prepared.run.runId}-${process.pid}-${stagingSequence}`,
     );
     let finalDirectoryCreated = false;
+    const usingReservedDirectory = this.reservedRunIds.has(prepared.run.runId);
 
     await mkdir(stagingRoot, { recursive: true });
     await mkdir(stagingDirectory);
     try {
-      for (const document of ['plan.json', 'run.json', 'evidence.json'] as const) {
-        await writeFile(safeChild(stagingDirectory, document), prepared.bytes[document], {
+      for (const document of documents) {
+        await writeFile(safeChild(stagingDirectory, document), prepared.bytes[document]!, {
           encoding: 'utf8',
           flag: 'wx',
         });
@@ -416,30 +538,45 @@ export class FilesystemRunBundleRepository implements RunBundleRepository {
       });
       await this.hooks.beforeCommit?.();
 
-      try {
-        await mkdir(finalDirectory);
-        finalDirectoryCreated = true;
-      } catch (error) {
-        if (isAlreadyExists(error)) {
+      if (this.reservedRunIds.has(prepared.run.runId)) {
+        try {
+          await readFile(safeChild(finalDirectory, '.reserved'), 'utf8');
+        } catch {
           throw new RunIdAlreadyExistsError();
         }
-        throw error;
+      } else {
+        try {
+          await mkdir(finalDirectory);
+          finalDirectoryCreated = true;
+        } catch (error) {
+          if (isAlreadyExists(error)) {
+            throw new RunIdAlreadyExistsError();
+          }
+          throw error;
+        }
       }
 
-      for (const document of ['plan.json', 'run.json', 'evidence.json'] as const) {
+      for (const document of documents) {
+        await this.hooks.beforePromote?.(document);
         await rename(safeChild(stagingDirectory, document), safeChild(finalDirectory, document));
       }
+      await this.hooks.beforePromote?.('.committed');
       await rename(
         safeChild(stagingDirectory, '.committed'),
         safeChild(finalDirectory, '.committed'),
       );
+      if (usingReservedDirectory) {
+        await rm(safeChild(finalDirectory, '.reserved'), { force: true }).catch(() => undefined);
+        this.reservedRunIds.delete(prepared.run.runId);
+      }
       await rm(stagingDirectory, { recursive: true, force: true }).catch(() => undefined);
       return prepared.run;
     } catch (error) {
       await rm(stagingDirectory, { recursive: true, force: true });
-      if (finalDirectoryCreated) {
+      if (finalDirectoryCreated || usingReservedDirectory) {
         await rm(finalDirectory, { recursive: true, force: true });
       }
+      this.reservedRunIds.delete(prepared.run.runId);
       throw error;
     }
   }
@@ -456,7 +593,8 @@ export class FilesystemRunBundleRepository implements RunBundleRepository {
       }
       throw error;
     }
-    let committedHashes: Record<BundleDocument, string>;
+    let committedHashes: Partial<Record<BundleDocument, string>> &
+      Record<(typeof BASE_BUNDLE_DOCUMENTS)[number], string>;
     try {
       committedHashes = parseCommitMarker(marker);
     } catch {
@@ -469,7 +607,7 @@ export class FilesystemRunBundleRepository implements RunBundleRepository {
         readFile(safeChild(directory, 'plan.json'), 'utf8'),
         readFile(safeChild(directory, 'evidence.json'), 'utf8'),
       ]);
-      const run = runRecordV1Schema.parse(JSON.parse(runBytes));
+      const run = runRecordSchema.parse(JSON.parse(runBytes));
       const plan = executablePlanV1Schema.parse(JSON.parse(planBytes));
       const evidenceManifest = evidenceManifestV1Schema.parse(JSON.parse(evidenceBytes));
       const runEntry = evidenceManifest.entries.find((entry) => entry.id === 'run-record');
@@ -492,7 +630,7 @@ export class FilesystemRunBundleRepository implements RunBundleRepository {
     }
   }
 
-  async list(): Promise<RunRecordV1[]> {
+  async list(): Promise<RunRecord[]> {
     const runsRoot = safeChild(this.artifactRoot, 'runs');
     let entries;
     try {
@@ -503,7 +641,7 @@ export class FilesystemRunBundleRepository implements RunBundleRepository {
       }
       throw error;
     }
-    const runs: RunRecordV1[] = [];
+    const runs: RunRecord[] = [];
     for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
       if (!entry.isDirectory() || !SAFE_ID_PATTERN.test(entry.name)) {
         continue;
@@ -524,7 +662,7 @@ export class FilesystemRunBundleRepository implements RunBundleRepository {
     );
   }
 
-  async get(id: string): Promise<RunRecordV1 | undefined> {
+  async get(id: string): Promise<RunRecord | undefined> {
     return (await this.readCommitted(id))?.run;
   }
 
@@ -535,11 +673,290 @@ export class FilesystemRunBundleRepository implements RunBundleRepository {
   async getEvidence(runId: string): Promise<EvidenceManifestV1 | undefined> {
     return (await this.readCommitted(runId))?.evidenceManifest;
   }
+
+  private async readOptionalDocument(
+    runId: string,
+    document: BundleDocument,
+  ): Promise<string | undefined> {
+    assertSafeId(runId);
+    const directory = safeChild(this.artifactRoot, 'runs', runId);
+    let marker: string;
+    try {
+      marker = await readFile(safeChild(directory, '.committed'), 'utf8');
+    } catch (error) {
+      if (isMissing(error)) {
+        return undefined;
+      }
+      throw error;
+    }
+    let committedHashes: Partial<Record<BundleDocument, string>>;
+    try {
+      committedHashes = parseCommitMarker(marker);
+    } catch {
+      throw new StorageCorruptionError('Run bundle', safeChild(directory, '.committed'));
+    }
+    const expectedHash = committedHashes[document];
+    if (!expectedHash) {
+      return undefined;
+    }
+    try {
+      const bytes = await readFile(safeChild(directory, document), 'utf8');
+      if (sha256(bytes) !== expectedHash) {
+        throw new Error('Optional run artifact integrity verification failed.');
+      }
+      return bytes;
+    } catch {
+      throw new StorageCorruptionError('Run bundle', safeChild(directory, document));
+    }
+  }
+
+  async getResourceInventory(runId: string): Promise<ResourceInventoryV1 | undefined> {
+    const bytes = await this.readOptionalDocument(runId, 'inventory.json');
+    return bytes ? resourceInventoryV1Schema.parse(JSON.parse(bytes)) : undefined;
+  }
+
+  async getStepObservations(runId: string): Promise<StepObservationV1[] | undefined> {
+    const bytes = await this.readOptionalDocument(runId, 'observations.json');
+    return bytes ? stepObservationV1Schema.array().parse(JSON.parse(bytes)) : undefined;
+  }
+
+  async getLiveCheckpoint(runId: string): Promise<LiveRunCheckpointV1 | undefined> {
+    const bytes = await this.readOptionalDocument(runId, 'checkpoint.json');
+    return bytes ? liveRunCheckpointV1Schema.parse(JSON.parse(bytes)) : undefined;
+  }
+}
+
+let liveStateSequence = 0;
+
+export class FilesystemLiveRunStateRepository implements LiveRunStateRepository {
+  constructor(
+    private readonly artifactRoot: string,
+    private readonly hooks: LiveStatePersistenceHooks = {},
+  ) {}
+
+  private root(): string {
+    return safeChild(this.artifactRoot, 'runs', '.inflight');
+  }
+
+  private directory(runId: string): string {
+    assertSafeId(runId);
+    return safeChild(this.root(), runId);
+  }
+
+  async reserve(state: LiveRunState): Promise<void> {
+    assertSafeId(state.runId);
+    const finalDirectory = safeChild(this.artifactRoot, 'runs', state.runId);
+    try {
+      await readFile(safeChild(finalDirectory, '.committed'), 'utf8');
+      throw new RunIdAlreadyExistsError();
+    } catch (error) {
+      if (!isMissing(error)) {
+        throw error;
+      }
+    }
+    try {
+      await readFile(safeChild(finalDirectory, '.reserved'), 'utf8');
+    } catch (error) {
+      if (isMissing(error)) {
+        try {
+          await readdir(finalDirectory);
+          throw new RunIdAlreadyExistsError();
+        } catch (directoryError) {
+          if (!isMissing(directoryError)) {
+            throw directoryError;
+          }
+        }
+      } else {
+        throw error;
+      }
+    }
+
+    const directory = this.directory(state.runId);
+    await mkdir(this.root(), { recursive: true });
+    try {
+      await mkdir(directory);
+    } catch (error) {
+      if (isAlreadyExists(error)) {
+        throw new RunIdAlreadyExistsError();
+      }
+      throw error;
+    }
+
+    try {
+      const parsedState: LiveRunState = {
+        runId: state.runId,
+        plan: executablePlanV1Schema.parse(state.plan),
+        checkpoint: liveRunCheckpointV1Schema.parse(state.checkpoint),
+        resourceInventory: resourceInventoryV1Schema.parse(state.resourceInventory),
+        observations: stepObservationV1Schema.array().parse(state.observations),
+      };
+      await writeFile(
+        safeChild(directory, 'plan.json'),
+        serializeForPersistence(parsedState.plan),
+        {
+          encoding: 'utf8',
+          flag: 'wx',
+        },
+      );
+      await writeFile(
+        safeChild(directory, 'checkpoint.json'),
+        serializeForPersistence(parsedState.checkpoint),
+        { encoding: 'utf8', flag: 'wx' },
+      );
+      await writeFile(
+        safeChild(directory, 'inventory.json'),
+        serializeForPersistence(parsedState.resourceInventory),
+        { encoding: 'utf8', flag: 'wx' },
+      );
+      await writeFile(
+        safeChild(directory, 'observations.json'),
+        serializeForPersistence(parsedState.observations),
+        { encoding: 'utf8', flag: 'wx' },
+      );
+    } catch (error) {
+      await rm(directory, { recursive: true, force: true }).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  private async writeDocument(
+    directory: string,
+    document: LiveStateDocument,
+    bytes: string,
+    state: LiveRunState,
+  ): Promise<void> {
+    liveStateSequence += 1;
+    const temporary = safeChild(directory, `.tmp-${document}-${process.pid}-${liveStateSequence}`);
+    await writeFile(temporary, bytes, { encoding: 'utf8' });
+    await rename(temporary, safeChild(directory, document));
+    await this.hooks.afterWrite?.(document, state);
+  }
+
+  async save(state: LiveRunState): Promise<void> {
+    assertSafeId(state.runId);
+    const directory = this.directory(state.runId);
+    await mkdir(directory, { recursive: true });
+    const parsedState: LiveRunState = {
+      runId: state.runId,
+      plan: executablePlanV1Schema.parse(state.plan),
+      checkpoint: liveRunCheckpointV1Schema.parse(state.checkpoint),
+      resourceInventory: resourceInventoryV1Schema.parse(state.resourceInventory),
+      observations: stepObservationV1Schema.array().parse(state.observations),
+    };
+    await this.writeDocument(
+      directory,
+      'plan.json',
+      serializeForPersistence(parsedState.plan),
+      parsedState,
+    );
+    await this.writeDocument(
+      directory,
+      'checkpoint.json',
+      serializeForPersistence(parsedState.checkpoint),
+      parsedState,
+    );
+    await this.writeDocument(
+      directory,
+      'inventory.json',
+      serializeForPersistence(parsedState.resourceInventory),
+      parsedState,
+    );
+    await this.writeDocument(
+      directory,
+      'observations.json',
+      serializeForPersistence(parsedState.observations),
+      parsedState,
+    );
+  }
+
+  async get(runId: string): Promise<LiveRunState | undefined> {
+    const directory = this.directory(runId);
+    try {
+      const [planBytes, checkpointBytes, inventoryBytes, observationsBytes] = await Promise.all([
+        readFile(safeChild(directory, 'plan.json'), 'utf8'),
+        readFile(safeChild(directory, 'checkpoint.json'), 'utf8'),
+        readFile(safeChild(directory, 'inventory.json'), 'utf8'),
+        readFile(safeChild(directory, 'observations.json'), 'utf8'),
+      ]);
+      return {
+        runId,
+        plan: executablePlanV1Schema.parse(JSON.parse(planBytes)),
+        checkpoint: liveRunCheckpointV1Schema.parse(JSON.parse(checkpointBytes)),
+        resourceInventory: resourceInventoryV1Schema.parse(JSON.parse(inventoryBytes)),
+        observations: stepObservationV1Schema.array().parse(JSON.parse(observationsBytes)),
+      };
+    } catch (error) {
+      if (isMissing(error)) {
+        return undefined;
+      }
+      throw new StorageCorruptionError('Live run state', safeChild(directory, 'checkpoint.json'));
+    }
+  }
+
+  async listActive(): Promise<LiveRunState[]> {
+    let entries;
+    try {
+      entries = await readdir(this.root(), { withFileTypes: true });
+    } catch (error) {
+      if (isMissing(error)) {
+        return [];
+      }
+      throw error;
+    }
+    const states: LiveRunState[] = [];
+    for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
+      if (!entry.isDirectory() || !SAFE_ID_PATTERN.test(entry.name)) {
+        continue;
+      }
+      const state = await this.get(entry.name);
+      if (state && state.checkpoint.status !== 'COMPLETED') {
+        states.push(state);
+      }
+    }
+    return states;
+  }
+
+  async complete(runId: string): Promise<void> {
+    const state = await this.get(runId);
+    if (!state) {
+      return;
+    }
+    await this.save({
+      ...state,
+      checkpoint: liveRunCheckpointV1Schema.parse({
+        ...state.checkpoint,
+        status: 'COMPLETED',
+        updatedAt: new Date().toISOString(),
+      }),
+    });
+  }
+}
+
+export class FilesystemNilesIncidentFixtureRepository {
+  constructor(private readonly root: string) {}
+
+  async list(): Promise<NilesIncidentFixtureV1[]> {
+    const fixtures: NilesIncidentFixtureV1[] = [];
+    for (const file of await yamlFiles(this.root, true)) {
+      try {
+        fixtures.push(parseNilesIncidentFixture(await readYaml(file)));
+      } catch {
+        throw new StorageCorruptionError('NILES incident fixture', file);
+      }
+    }
+    return fixtures.sort((left, right) => left.id.localeCompare(right.id));
+  }
+
+  async getForEnvironment(environmentId: string): Promise<NilesIncidentFixtureV1 | undefined> {
+    assertSafeId(environmentId);
+    return (await this.list()).find((fixture) => fixture.environmentId === environmentId);
+  }
 }
 
 export const storageSchemas = {
   actorProfile: actorProfileV1Schema,
   environmentActorMap: environmentActorMapV1Schema,
   environment: environmentDefinitionV1Schema,
+  nilesIncidentFixture: nilesIncidentFixtureV1Schema,
   scenario: businessBlueprintV1Schema,
 };

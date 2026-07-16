@@ -1,0 +1,1 @@
+This temporary marker exists only to produce one fully validated CI completion on the exact internal branch consumed by the reviewed choice-compatibility workflow.

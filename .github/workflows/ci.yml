@@ -23,7 +23,7 @@ jobs:
       - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa
         with:
           version: 11.13.0
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+      - uses: actions/setup-node@49933ea5288ca8642d1e84afbd3f7d6820020
         with:
           node-version: 24.18.0
           cache: pnpm
@@ -61,3 +61,88 @@ jobs:
             test-results
           if-no-files-found: ignore
           retention-days: 7
+
+  apply-reviewed-choice-compatibility:
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.head_ref == 'ops/apply-choice-compatibility-via-ci'
+    needs: foundation
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Check out the reviewed implementation branch
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: fix/empty-choice-catalog-compatibility
+          persist-credentials: true
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa
+        with:
+          version: 11.13.0
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.18.0
+          cache: pnpm
+
+      - name: Apply and verify the deterministic patch
+        run: |
+          set -euo pipefail
+          pnpm install --frozen-lockfile
+          python3 tools/apply-empty-choice-catalog-compatibility.py
+          python3 - <<'PY'
+          from pathlib import Path
+
+          target = Path('tests/live-incident.test.ts')
+          source = target.read_text(encoding='utf-8')
+          old = "      values: [],\n      configuredCount: 0,"
+          new = "      values: [] as string[],\n      configuredCount: 0,"
+          if source.count(old) != 1:
+              raise SystemExit('expected exactly one generated empty choice-value array')
+          target.write_text(source.replace(old, new, 1), encoding='utf-8')
+          PY
+          pnpm exec prettier --write \
+            packages/core/src/index.ts \
+            packages/adapter-niles/src/index.ts \
+            ops/staging-fixture-bootstrap.mjs \
+            ops/staging-fixture-discovery.mjs \
+            tests/live-incident.test.ts \
+            tests/staging-fixture-plan-selection.test.ts \
+            tests/staging-fixture-bootstrap-assets.test.ts \
+            tests/niles-incident-adapter.test.ts \
+            tests/staging-operator-assets.test.ts \
+            docs/operations/STAGING_FIXTURE_BOOTSTRAP.md
+          python3 -m py_compile ops/staging-fixture-plan.py
+          node --check ops/staging-fixture-bootstrap.mjs
+          node --check ops/staging-fixture-discovery.mjs
+          pnpm exec tsc --noEmit
+          pnpm exec eslint \
+            packages/core/src/index.ts \
+            packages/adapter-niles/src/index.ts \
+            ops/staging-fixture-bootstrap.mjs \
+            ops/staging-fixture-discovery.mjs \
+            tests/live-incident.test.ts \
+            tests/staging-fixture-plan-selection.test.ts \
+            tests/staging-fixture-bootstrap-assets.test.ts \
+            tests/niles-incident-adapter.test.ts \
+            tests/staging-operator-assets.test.ts
+          pnpm exec vitest run \
+            tests/live-incident.test.ts \
+            tests/niles-incident-adapter.test.ts \
+            tests/staging-fixture-plan-selection.test.ts \
+            tests/staging-fixture-bootstrap-assets.test.ts \
+            tests/staging-operator-assets.test.ts
+          git diff --check
+
+      - name: Push only the reviewed implementation changes
+        run: |
+          set -euo pipefail
+          rm -f tools/apply-empty-choice-catalog-compatibility.py
+          git config user.name 'nvs-maintenance-bot'
+          git config user.email 'nvs-maintenance-bot@users.noreply.github.com'
+          git add -A
+          git commit -m 'fix: support NILES product-default choice contracts'
+          git push origin HEAD:fix/empty-choice-catalog-compatibility

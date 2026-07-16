@@ -14,4 +14,20 @@ export default tseslint.config(
       '@typescript-eslint/no-explicit-any': 'error',
     },
   },
+  {
+    files: ['ops/**/*.mjs'],
+    languageOptions: {
+      globals: {
+        AbortSignal: 'readonly',
+        URL: 'readonly',
+        console: 'readonly',
+        crypto: 'readonly',
+        fetch: 'readonly',
+        process: 'readonly',
+      },
+    },
+    rules: {
+      'no-control-regex': 'off',
+    },
+  },
 );

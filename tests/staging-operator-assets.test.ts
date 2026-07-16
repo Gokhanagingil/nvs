@@ -6,12 +6,20 @@ import { describe, expect, it } from 'vitest';
 const root = process.cwd();
 const operatorWorkflowPath = path.join(root, '.github', 'workflows', 'staging-operator.yml');
 const fixtureWorkflowPath = path.join(root, '.github', 'workflows', 'staging-fixture.yml');
+const acceptanceWorkflowPath = path.join(
+  root,
+  '.github',
+  'workflows',
+  'staging-live-acceptance.yml',
+);
 const hostOperatorPath = path.join(root, 'ops', 'staging-operator.py');
 const discoveryStorePath = path.join(root, 'ops', 'staging-discovery-store.py');
 const containerDiscoveryPath = path.join(root, 'ops', 'staging-fixture-discovery.mjs');
 const fixturePlanPath = path.join(root, 'ops', 'staging-fixture-plan.py');
 const fixtureApplyPath = path.join(root, 'ops', 'staging-fixture-apply.py');
 const fixtureApplyGuardPath = path.join(root, 'ops', 'staging-fixture-apply-guard.py');
+const livePreflightPath = path.join(root, 'ops', 'staging-live-preflight.py');
+const liveAcceptancePath = path.join(root, 'ops', 'staging-live-acceptance.py');
 
 describe('browser-triggered staging operator assets', () => {
   it('keeps the read-only staging workflow manual, main-pinned, and non-mutating', () => {
@@ -47,6 +55,23 @@ describe('browser-triggered staging operator assets', () => {
     expect(workflow).not.toContain('set -x');
   });
 
+  it('requires static fixture readiness, explicit live confirmation, and unconditional cleanup', () => {
+    const workflow = readFileSync(acceptanceWorkflowPath, 'utf8');
+
+    expect(workflow).toContain('workflow_dispatch:');
+    expect(workflow).toContain("if: github.ref == 'refs/heads/main'");
+    expect(workflow).toContain('ref: main');
+    expect(workflow).toContain('environment: staging');
+    expect(workflow).toContain('RUN_M1_02B_LIVE_INCIDENT');
+    expect(workflow).toContain('group: nvs-staging-control');
+    expect(workflow).toContain('staging-live-preflight.py');
+    expect(workflow).toContain('Prove fixture readiness before mutation lease');
+    expect(workflow).toContain('force-disable');
+    expect(workflow).toContain('if: always()');
+    expect(workflow).not.toContain('pull_request:');
+    expect(workflow).not.toContain('set -x');
+  });
+
   it('parses every Python and Node operator script without generating artifacts', () => {
     for (const pythonPath of [
       hostOperatorPath,
@@ -54,6 +79,8 @@ describe('browser-triggered staging operator assets', () => {
       fixturePlanPath,
       fixtureApplyPath,
       fixtureApplyGuardPath,
+      livePreflightPath,
+      liveAcceptancePath,
     ]) {
       const python = spawnSync(
         'python3',
@@ -73,7 +100,7 @@ describe('browser-triggered staging operator assets', () => {
     expect(node.status, node.stderr).toBe(0);
   });
 
-  it('keeps credentials, proposal identifiers, and mutation enablement out of public output', () => {
+  it('keeps credentials, proposal identities, and live record identities out of public output', () => {
     const operatorWorkflow = readFileSync(operatorWorkflowPath, 'utf8');
     const fixtureWorkflow = readFileSync(fixtureWorkflowPath, 'utf8');
     const hostOperator = readFileSync(hostOperatorPath, 'utf8');
@@ -82,6 +109,8 @@ describe('browser-triggered staging operator assets', () => {
     const plan = readFileSync(fixturePlanPath, 'utf8');
     const apply = readFileSync(fixtureApplyPath, 'utf8');
     const guard = readFileSync(fixtureApplyGuardPath, 'utf8');
+    const preflight = readFileSync(livePreflightPath, 'utf8');
+    const acceptance = readFileSync(liveAcceptancePath, 'utf8');
 
     expect(discovery).toContain("schemaVersion: 'nvs.staging-fixture-discovery/v1'");
     expect(discovery).toContain('authorization: `Bearer ${accessToken}`');
@@ -92,6 +121,13 @@ describe('browser-triggered staging operator assets', () => {
     expect(plan).not.toContain('print(service)');
     expect(apply).not.toContain('NVS_ENABLE_NILES_MUTATIONS=true');
     expect(guard).toContain('fixture application requires NVS mutations to remain disabled');
+    expect(preflight).toContain('NILES_MUTATIONS_DISABLED');
+    expect(preflight).not.toContain('/auth/login');
+    expect(acceptance).toContain('No credential, bearer token, raw payload, Incident UUID');
+    expect(acceptance).toContain('NVS_ENABLE_NILES_MUTATIONS');
+    expect(acceptance).toContain('LEASE_TTL_SECONDS');
+    expect(acceptance).toContain('RECOVERY_REQUIRED');
+    expect(acceptance).not.toMatch(/print\(\s*(accessToken|password|credential)\b/);
     expect(operatorWorkflow).toContain('staging-discovery-store.py');
     expect(fixtureWorkflow).not.toContain('NVS_ENABLE_NILES_MUTATIONS=true');
     expect(hostOperator).not.toContain('/opt/nvs/.env');

@@ -56,7 +56,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: nvs-staging-fixture
+  group: nvs-staging-control
   cancel-in-progress: false
 
 jobs:

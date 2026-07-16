@@ -45,7 +45,7 @@ jobs:
           fi
           body="$RUNNER_TEMP/legacy-patch-diagnostic.md"
           {
-            echo 'Temporary sanitized diagnostic for the latest legacy assignment patch workflow.'
+            echo 'Temporary sanitized diagnostic for the current legacy assignment patch workflow.'
             echo
             echo '```json'
             printf '%s\n' "$run_json"

@@ -1,0 +1,213 @@
+name: staging fixture bootstrap
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Bootstrap operation
+        required: true
+        default: plan
+        type: choice
+        options:
+          - plan
+          - apply
+      environment_id:
+        description: NVS environment identifier
+        required: true
+        default: staging-example
+        type: string
+      expected_sha:
+        description: Exact deployed NVS build SHA
+        required: true
+        default: 30617d6c576b921607c607c27a2a4d401a1303ed
+        type: string
+      bootstrap_digest:
+        description: SHA-256 printed by a successful bootstrap plan
+        required: false
+        default: ''
+        type: string
+      confirmation:
+        description: Apply requires BOOTSTRAP_M1_02B_FIXTURES
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nvs-staging-control
+  cancel-in-progress: false
+
+jobs:
+  bootstrap:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: staging
+    steps:
+      - name: Check out reviewed bootstrap tooling
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Validate bootstrap inputs
+        env:
+          OPERATION: ${{ inputs.operation }}
+          ENVIRONMENT_ID: ${{ inputs.environment_id }}
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          BOOTSTRAP_DIGEST: ${{ inputs.bootstrap_digest }}
+          CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          set -euo pipefail
+          [[ "$OPERATION" == 'plan' || "$OPERATION" == 'apply' ]]
+          [[ "$ENVIRONMENT_ID" =~ ^[a-z0-9][a-z0-9._-]{0,95}$ ]]
+          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          if [[ -n "$BOOTSTRAP_DIGEST" ]]; then
+            [[ "$BOOTSTRAP_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+          fi
+          if [[ "$OPERATION" == 'apply' ]]; then
+            [[ -n "$BOOTSTRAP_DIGEST" ]]
+            [[ "$CONFIRMATION" == 'BOOTSTRAP_M1_02B_FIXTURES' ]]
+          fi
+
+      - name: Configure pinned SSH trust
+        env:
+          SSH_HOST: ${{ secrets.NVS_STAGING_SSH_HOST }}
+          SSH_USER: ${{ secrets.NVS_STAGING_SSH_USER }}
+          SSH_KEY_B64: ${{ secrets.NVS_STAGING_SSH_KEY_B64 }}
+          SSH_KNOWN_HOSTS: ${{ secrets.NVS_STAGING_SSH_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          [[ "$SSH_HOST" =~ ^[A-Za-z0-9.-]+$ ]]
+          [[ "$SSH_USER" =~ ^[A-Za-z_][A-Za-z0-9_-]{0,31}$ ]]
+          test -n "$SSH_KEY_B64"
+          test -n "$SSH_KNOWN_HOSTS"
+          install -d -m 0700 "$HOME/.ssh"
+          printf '%s' "$SSH_KEY_B64" | base64 --decode > "$HOME/.ssh/id_nvs_staging"
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 0600 "$HOME/.ssh/id_nvs_staging" "$HOME/.ssh/known_hosts"
+
+      - name: Plan or apply deterministic staging fixtures
+        env:
+          SSH_HOST: ${{ secrets.NVS_STAGING_SSH_HOST }}
+          SSH_USER: ${{ secrets.NVS_STAGING_SSH_USER }}
+          OPERATION: ${{ inputs.operation }}
+          ENVIRONMENT_ID: ${{ inputs.environment_id }}
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          BOOTSTRAP_DIGEST: ${{ inputs.bootstrap_digest }}
+          CONFIRMATION: ${{ inputs.confirmation }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          ssh_options=(
+            -i "$HOME/.ssh/id_nvs_staging"
+            -o BatchMode=yes
+            -o IdentitiesOnly=yes
+            -o StrictHostKeyChecking=yes
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts"
+          )
+          remote="${SSH_USER}@${SSH_HOST}"
+          remote_dir="/tmp/nvs-staging-bootstrap-${RUN_ID}-${RUN_ATTEMPT}"
+          result_file="$RUNNER_TEMP/nvs-staging-fixture-bootstrap.json"
+          summary_file="$RUNNER_TEMP/nvs-staging-fixture-bootstrap.md"
+
+          ssh "${ssh_options[@]}" "$remote" "install -d -m 0700 '$remote_dir'"
+          scp "${ssh_options[@]}" ops/staging-fixture-bootstrap.mjs "${remote}:${remote_dir}/"
+
+          printf -v expected_q '%q' "$EXPECTED_SHA"
+          ssh "${ssh_options[@]}" "$remote" \
+            "observed=\$(curl --fail --silent --show-error http://127.0.0.1:4100/api/version | python3 -c 'import json,sys; print(json.load(sys.stdin).get(\"buildSha\", \"\"))'); [[ \"\$observed\" == $expected_q ]]; mutation=\$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' nvs | awk -F= '\$1 == \"NVS_ENABLE_NILES_MUTATIONS\" {print tolower(\$2)}' | tail -n 1); [[ \"\$mutation\" != true ]]"
+
+          operation_b64="$(printf '%s' "$OPERATION" | base64 -w0)"
+          environment_b64="$(printf '%s' "$ENVIRONMENT_ID" | base64 -w0)"
+          digest_b64="$(printf '%s' "$BOOTSTRAP_DIGEST" | base64 -w0)"
+          confirmation_b64="$(printf '%s' "$CONFIRMATION" | base64 -w0)"
+
+          set +e
+          ssh "${ssh_options[@]}" "$remote" \
+            "operation=\$(printf '%s' '$operation_b64' | base64 --decode); environment_id=\$(printf '%s' '$environment_b64' | base64 --decode); bootstrap_digest=\$(printf '%s' '$digest_b64' | base64 --decode); confirmation=\$(printf '%s' '$confirmation_b64' | base64 --decode); docker exec -i -e NVS_BOOTSTRAP_OPERATION=\"\$operation\" -e NVS_BOOTSTRAP_ENVIRONMENT_ID=\"\$environment_id\" -e NVS_BOOTSTRAP_EXPECTED_DIGEST=\"\$bootstrap_digest\" -e NVS_BOOTSTRAP_CONFIRMATION=\"\$confirmation\" nvs node --input-type=module - < '$remote_dir/staging-fixture-bootstrap.mjs'" \
+            > "$result_file"
+          status=$?
+          set -e
+
+          python3 - "$result_file" "$summary_file" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          source = pathlib.Path(sys.argv[1])
+          target = pathlib.Path(sys.argv[2])
+          payload = json.loads(source.read_text(encoding='utf-8'))
+          result = payload.get('result', 'FAIL')
+          operation = payload.get('operation', 'unknown')
+          lines = [
+              '# NVS staging fixture bootstrap',
+              '',
+              f'- Operation: `{operation}`',
+              f'- Result: `{result}`',
+          ]
+          digest = payload.get('digest')
+          if isinstance(digest, str):
+              lines.append(f'- Bootstrap digest: `{digest}`')
+          planned = payload.get('plannedActions')
+          if isinstance(planned, list):
+              lines.extend(['', '## Planned actions', ''])
+              lines.extend(f'- `{item}`' for item in planned)
+              if not planned:
+                  lines.append('- `NONE_ALREADY_READY`')
+          counts = payload.get('existingCounts')
+          if isinstance(counts, dict):
+              lines.extend(['', '## Existing deterministic resources', ''])
+              lines.extend(f'- {key}: `{value}`' for key, value in sorted(counts.items()))
+          effects = payload.get('effects')
+          if isinstance(effects, list):
+              lines.extend(['', '## Apply effects', ''])
+              for effect in effects:
+                  if isinstance(effect, dict):
+                      lines.append(
+                          f"- `{effect.get('resource', 'unknown')}`: `{effect.get('disposition', 'unknown')}`"
+                      )
+          error = payload.get('error')
+          if isinstance(error, dict):
+              lines.extend(
+                  [
+                      '',
+                      '## Safe error',
+                      '',
+                      f"- Code: `{error.get('code', 'UNKNOWN')}`",
+                      f"- Message: {error.get('message', 'No safe message was returned.')}",
+                  ]
+              )
+          lines.extend(
+              [
+                  '',
+                  'No live UUID, credential, bearer token, raw request/response payload, or private inventory is included in this summary.',
+              ]
+          )
+          target.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+          PY
+
+          cat "$summary_file"
+          {
+            echo
+            cat "$summary_file"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          ssh "${ssh_options[@]}" "$remote" "rm -rf '$remote_dir'" || true
+          exit "$status"
+
+      - name: Upload sanitized bootstrap result
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: nvs-staging-fixture-bootstrap-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/nvs-staging-fixture-bootstrap.md
+          retention-days: 1
+          if-no-files-found: ignore
+
+      - name: Remove local SSH material
+        if: always()
+        run: rm -rf "$HOME/.ssh"

@@ -63,6 +63,9 @@ describe('staging fixture bootstrap assets', () => {
     expect(source).toContain('CREATE_CONFIGURATION_APPROVER');
     expect(source).toContain('RECOVER_CONFIGURATION_APPROVER');
     expect(source).toContain("role: 'admin'");
+    expect(source).toContain('tenantId: context.tenantId');
+    expect(source).toContain('domainAccessItsm: true');
+    expect(source).not.toContain('hasItsmAccess: true');
     expect(source).toContain('mustChangePassword: false');
     expect(source).toContain('APPROVER_CREDENTIAL_SCHEMA');
     expect(source).toContain('CONFIGURATION_APPROVER_SELF_APPROVAL_FORBIDDEN');

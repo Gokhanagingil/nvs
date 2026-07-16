@@ -52,6 +52,8 @@ describe('staging fixture bootstrap assets', () => {
     expect(source).toContain("acknowledgement: 'PUBLISH_SLA_POLICY'");
     expect(source).toContain('/publish-requests/${approvalId}/approve');
     expect(source).toContain("operator: 'is', value: serviceId");
+    expect(source.match(/'x-correlation-id': randomUUID\(\)/g)).toHaveLength(2);
+    expect(source).not.toContain('bootstrap_${randomUUID');
   });
 
   it('is resume-safe and never performs broad deletion or exposes private inventory', () => {

@@ -60,5 +60,8 @@ source = source.replace(
   "const anchor = \"  it('classifies a real HTTP 502 as retryable upstream failure rather than malformed response', async () => {\";",
   "const anchor = \"  it('parses affected-CI paginated object envelopes', async () => {\";",
 );
+source = source
+  .replace('    do {\\n      attempt += 1;', '    for (;;) {\\n      attempt += 1;')
+  .replace('    } while (true);\\n  }\\n\\n  private allowlistMatches', '    }\\n  }\\n\\n  private allowlistMatches');
 
 await writeFile(path, source, 'utf8');

@@ -112,8 +112,12 @@ jobs:
         run: |
           set +e
           {
-            corepack pnpm run ci
+            corepack pnpm exec prettier --write packages/core/src/index.ts tests/live-incident.test.ts
             verify_status=$?
+            if [ "$verify_status" -eq 0 ]; then
+              corepack pnpm run ci
+              verify_status=$?
+            fi
             if [ "$verify_status" -eq 0 ]; then
               bash -n ops/*.sh ops/ci/*.sh
               verify_status=$?

@@ -267,17 +267,12 @@ class StatefulIncidentAdapter implements NilesIncidentLiveAdapter {
 
   async readChoiceValues(input: { field: 'pendingReason' | 'relationshipType' | 'impactScope' }) {
     this.operations.push(`GET choices ${input.field}`);
-    const values =
-      input.field === 'pendingReason'
-        ? ['pending_external_dependency']
-        : input.field === 'relationshipType'
-          ? ['affected_by']
-          : ['service_impacting'];
     return {
-      values,
+      values: [] as string[],
+      configuredCount: 0,
       transport: {
         method: 'GET' as const,
-        pathTemplate: '/grc/itsm/choices?table=:table&field=:field',
+        pathTemplate: '/grc/itsm/choices?table=:table&field=:field&includeInactive=true',
         httpStatus: 200,
         durationMs: 1,
         correlationId: `choice_${input.field}`,
@@ -615,6 +610,35 @@ describe('live Incident API orchestration', () => {
       ]),
     );
     expect(adapter.operations.every((operation) => operation.startsWith('GET'))).toBe(true);
+  });
+
+  it('blocks a non-empty incident-CI choice catalog that omits the required value', async () => {
+    class IncompatibleChoiceAdapter extends StatefulIncidentAdapter {
+      override async readChoiceValues(input: {
+        field: 'pendingReason' | 'relationshipType' | 'impactScope';
+      }) {
+        const result = await super.readChoiceValues(input);
+        return input.field === 'relationshipType'
+          ? { ...result, values: ['caused_by'], configuredCount: 1 }
+          : result;
+      }
+    }
+    const adapter = new IncompatibleChoiceAdapter();
+    const core = buildCore(adapter);
+
+    const readiness = await core.confirmExecutionReadiness({
+      environmentId: 'live-test',
+      scenarioId: 'payment-api-service-degradation',
+      variationValues: { journey: 'normal' },
+    });
+
+    expect(readiness).toMatchObject({
+      verdict: 'BLOCKED',
+      confirmed: true,
+      mutationEligible: false,
+      error: { code: 'NILES_FIXTURE_CHOICE_UNSUPPORTED' },
+    });
+    expect(adapter.operations.some((operation) => operation.startsWith('POST'))).toBe(false);
   });
 
   it('blocks a live run before mutation when a required fixture resource is missing', async () => {

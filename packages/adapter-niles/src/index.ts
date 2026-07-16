@@ -852,21 +852,34 @@ export class NilesIncidentApiAdapter implements NilesIncidentLiveAdapter {
     table: 'itsm_incidents' | 'itsm_incident_ci';
     field: 'pendingReason' | 'relationshipType' | 'impactScope';
     correlationId: string;
-  }): Promise<{ values: string[]; transport?: NilesTransportEvidence }> {
-    const query = new URLSearchParams({ table: input.table, field: input.field });
+  }): Promise<{
+    values: string[];
+    configuredCount: number;
+    transport?: NilesTransportEvidence;
+  }> {
+    const query = new URLSearchParams({
+      table: input.table,
+      field: input.field,
+      includeInactive: 'true',
+    });
     return this.request({
       ...input,
       method: 'GET',
       path: `/grc/itsm/choices?${query.toString()}`,
-      pathTemplate: '/grc/itsm/choices?table=:table&field=:field',
+      pathTemplate: '/grc/itsm/choices?table=:table&field=:field&includeInactive=true',
       operation: `read ${input.table}.${input.field} choices`,
-    }).then((response) => ({
-      values: asArrayPayload(response.payload).flatMap((entry) => {
-        const value = safeString(asRecord(entry)?.['value']);
-        return value ? [value] : [];
-      }),
-      transport: response.transport,
-    }));
+    }).then((response) => {
+      const entries = asArrayPayload(response.payload);
+      return {
+        values: entries.flatMap((entry) => {
+          const record = asRecord(entry);
+          const value = safeString(record?.['value']);
+          return value && record?.['isActive'] !== false ? [value] : [];
+        }),
+        configuredCount: entries.length,
+        transport: response.transport,
+      };
+    });
   }
 
   createIncident(input: {

@@ -242,7 +242,12 @@ function selectCi(value) {
 
 function selectChoice(value) {
   const item = asRecord(value);
-  return safeString(item?.value);
+  const choiceValue = safeString(item?.value);
+  if (!choiceValue) return undefined;
+  return {
+    value: choiceValue,
+    isActive: safeBoolean(item?.isActive) ?? true,
+  };
 }
 
 function sortByName(items) {
@@ -257,10 +262,7 @@ function sortByName(items) {
 
 function validateQuery(value, scope) {
   if (value.length > 100 || /[\u0000-\u001f\u007f]/u.test(value)) {
-    throw new DiscoveryError(
-      'DISCOVERY_QUERY_INVALID',
-      `The ${scope} discovery query is invalid.`,
-    );
+    throw new DiscoveryError('DISCOVERY_QUERY_INVALID', `The ${scope} discovery query is invalid.`);
   }
 }
 
@@ -279,7 +281,10 @@ async function main() {
   const environments = await readYamlDirectory(path.join(CONFIG_DIR, 'environments'));
   const environment = environments.find((document) => document.values.id === environmentId)?.values;
   if (!environment) {
-    throw new DiscoveryError('ENVIRONMENT_NOT_FOUND', 'The requested NVS environment is not configured.');
+    throw new DiscoveryError(
+      'ENVIRONMENT_NOT_FOUND',
+      'The requested NVS environment is not configured.',
+    );
   }
   const baseUrl = safeString(environment.baseUrl);
   if (!baseUrl || !/^https?:\/\//u.test(baseUrl)) {
@@ -420,7 +425,7 @@ async function main() {
   async function discoverChoice(field, table) {
     return discoverScope(
       `choice-${table}-${field}`,
-      `/grc/itsm/choices?table=${encodeURIComponent(table)}&field=${encodeURIComponent(field)}`,
+      `/grc/itsm/choices?table=${encodeURIComponent(table)}&field=${encodeURIComponent(field)}&includeInactive=true`,
       selectChoice,
     );
   }
@@ -442,9 +447,23 @@ async function main() {
       configurationItems: sortByName(configurationItems),
     },
     choices: {
-      pendingReason: [...pendingReason].sort(),
-      relationshipType: [...relationshipType].sort(),
-      impactScope: [...impactScope].sort(),
+      pendingReason: pendingReason
+        .filter((choice) => choice.isActive !== false)
+        .map((choice) => choice.value)
+        .sort(),
+      relationshipType: relationshipType
+        .filter((choice) => choice.isActive !== false)
+        .map((choice) => choice.value)
+        .sort(),
+      impactScope: impactScope
+        .filter((choice) => choice.isActive !== false)
+        .map((choice) => choice.value)
+        .sort(),
+    },
+    choiceCatalogCounts: {
+      pendingReason: pendingReason.length,
+      relationshipType: relationshipType.length,
+      impactScope: impactScope.length,
     },
     errors,
   };

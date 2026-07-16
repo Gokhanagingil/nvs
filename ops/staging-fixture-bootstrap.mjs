@@ -37,10 +37,9 @@ const DESIRED = Object.freeze({
   ci: {
     name: 'NVS-PAYMENT-API-STG',
     description: 'Synthetic Payment API configuration item for NVS staging validation.',
-    status: 'active',
     lifecycle: 'active',
     environment: 'staging',
-    version: 'synthetic-v1',
+    category: 'application',
   },
   choices: [
     {
@@ -224,6 +223,43 @@ function requireUuid(scope, value) {
     throw new BootstrapError('BOOTSTRAP_RESPONSE_INVALID', `${scope} did not expose a valid UUID.`);
   }
   return candidate;
+}
+
+function resolveChoiceCompatibility(desiredChoice, records) {
+  const activeRecords = records.filter((item) => asRecord(item)?.isActive !== false);
+  const matches = exactMatches(activeRecords, 'value', desiredChoice.value);
+  const choice = requireUnique(`${desiredChoice.table}.${desiredChoice.field} choice`, matches);
+  if (choice) {
+    return {
+      desired: desiredChoice,
+      existingId: requireUuid('choice', choice.id),
+      compatibilityMode: 'CATALOG_RECORD',
+    };
+  }
+  if (
+    desiredChoice.table === 'itsm_incidents' &&
+    desiredChoice.field === 'pendingReason' &&
+    desiredChoice.value === 'pending_external_dependency'
+  ) {
+    return {
+      desired: desiredChoice,
+      compatibilityMode: 'BUILTIN_PRODUCT_DEFAULT',
+    };
+  }
+  if (
+    desiredChoice.table === 'itsm_incident_ci' &&
+    ['relationshipType', 'impactScope'].includes(desiredChoice.field) &&
+    records.length === 0
+  ) {
+    return {
+      desired: desiredChoice,
+      compatibilityMode: 'EMPTY_CATALOG_VALIDATION_BYPASS',
+    };
+  }
+  throw new BootstrapError(
+    'BOOTSTRAP_RESOURCE_INCOMPATIBLE',
+    `The configured ${desiredChoice.table}.${desiredChoice.field} value is not accepted by the tenant choice contract.`,
+  );
 }
 
 function classification(status) {
@@ -548,23 +584,13 @@ async function discover(context) {
       context,
       admin,
       'GET',
-      `/grc/itsm/choices?table=${encoded(desiredChoice.table)}&field=${encoded(desiredChoice.field)}`,
+      `/grc/itsm/choices?table=${encoded(desiredChoice.table)}&field=${encoded(desiredChoice.field)}&includeInactive=true`,
       undefined,
       undefined,
       `list ${desiredChoice.field} choices`,
     );
-    const matches = exactMatches(arrayFrom(payload), 'value', desiredChoice.value);
-    const choice = requireUnique(`${desiredChoice.table}.${desiredChoice.field} choice`, matches);
-    if (choice?.isActive === false) {
-      throw new BootstrapError(
-        'BOOTSTRAP_RESOURCE_INCOMPATIBLE',
-        'A deterministic choice exists but is inactive.',
-      );
-    }
-    choiceState.push({
-      desired: desiredChoice,
-      existingId: choice ? requireUuid('choice', choice.id) : undefined,
-    });
+    const records = arrayFrom(payload);
+    choiceState.push(resolveChoiceCompatibility(desiredChoice, records));
   }
 
   const writes = asRecord(writesPayload);
@@ -577,22 +603,25 @@ async function discover(context) {
 
   let policyState = { kind: 'MISSING' };
   if (policy) {
-    const policyId = requireUuid('governed SLA policy', policy.policyId);
-    const details = asRecord(
-      await api(
-        context,
-        admin,
-        'GET',
-        `/grc/itsm/sla/governed/policies/${policyId}`,
-        undefined,
-        undefined,
-        'read governed SLA policy details',
-      ),
-    );
-    const published = asRecord(details?.publishedRevision);
-    const draft = asRecord(details?.activeDraft);
-    if (published) {
-      if (!serviceId || !compatibleSnapshot(published.snapshot, policySnapshot(serviceId))) {
+    const policyId = requireUuid('governed SLA policy', policy.id);
+    const publishedSummary = asRecord(policy.publishedRevisionSummary);
+    const draftSummary = asRecord(policy.activeDraftSummary);
+    const readRevision = async (revisionId, scope) =>
+      asRecord(
+        await api(
+          context,
+          admin,
+          'GET',
+          `/grc/itsm/sla/governed/revisions/${revisionId}`,
+          undefined,
+          undefined,
+          scope,
+        ),
+      );
+    if (publishedSummary) {
+      const revisionId = requireUuid('published SLA revision', publishedSummary.revisionId);
+      const revision = await readRevision(revisionId, 'read published governed SLA revision');
+      if (!serviceId || !compatibleSnapshot(revision?.snapshot, policySnapshot(serviceId))) {
         throw new BootstrapError(
           'BOOTSTRAP_RESOURCE_INCOMPATIBLE',
           'The deterministic governed SLA policy has an incompatible published snapshot.',
@@ -601,14 +630,16 @@ async function discover(context) {
       policyState = {
         kind: 'PUBLISHED',
         policyId,
-        revisionId: requireUuid('published SLA revision', published.id),
+        revisionId,
         runtimeDefinitionId: requireUuid(
           'published SLA runtime definition',
-          published.runtimeDefinitionId,
+          policy.runtimeDefinitionId,
         ),
       };
-    } else if (draft) {
-      if (!serviceId || !compatibleSnapshot(draft.snapshot, policySnapshot(serviceId))) {
+    } else if (draftSummary) {
+      const revisionId = requireUuid('draft SLA revision', draftSummary.revisionId);
+      const revision = await readRevision(revisionId, 'read draft governed SLA revision');
+      if (!serviceId || !compatibleSnapshot(revision?.snapshot, policySnapshot(serviceId))) {
         throw new BootstrapError(
           'BOOTSTRAP_RESOURCE_INCOMPATIBLE',
           'The deterministic governed SLA policy has an incompatible draft snapshot.',
@@ -617,7 +648,7 @@ async function discover(context) {
       policyState = {
         kind: 'DRAFT',
         policyId,
-        revisionId: requireUuid('draft SLA revision', draft.id),
+        revisionId,
       };
     } else {
       throw new BootstrapError(
@@ -642,9 +673,6 @@ async function discover(context) {
   if (!groupMemberPresent) actions.push('ADD_SERVICE_DESK_MEMBER');
   if (!classId) actions.push('CREATE_CI_CLASS');
   if (!serviceId) actions.push('CREATE_CMDB_SERVICE');
-  for (const choice of choiceState) {
-    if (!choice.existingId) actions.push(`CREATE_CHOICE_${choice.desired.field.toUpperCase()}`);
-  }
   if (policyState.kind === 'MISSING') actions.push('CREATE_AND_PUBLISH_GOVERNED_SLA');
   if (policyState.kind === 'DRAFT') actions.push('COMPLETE_GOVERNED_SLA_PUBLISH');
   if (!offeringId) actions.push('CREATE_SERVICE_OFFERING');
@@ -668,6 +696,7 @@ async function discover(context) {
         field: choice.desired.field,
         value: choice.desired.value,
         existingId: choice.existingId ?? null,
+        compatibilityMode: choice.compatibilityMode,
       })),
       policy: policyState,
     },
@@ -829,9 +858,7 @@ async function ensurePublishedPolicy(context, serviceId, current) {
       'published governed SLA policy',
       exactMatches(policies, 'policyName', DESIRED.sla.name),
     );
-    const runtimeDefinitionId = safeString(
-      asRecord(match?.publishedRevisionSummary)?.runtimeDefinitionId,
-    );
+    const runtimeDefinitionId = safeString(match?.runtimeDefinitionId);
     if (runtimeDefinitionId) {
       return {
         runtimeDefinitionId: requireUuid('published SLA runtime definition', runtimeDefinitionId),
@@ -924,19 +951,11 @@ async function applyPlan(context, plan) {
   }
 
   for (const choice of plan.state.choiceState) {
-    if (choice.existingId) {
-      effects.push({ resource: `choice:${choice.desired.field}`, disposition: 'REUSED' });
-      continue;
-    }
-    await createResource(
-      context,
-      admin,
-      '/grc/itsm/choices',
-      { ...choice.desired, isActive: true },
-      `choice-${choice.desired.field}`,
-      `create ${choice.desired.field} choice`,
-    );
-    effects.push({ resource: `choice:${choice.desired.field}`, disposition: 'CREATED' });
+    effects.push({
+      resource: `choice:${choice.desired.field}`,
+      disposition: choice.existingId ? 'REUSED' : 'PRODUCT_DEFAULT',
+      compatibilityMode: choice.compatibilityMode,
+    });
   }
 
   const policy = await ensurePublishedPolicy(context, serviceId, plan.state.policyState);
@@ -967,7 +986,7 @@ async function applyPlan(context, plan) {
       context,
       admin,
       '/grc/cmdb/cis',
-      { ...DESIRED.ci, classId, ownerUserId: serviceDesk.userId },
+      { ...DESIRED.ci, classId, ownedBy: serviceDesk.userId },
       'ci-create',
       'create configuration item',
     );
@@ -994,6 +1013,7 @@ async function applyPlan(context, plan) {
         table: choice.desired.table,
         field: choice.desired.field,
         value: choice.desired.value,
+        compatibilityMode: choice.compatibilityMode,
       })),
     },
     effects,

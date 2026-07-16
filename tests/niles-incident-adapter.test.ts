@@ -185,6 +185,36 @@ describe('NILES incident live API adapter', () => {
     });
   });
 
+  it('reads active choice values while retaining the configured catalog count', async () => {
+    const fetchMock = vi.fn<FetchImplementation>().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          success: true,
+          data: [
+            { value: 'affected_by', isActive: true },
+            { value: 'caused_by', isActive: false },
+          ],
+        }),
+        { status: 200 },
+      ),
+    );
+    const adapter = new NilesIncidentApiAdapter(fetchMock, 100);
+
+    await expect(
+      adapter.readChoiceValues({
+        environment,
+        session,
+        tenantId,
+        table: 'itsm_incident_ci',
+        field: 'relationshipType',
+        correlationId: 'read-choice-catalog',
+      }),
+    ).resolves.toMatchObject({ values: ['affected_by'], configuredCount: 2 });
+
+    const [requestUrl] = fetchMock.mock.calls[0]!;
+    expect(String(requestUrl)).toContain('includeInactive=true');
+  });
+
   it('parses affected-CI paginated object envelopes', async () => {
     const ciId = '88888888-8888-4888-8888-888888888888';
     const fetchMock = vi.fn<FetchImplementation>().mockResolvedValue(

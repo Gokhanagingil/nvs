@@ -312,6 +312,28 @@ def _assignment_selection(item: dict[str, Any], mode: str) -> dict[str, Any]:
     return {"mode": "CANONICAL_ID", **_selection(item)}
 
 
+def _choice_compatibility(
+    field: str,
+    values: Any,
+    configured_count: Any,
+    expected: str,
+) -> str:
+    if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
+        raise PlanError(f"tenant choice catalog for {field} returned an invalid shape.")
+    if not isinstance(configured_count, int) or configured_count < 0:
+        raise PlanError(f"tenant choice catalog count for {field} is unavailable.")
+    normalized = {value.casefold() for value in values}
+    if expected.casefold() in normalized:
+        return "CATALOG_RECORD"
+    if field == "pendingReason" and expected == "pending_external_dependency":
+        return "BUILTIN_PRODUCT_DEFAULT"
+    if field in {"relationshipType", "impactScope"} and configured_count == 0:
+        return "EMPTY_CATALOG_VALIDATION_BYPASS"
+    raise PlanError(
+        f"tenant choice contract does not accept required {field} value {expected}."
+    )
+
+
 def _run(args: argparse.Namespace) -> int:
     if not SAFE_ID.fullmatch(args.environment_id):
         raise PlanError("environment_id is not a safe NVS identifier.")
@@ -355,12 +377,17 @@ def _run(args: argparse.Namespace) -> int:
         "relationshipType": "affected_by",
         "impactScope": "service_impacting",
     }
-    for field, expected in required_choices.items():
-        values = choice_map.get(field)
-        if not isinstance(values, list) or expected not in values:
-            raise PlanError(
-                f"tenant choice catalog does not contain required {field} value {expected}."
-            )
+    catalog_counts = discovery.get("choiceCatalogCounts")
+    count_map = catalog_counts if isinstance(catalog_counts, dict) else {}
+    choice_compatibility = {
+        field: _choice_compatibility(
+            field,
+            choice_map.get(field),
+            count_map.get(field),
+            expected,
+        )
+        for field, expected in required_choices.items()
+    }
 
     generated_at = datetime.now(timezone.utc).isoformat()
     proposal: dict[str, Any] = {
@@ -387,6 +414,7 @@ def _run(args: argparse.Namespace) -> int:
             "configurationItem": _selection(ci),
         },
         "choices": required_choices,
+        "choiceCompatibility": choice_compatibility,
         "candidateCounts": {
             "assignmentGroups": group_count,
             "services": service_count,
@@ -422,6 +450,13 @@ def _run(args: argparse.Namespace) -> int:
         f"- Offering eligible matches linked to the selected service: `1` of `{offering_count}` returned"
     )
     print(f"- CI eligible matches: `1` of `{ci_count}` returned")
+    print(
+        "- Choice compatibility: `"
+        + ", ".join(
+            f"{field}={mode}" for field, mode in sorted(choice_compatibility.items())
+        )
+        + "`"
+    )
     print(f"- Server proposal file: `{proposal_path}`")
     print()
     print("**Result:** PASS")

@@ -38,6 +38,8 @@ jobs:
           python3 .github/scripts/patch-test-choice.py
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+      - name: Install Chromium
+        run: pnpm exec playwright install --with-deps chromium
       - name: Format changed sources
         run: pnpm exec prettier --write packages/core/src/index.ts packages/adapter-niles/src/index.ts packages/contracts/src/index.ts tests/live-incident.test.ts fixtures/niles-incident/staging.example.yaml
       - name: Focused regressions

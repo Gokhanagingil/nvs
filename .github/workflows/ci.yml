@@ -80,10 +80,30 @@ jobs:
           node-version: 24.18.0
           cache: pnpm
       - name: Apply final blocker fixes
+        id: apply
+        shell: bash
         run: |
-          node .github/scripts/m1-02b-finalize-hotfix.mjs
-          node .github/scripts/m1-02b-finalize.mjs
-          rm -f .github/scripts/m1-02b-finalize-hotfix.mjs
+          set +e
+          {
+            node .github/scripts/m1-02b-finalize-hotfix.mjs
+            hotfix_status=$?
+            if [ "$hotfix_status" -eq 0 ]; then
+              node .github/scripts/m1-02b-finalize.mjs
+              apply_status=$?
+            else
+              apply_status=$hotfix_status
+            fi
+          } > .github/finalizer-error.log 2>&1
+          cat .github/finalizer-error.log
+          if [ "$apply_status" -ne 0 ]; then
+            git config user.name "nvs-maintenance-bot"
+            git config user.email "nvs-maintenance-bot@users.noreply.github.com"
+            git add .github/finalizer-error.log
+            git commit -m "chore: capture M1-02B finalizer error"
+            git push origin HEAD:agent/m1-02b-real-incident-api
+            exit "$apply_status"
+          fi
+          rm -f .github/finalizer-error.log .github/scripts/m1-02b-finalize-hotfix.mjs
       - run: pnpm install --frozen-lockfile
       - run: pnpm exec playwright install --with-deps chromium
       - name: Verify transformed tree

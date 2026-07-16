@@ -117,6 +117,7 @@ jobs:
           ssh "${ssh_options[@]}" "$remote" "install -d -m 0700 '$remote_dir'"
           scp "${ssh_options[@]}" \
             ops/staging-operator.py \
+            ops/staging-discovery-store.py \
             ops/staging-fixture-discovery.mjs \
             "${remote}:${remote_dir}/"
 
@@ -132,7 +133,7 @@ jobs:
             status=$?
           else
             ssh "${ssh_options[@]}" "$remote" \
-              "query=\$(printf '%s' '$query_b64' | base64 --decode); python3 '$remote_dir/staging-operator.py' discover --environment-id $environment_q --query \"\$query\" --discovery-script '$remote_dir/staging-fixture-discovery.mjs'" \
+              "query=\$(printf '%s' '$query_b64' | base64 --decode); python3 '$remote_dir/staging-discovery-store.py' --environment-id $environment_q --query \"\$query\" --discovery-script '$remote_dir/staging-fixture-discovery.mjs' --output-file '/opt/nvs/releases/nvs-fixture-discovery-latest.json'" \
               >"$output_file"
             status=$?
           fi

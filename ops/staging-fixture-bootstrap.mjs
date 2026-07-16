@@ -1,5 +1,5 @@
-import { createHash, randomUUID } from 'node:crypto';
-import { chmod, mkdir, readFile, readdir, rename, writeFile } from 'node:fs/promises';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { chmod, lstat, mkdir, readFile, readdir, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
 const CONFIG_DIR = process.env.NVS_CONFIG_DIR || '/app/config';
@@ -10,6 +10,11 @@ const ENVIRONMENT_ID = (process.env.NVS_BOOTSTRAP_ENVIRONMENT_ID || 'staging-exa
 const REQUEST_TIMEOUT_MS = 10_000;
 const APPLY_CONFIRMATION = 'BOOTSTRAP_M1_02B_FIXTURES';
 const INVENTORY_PATH = '/app/data/bootstrap/staging-fixture-bootstrap.json';
+const APPROVER_CREDENTIAL_SCHEMA = 'nvs.staging-configuration-approver-credential/v1';
+const APPROVER_CREDENTIAL_PATH = path.join(
+  '/app/data/bootstrap',
+  `${ENVIRONMENT_ID}-configuration-approver.json`,
+);
 
 const DESIRED = Object.freeze({
   group: {
@@ -225,6 +230,117 @@ function requireUuid(scope, value) {
   return candidate;
 }
 
+function configurationApproverEmail(tenantId) {
+  return `nvs.configuration-approver.${tenantId.slice(0, 8).toLowerCase()}@example.com`;
+}
+
+function generateConfigurationApproverPassword() {
+  return `NvS!2${randomBytes(32).toString('base64url')}aA`;
+}
+
+async function writePrivateJson(filePath, payload) {
+  if (!filePath.startsWith('/app/data/bootstrap/')) {
+    throw new BootstrapError(
+      'PRIVATE_STORAGE_PATH_INVALID',
+      'Bootstrap private state must remain inside the dedicated data directory.',
+    );
+  }
+  const directory = path.dirname(filePath);
+  await mkdir(directory, { recursive: true });
+  try {
+    const existing = await lstat(filePath);
+    if (existing.isSymbolicLink()) {
+      throw new BootstrapError(
+        'PRIVATE_STORAGE_SYMLINK_FORBIDDEN',
+        'Bootstrap private state must not be a symbolic link.',
+      );
+    }
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+  const temporary = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  await writeFile(
+    temporary,
+    `${JSON.stringify(payload, null, 2)}
+`,
+    {
+      encoding: 'utf8',
+      mode: 0o600,
+    },
+  );
+  await rename(temporary, filePath);
+  await chmod(filePath, 0o600);
+}
+
+async function readConfigurationApproverCredential(tenantId) {
+  let raw;
+  try {
+    const existing = await lstat(APPROVER_CREDENTIAL_PATH);
+    if (existing.isSymbolicLink()) {
+      throw new BootstrapError(
+        'CONFIGURATION_APPROVER_SECRET_INVALID',
+        'The configuration approver credential path must not be a symbolic link.',
+      );
+    }
+    raw = await readFile(APPROVER_CREDENTIAL_PATH, 'utf8');
+  } catch (error) {
+    if (error?.code === 'ENOENT') return undefined;
+    throw error;
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new BootstrapError(
+      'CONFIGURATION_APPROVER_SECRET_INVALID',
+      'The configuration approver credential file is invalid.',
+    );
+  }
+  const record = asRecord(parsed);
+  const email = safeString(record?.email);
+  const password = typeof record?.password === 'string' ? record.password : '';
+  const state = safeString(record?.state);
+  if (
+    record?.schemaVersion !== APPROVER_CREDENTIAL_SCHEMA ||
+    record?.tenantId !== tenantId ||
+    email !== configurationApproverEmail(tenantId) ||
+    password.length < 24 ||
+    !['PENDING', 'READY'].includes(state)
+  ) {
+    throw new BootstrapError(
+      'CONFIGURATION_APPROVER_SECRET_INVALID',
+      'The configuration approver credential file does not match the staging tenant contract.',
+    );
+  }
+  const userId = record?.userId
+    ? requireUuid('configuration approver user', record.userId)
+    : undefined;
+  if (state === 'READY' && !userId) {
+    throw new BootstrapError(
+      'CONFIGURATION_APPROVER_SECRET_INVALID',
+      'The ready configuration approver credential does not include a user identity.',
+    );
+  }
+  return { email, password, state, userId };
+}
+
+function validateConfigurationApproverUser(user, tenantId) {
+  const record = asRecord(user);
+  const id = requireUuid('configuration approver user', record?.id);
+  if (
+    safeString(record?.email) !== configurationApproverEmail(tenantId) ||
+    safeString(record?.role)?.toLowerCase() !== 'admin' ||
+    record?.isActive === false ||
+    (record?.tenantId && record.tenantId !== tenantId)
+  ) {
+    throw new BootstrapError(
+      'CONFIGURATION_APPROVER_INCOMPATIBLE',
+      'The deterministic configuration approver account has incompatible tenant, role, or active-state metadata.',
+    );
+  }
+  return { id, email: configurationApproverEmail(tenantId) };
+}
+
 function resolveChoiceCompatibility(desiredChoice, records) {
   const activeRecords = records.filter((item) => asRecord(item)?.isActive !== false);
   const matches = exactMatches(activeRecords, 'value', desiredChoice.value);
@@ -300,38 +416,61 @@ async function fetchJson(url, init, scope) {
   return unwrapData(payload);
 }
 
+async function authenticateCredential(baseUrl, persona, credential, expectedTenantId) {
+  const payload = await fetchJson(
+    new URL('/auth/login', baseUrl),
+    {
+      method: 'POST',
+      headers: {
+        accept: 'application/json',
+        'content-type': 'application/json',
+        'x-correlation-id': randomUUID(),
+      },
+      body: JSON.stringify({ email: credential.email, password: credential.password }),
+    },
+    `${persona} login`,
+  );
+  const record = asRecord(payload);
+  const user = asRecord(record?.user);
+  const accessToken = safeString(record?.accessToken);
+  const userId = requireUuid(`${persona} login user`, user?.id);
+  const tenantId = requireUuid(`${persona} login tenant`, user?.tenantId);
+  if (!accessToken || tenantId !== expectedTenantId) {
+    throw new BootstrapError(
+      'TENANT_MISMATCH',
+      'A staging actor authenticated into an unexpected tenant.',
+    );
+  }
+  return { accessToken, userId, tenantId, persona };
+}
+
 async function login(baseUrl, profile, expectedTenantId) {
   const credential = resolveCredential(profile.credentialRef);
   try {
-    const payload = await fetchJson(
-      new URL('/auth/login', baseUrl),
-      {
-        method: 'POST',
-        headers: {
-          accept: 'application/json',
-          'content-type': 'application/json',
-          'x-correlation-id': randomUUID(),
-        },
-        body: JSON.stringify({ email: credential.email, password: credential.password }),
-      },
-      `${profile.persona} login`,
-    );
-    const record = asRecord(payload);
-    const user = asRecord(record?.user);
-    const accessToken = safeString(record?.accessToken);
-    const userId = requireUuid(`${profile.persona} login user`, user?.id);
-    const tenantId = requireUuid(`${profile.persona} login tenant`, user?.tenantId);
-    if (!accessToken || tenantId !== expectedTenantId) {
-      throw new BootstrapError(
-        'TENANT_MISMATCH',
-        'A staging actor authenticated into an unexpected tenant.',
-      );
-    }
-    return { accessToken, userId, tenantId, persona: profile.persona };
+    return await authenticateCredential(baseUrl, profile.persona, credential, expectedTenantId);
   } finally {
     credential.email = '';
     credential.password = '';
   }
+}
+
+async function loginConfigurationApprover(context, credential) {
+  const inMemory = { email: credential.email, password: credential.password };
+  try {
+    return await authenticateCredential(
+      context.baseUrl,
+      'configuration-approver',
+      inMemory,
+      context.tenantId,
+    );
+  } finally {
+    inMemory.email = '';
+    inMemory.password = '';
+  }
+}
+
+function clearSession(session) {
+  if (session) session.accessToken = '';
 }
 
 function headers(session, tenantId, idempotencyKey) {
@@ -424,6 +563,7 @@ async function discover(context) {
     cisPayload,
     policiesPayload,
     writesPayload,
+    approverUsersPayload,
   ] = await Promise.all([
     api(
       context,
@@ -487,6 +627,15 @@ async function discover(context) {
       undefined,
       undefined,
       'read governed SLA write state',
+    ),
+    api(
+      context,
+      admin,
+      'GET',
+      `/users?page=1&limit=100&search=${encoded(configurationApproverEmail(context.tenantId))}`,
+      undefined,
+      undefined,
+      'discover configuration approver',
     ),
   ]);
 
@@ -576,6 +725,52 @@ async function discover(context) {
     groupMemberPresent = arrayFrom(membersPayload).some(
       (entry) => safeString(asRecord(entry)?.userId) === serviceDesk.userId,
     );
+  }
+
+  const approverEmail = configurationApproverEmail(context.tenantId);
+  const approverUserRecord = requireUnique(
+    'configuration approver user',
+    exactMatches(arrayFrom(approverUsersPayload, 'users'), 'email', approverEmail),
+  );
+  const approverUser = approverUserRecord
+    ? validateConfigurationApproverUser(approverUserRecord, context.tenantId)
+    : undefined;
+  const approverCredential = await readConfigurationApproverCredential(context.tenantId);
+  let approverState;
+  if (!approverUser && !approverCredential) {
+    approverState = { kind: 'MISSING' };
+  } else if (!approverUser && approverCredential) {
+    approverState = { kind: 'PENDING' };
+  } else if (approverUser && !approverCredential) {
+    throw new BootstrapError(
+      'CONFIGURATION_APPROVER_SECRET_MISSING',
+      'The deterministic configuration approver exists but its server-owned credential is unavailable.',
+    );
+  } else {
+    if (approverCredential.userId && approverCredential.userId !== approverUser.id) {
+      throw new BootstrapError(
+        'CONFIGURATION_APPROVER_IDENTITY_MISMATCH',
+        'The stored configuration approver credential references an unexpected user.',
+      );
+    }
+    if (approverUser.id === admin.userId) {
+      throw new BootstrapError(
+        'CONFIGURATION_APPROVER_SELF_APPROVAL_FORBIDDEN',
+        'The configuration approver must be distinct from the governed SLA requester.',
+      );
+    }
+    const session = await loginConfigurationApprover(context, approverCredential);
+    try {
+      if (session.userId !== approverUser.id) {
+        throw new BootstrapError(
+          'CONFIGURATION_APPROVER_IDENTITY_MISMATCH',
+          'The stored configuration approver credential resolved to an unexpected user.',
+        );
+      }
+    } finally {
+      clearSession(session);
+    }
+    approverState = { kind: 'READY', userId: approverUser.id };
   }
 
   const choiceState = [];
@@ -673,6 +868,12 @@ async function discover(context) {
   if (!groupMemberPresent) actions.push('ADD_SERVICE_DESK_MEMBER');
   if (!classId) actions.push('CREATE_CI_CLASS');
   if (!serviceId) actions.push('CREATE_CMDB_SERVICE');
+  if (policyState.kind !== 'PUBLISHED' && approverState.kind === 'MISSING') {
+    actions.push('CREATE_CONFIGURATION_APPROVER');
+  }
+  if (policyState.kind !== 'PUBLISHED' && approverState.kind === 'PENDING') {
+    actions.push('RECOVER_CONFIGURATION_APPROVER');
+  }
   if (policyState.kind === 'MISSING') actions.push('CREATE_AND_PUBLISH_GOVERNED_SLA');
   if (policyState.kind === 'DRAFT') actions.push('COMPLETE_GOVERNED_SLA_PUBLISH');
   if (!offeringId) actions.push('CREATE_SERVICE_OFFERING');
@@ -683,7 +884,7 @@ async function discover(context) {
     environmentId: ENVIRONMENT_ID,
     tenantId: context.tenantId,
     serviceDeskUserId: serviceDesk.userId,
-    desiredVersion: 1,
+    desiredVersion: 2,
     existing: {
       groupId: groupId ?? null,
       groupMemberPresent,
@@ -699,6 +900,10 @@ async function discover(context) {
         compatibilityMode: choice.compatibilityMode,
       })),
       policy: policyState,
+      configurationApprover: {
+        kind: approverState.kind,
+        userId: approverState.userId ?? null,
+      },
     },
     actions,
   };
@@ -715,6 +920,7 @@ async function discover(context) {
       ciId,
       choiceState,
       policyState,
+      approverState,
     },
     safe: {
       schemaVersion: 'nvs.staging-fixture-bootstrap-result/v1',
@@ -730,6 +936,7 @@ async function discover(context) {
         configurationItems: ciId ? 1 : 0,
         choices: choiceState.filter((choice) => choice.existingId).length,
         publishedSlaPolicies: policyState.kind === 'PUBLISHED' ? 1 : 0,
+        configurationApprovers: approverState.kind === 'READY' ? 1 : 0,
       },
       targetNames: {
         assignmentGroup: DESIRED.group.name,
@@ -754,10 +961,17 @@ async function createResource(context, session, pathname, body, action, scope) {
   return requireUuid(scope, payload?.id ?? asRecord(payload?.response)?.targetId);
 }
 
-async function ensurePublishedPolicy(context, serviceId, current) {
-  const { admin, manager } = context.sessions;
+async function ensurePublishedPolicy(context, serviceId, current, approver) {
+  const { admin } = context.sessions;
   if (current.kind === 'PUBLISHED') {
     return { runtimeDefinitionId: current.runtimeDefinitionId, disposition: 'REUSED' };
+  }
+
+  if (!approver) {
+    throw new BootstrapError(
+      'CONFIGURATION_APPROVER_REQUIRED',
+      'A distinct tenant-admin configuration approver is required for governed SLA publication.',
+    );
   }
 
   let revisionId = current.kind === 'DRAFT' ? current.revisionId : undefined;
@@ -815,7 +1029,7 @@ async function ensurePublishedPolicy(context, serviceId, current) {
   if (approval.status !== 'APPROVED') {
     await api(
       context,
-      manager,
+      approver,
       'POST',
       `/grc/itsm/sla/governed/publish-requests/${approvalId}/approve`,
       {
@@ -874,15 +1088,112 @@ async function ensurePublishedPolicy(context, serviceId, current) {
 }
 
 async function atomicInventory(payload) {
-  const directory = path.dirname(INVENTORY_PATH);
-  await mkdir(directory, { recursive: true });
-  const temporary = `${INVENTORY_PATH}.${process.pid}.${Date.now()}.tmp`;
-  await writeFile(temporary, `${JSON.stringify(payload, null, 2)}\n`, {
-    encoding: 'utf8',
-    mode: 0o600,
+  await writePrivateJson(INVENTORY_PATH, payload);
+}
+
+async function findConfigurationApprover(context) {
+  const payload = await api(
+    context,
+    context.sessions.admin,
+    'GET',
+    `/users?page=1&limit=100&search=${encodeURIComponent(configurationApproverEmail(context.tenantId))}`,
+    undefined,
+    undefined,
+    'find configuration approver',
+  );
+  const match = requireUnique(
+    'configuration approver user',
+    exactMatches(
+      arrayFrom(payload, 'users'),
+      'email',
+      configurationApproverEmail(context.tenantId),
+    ),
+  );
+  return match ? validateConfigurationApproverUser(match, context.tenantId) : undefined;
+}
+
+async function ensureConfigurationApprover(context, current) {
+  let credential = await readConfigurationApproverCredential(context.tenantId);
+  let created = false;
+  if (!credential) {
+    credential = {
+      email: configurationApproverEmail(context.tenantId),
+      password: generateConfigurationApproverPassword(),
+      state: 'PENDING',
+    };
+    await writePrivateJson(APPROVER_CREDENTIAL_PATH, {
+      schemaVersion: APPROVER_CREDENTIAL_SCHEMA,
+      tenantId: context.tenantId,
+      email: credential.email,
+      password: credential.password,
+      state: 'PENDING',
+      createdAt: new Date().toISOString(),
+    });
+  }
+
+  let user = await findConfigurationApprover(context);
+  if (!user) {
+    try {
+      const createdPayload = await api(
+        context,
+        context.sessions.admin,
+        'POST',
+        '/users',
+        {
+          email: credential.email,
+          password: credential.password,
+          firstName: 'NVS',
+          lastName: 'Configuration Approver',
+          department: 'NVS Validation',
+          role: 'admin',
+          isActive: true,
+          isGlobalAdmin: false,
+          hasItsmAccess: true,
+          mustChangePassword: false,
+        },
+        undefined,
+        'create configuration approver',
+      );
+      user = validateConfigurationApproverUser(createdPayload, context.tenantId);
+      created = true;
+    } catch (error) {
+      for (let attempt = 0; attempt < 20 && !user; attempt += 1) {
+        await new Promise((resolve) => globalThis.setTimeout(resolve, 250));
+        user = await findConfigurationApprover(context);
+      }
+      if (!user) throw error;
+    }
+  }
+
+  if (user.id === context.sessions.admin.userId) {
+    throw new BootstrapError(
+      'CONFIGURATION_APPROVER_SELF_APPROVAL_FORBIDDEN',
+      'The configuration approver must be distinct from the governed SLA requester.',
+    );
+  }
+  const session = await loginConfigurationApprover(context, credential);
+  if (session.userId !== user.id) {
+    clearSession(session);
+    throw new BootstrapError(
+      'CONFIGURATION_APPROVER_IDENTITY_MISMATCH',
+      'The configuration approver credential resolved to an unexpected user.',
+    );
+  }
+  await writePrivateJson(APPROVER_CREDENTIAL_PATH, {
+    schemaVersion: APPROVER_CREDENTIAL_SCHEMA,
+    tenantId: context.tenantId,
+    email: credential.email,
+    password: credential.password,
+    state: 'READY',
+    userId: user.id,
+    verifiedAt: new Date().toISOString(),
   });
-  await rename(temporary, INVENTORY_PATH);
-  await chmod(INVENTORY_PATH, 0o600);
+  credential.password = '';
+  return {
+    session,
+    userId: user.id,
+    disposition: created ? 'CREATED' : current.kind === 'READY' ? 'REUSED' : 'RECOVERED',
+  };
 }
 
 async function applyPlan(context, plan) {
@@ -958,7 +1269,26 @@ async function applyPlan(context, plan) {
     });
   }
 
-  const policy = await ensurePublishedPolicy(context, serviceId, plan.state.policyState);
+  let configurationApprover;
+  if (plan.state.policyState.kind !== 'PUBLISHED') {
+    configurationApprover = await ensureConfigurationApprover(context, plan.state.approverState);
+    effects.push({
+      resource: 'configurationApprover',
+      disposition: configurationApprover.disposition,
+    });
+  }
+
+  let policy;
+  try {
+    policy = await ensurePublishedPolicy(
+      context,
+      serviceId,
+      plan.state.policyState,
+      configurationApprover?.session,
+    );
+  } finally {
+    clearSession(configurationApprover?.session);
+  }
   effects.push({ resource: 'slaPolicy', disposition: policy.disposition });
 
   let offeringId = plan.state.offeringId;
@@ -1004,6 +1334,8 @@ async function applyPlan(context, plan) {
     resources: {
       assignmentGroupId: groupId,
       serviceDeskUserId: serviceDesk.userId,
+      configurationApproverUserId:
+        configurationApprover?.userId ?? plan.state.approverState.userId ?? null,
       ciClassId: classId,
       serviceId,
       offeringId,
@@ -1060,16 +1392,15 @@ async function loadContext() {
         candidate.enabled !== false,
     );
   const adminProfile = profile('tenant-admin');
-  const managerProfile = profile('incident-manager');
   const serviceDeskProfile = profile('service-desk-agent');
-  if (!adminProfile || !managerProfile || !serviceDeskProfile) {
+  if (!adminProfile || !serviceDeskProfile) {
     throw new BootstrapError(
       'ACTOR_PROFILE_MISSING',
       'Required staging actor profiles are unavailable.',
     );
   }
   const tenantId = requireUuid('fixture tenant', adminProfile.tenantId);
-  for (const actor of [adminProfile, managerProfile, serviceDeskProfile]) {
+  for (const actor of [adminProfile, serviceDeskProfile]) {
     if (!actor.credentialRef || actor.tenantId !== tenantId) {
       throw new BootstrapError(
         'ACTOR_PROFILE_INVALID',
@@ -1079,7 +1410,6 @@ async function loadContext() {
   }
   const sessions = {
     admin: await login(baseUrl, adminProfile, tenantId),
-    manager: await login(baseUrl, managerProfile, tenantId),
     serviceDesk: await login(baseUrl, serviceDeskProfile, tenantId),
   };
   return { baseUrl, tenantId, sessions };

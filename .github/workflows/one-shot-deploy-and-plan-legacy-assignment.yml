@@ -1,0 +1,170 @@
+name: one-shot deploy and plan legacy assignment
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/one-shot-deploy-and-plan-legacy-assignment.yml
+
+permissions:
+  actions: write
+  contents: write
+  issues: write
+
+concurrency:
+  group: nvs-one-shot-deploy-and-plan-legacy-assignment
+  cancel-in-progress: false
+
+jobs:
+  orchestrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    steps:
+      - name: Check out main for self-cleanup
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: main
+          persist-credentials: true
+          fetch-depth: 0
+
+      - name: Deploy exact clean build and run sanitized read-only fixture plan
+        id: operation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_SHA: 30617d6c576b921607c607c27a2a4d401a1303ed
+        run: |
+          set -euo pipefail
+          repo="$GITHUB_REPOSITORY"
+
+          latest_run_id() {
+            local workflow="$1"
+            gh run list \
+              --repo "$repo" \
+              --workflow "$workflow" \
+              --branch main \
+              --event workflow_dispatch \
+              --limit 1 \
+              --json databaseId \
+              --jq '.[0].databaseId // 0'
+          }
+
+          await_new_run() {
+            local workflow="$1"
+            local previous="$2"
+            local candidate='0'
+            for _attempt in $(seq 1 60); do
+              sleep 2
+              candidate="$(latest_run_id "$workflow")"
+              if [[ "$candidate" != '0' && "$candidate" != "$previous" ]]; then
+                printf '%s' "$candidate"
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          deploy_previous="$(latest_run_id deploy-staging.yml)"
+          gh workflow run deploy-staging.yml \
+            --repo "$repo" \
+            --ref main \
+            --field "ref=$TARGET_SHA"
+          deploy_run_id="$(await_new_run deploy-staging.yml "$deploy_previous")"
+
+          set +e
+          gh run watch "$deploy_run_id" --repo "$repo" --exit-status
+          deploy_status=$?
+          set -e
+          deploy_json="$(gh run view "$deploy_run_id" --repo "$repo" --json databaseId,status,conclusion,url,headSha)"
+
+          fixture_run_id=''
+          fixture_status=99
+          fixture_json='null'
+          result_dir="$RUNNER_TEMP/staging-fixture-result"
+          mkdir -p "$result_dir"
+
+          if [[ "$deploy_status" -eq 0 ]]; then
+            fixture_previous="$(latest_run_id staging-fixture.yml)"
+            gh workflow run staging-fixture.yml \
+              --repo "$repo" \
+              --ref main \
+              --field operation=plan \
+              --field environment_id=staging-example \
+              --field "expected_sha=$TARGET_SHA" \
+              --field assignment_group_query='service desk' \
+              --field service_query=payment \
+              --field offering_query=payment \
+              --field ci_query=payment \
+              --field proposal_digest='' \
+              --field confirmation=''
+            fixture_run_id="$(await_new_run staging-fixture.yml "$fixture_previous")"
+            set +e
+            gh run watch "$fixture_run_id" --repo "$repo" --exit-status
+            fixture_status=$?
+            set -e
+            fixture_json="$(gh run view "$fixture_run_id" --repo "$repo" --json databaseId,status,conclusion,url,headSha)"
+            set +e
+            gh run download "$fixture_run_id" \
+              --repo "$repo" \
+              --name "nvs-staging-fixture-${fixture_run_id}-1" \
+              --dir "$result_dir"
+            download_status=$?
+            set -e
+          else
+            download_status=1
+          fi
+
+          comment_file="$RUNNER_TEMP/deploy-and-plan-comment.md"
+          {
+            echo '## Clean legacy-assignment staging deployment and fixture plan'
+            echo
+            echo "- Target build SHA: \`$TARGET_SHA\`"
+            echo "- Deploy run ID: \`$deploy_run_id\`"
+            echo "- Deploy exit status: \`$deploy_status\`"
+            echo
+            echo '```json'
+            printf '%s\n' "$deploy_json"
+            echo '```'
+            echo
+            if [[ -n "$fixture_run_id" ]]; then
+              echo "- Fixture-plan run ID: \`$fixture_run_id\`"
+              echo "- Fixture-plan exit status: \`$fixture_status\`"
+              echo
+              echo '```json'
+              printf '%s\n' "$fixture_json"
+              echo '```'
+              echo
+              if [[ "$download_status" -eq 0 && -f "$result_dir/nvs-staging-fixture.md" ]]; then
+                cat "$result_dir/nvs-staging-fixture.md"
+              else
+                echo '**Fixture result artifact:** unavailable'
+              fi
+            else
+              echo '**Fixture plan:** not started because deployment did not pass.'
+            fi
+          } > "$comment_file"
+
+          gh api \
+            --method POST \
+            "repos/${repo}/issues/9/comments" \
+            --raw-field "body=$(cat "$comment_file")" \
+            >/dev/null
+
+          if [[ "$deploy_status" -ne 0 || "$fixture_status" -ne 0 ]]; then
+            exit 1
+          fi
+
+      - name: Remove this one-shot workflow
+        if: always()
+        run: |
+          set -euo pipefail
+          git config user.name 'nvs-maintenance-bot'
+          git config user.email 'nvs-maintenance-bot@users.noreply.github.com'
+          git pull --ff-only origin main
+          rm -f .github/workflows/one-shot-deploy-and-plan-legacy-assignment.yml
+          if git diff --quiet --exit-code; then
+            exit 0
+          fi
+          git add .github/workflows/one-shot-deploy-and-plan-legacy-assignment.yml
+          git commit -m 'chore: remove completed deploy-and-plan workflow'
+          git push origin HEAD:main

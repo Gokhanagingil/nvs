@@ -1,0 +1,206 @@
+name: one-shot patch bootstrap private data directory
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/one-shot-patch-bootstrap-private-data-dir.yml
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: nvs-one-shot-patch-bootstrap-private-data-dir
+  cancel-in-progress: false
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: main
+          persist-credentials: true
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa
+        with:
+          version: 11.13.0
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.18.0
+          cache: pnpm
+
+      - name: Apply deterministic private-data-directory correction
+        id: patch
+        run: |
+          set -euo pipefail
+          git config user.name 'nvs-maintenance-bot'
+          git config user.email 'nvs-maintenance-bot@users.noreply.github.com'
+          git checkout -B fix/bootstrap-private-data-dir origin/main
+          pnpm install --frozen-lockfile
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path: Path, old: str, new: str) -> None:
+              text = path.read_text(encoding='utf-8')
+              count = text.count(old)
+              if count != 1:
+                  raise RuntimeError(f'{path}: expected one exact match, found {count}: {old[:160]!r}')
+              path.write_text(text.replace(old, new, 1), encoding='utf-8')
+
+          bootstrap = Path('ops/staging-fixture-bootstrap.mjs')
+          replace_once(
+              bootstrap,
+              "const CONFIG_DIR = process.env.NVS_CONFIG_DIR || '/app/config';\n",
+              "const CONFIG_DIR = process.env.NVS_CONFIG_DIR || '/app/config';\n"
+              "const DATA_DIR = process.env.NVS_DATA_DIR || '/var/lib/nvs';\n",
+          )
+          replace_once(
+              bootstrap,
+              "const INVENTORY_PATH = '/app/data/bootstrap/staging-fixture-bootstrap.json';\n"
+              "const APPROVER_CREDENTIAL_SCHEMA = 'nvs.staging-configuration-approver-credential/v1';\n"
+              "const APPROVER_CREDENTIAL_PATH = path.join(\n"
+              "  '/app/data/bootstrap',\n",
+              "const PRIVATE_BOOTSTRAP_DIR = path.join(DATA_DIR, 'bootstrap');\n"
+              "const INVENTORY_PATH = path.join(PRIVATE_BOOTSTRAP_DIR, 'staging-fixture-bootstrap.json');\n"
+              "const APPROVER_CREDENTIAL_SCHEMA = 'nvs.staging-configuration-approver-credential/v1';\n"
+              "const APPROVER_CREDENTIAL_PATH = path.join(\n"
+              "  PRIVATE_BOOTSTRAP_DIR,\n",
+          )
+          replace_once(
+              bootstrap,
+              "async function writePrivateJson(filePath, payload) {\n"
+              "  if (!filePath.startsWith('/app/data/bootstrap/')) {\n"
+              "    throw new BootstrapError(\n"
+              "      'PRIVATE_STORAGE_PATH_INVALID',\n"
+              "      'Bootstrap private state must remain inside the dedicated data directory.',\n"
+              "    );\n"
+              "  }\n",
+              "async function writePrivateJson(filePath, payload) {\n"
+              "  const relative = path.relative(PRIVATE_BOOTSTRAP_DIR, filePath);\n"
+              "  if (\n"
+              "    !relative ||\n"
+              "    relative === '..' ||\n"
+              "    relative.startsWith(`..${path.sep}`) ||\n"
+              "    path.isAbsolute(relative)\n"
+              "  ) {\n"
+              "    throw new BootstrapError(\n"
+              "      'PRIVATE_STORAGE_PATH_INVALID',\n"
+              "      'Bootstrap private state must remain inside the dedicated data directory.',\n"
+              "    );\n"
+              "  }\n",
+          )
+          replace_once(
+              bootstrap,
+              "async function loadContext() {\n"
+              "  if (!['plan', 'apply'].includes(OPERATION)) {\n",
+              "async function loadContext() {\n"
+              "  if (!path.isAbsolute(DATA_DIR)) {\n"
+              "    throw new BootstrapError(\n"
+              "      'PRIVATE_STORAGE_PATH_INVALID',\n"
+              "      'The configured NVS data directory must be an absolute path.',\n"
+              "    );\n"
+              "  }\n"
+              "  if (!['plan', 'apply'].includes(OPERATION)) {\n",
+          )
+
+          docs = Path('docs/operations/STAGING_FIXTURE_BOOTSTRAP.md')
+          replace_once(
+              docs,
+              "The configuration-approver credential is generated inside staging, never returned to the GitHub runner, and stored only as a mode-`0600` server-owned document under `/app/data/bootstrap`. It is not an ordinary Incident actor profile and is not exposed in application evidence or public workflow output.",
+              "The configuration-approver credential is generated inside staging, never returned to the GitHub runner, and stored only as a mode-`0600` server-owned document under the configured NVS data directory (`/var/lib/nvs/bootstrap` in staging). It is not an ordinary Incident actor profile and is not exposed in application evidence or public workflow output.",
+          )
+          replace_once(
+              docs,
+              "/app/data/bootstrap/staging-fixture-bootstrap.json\n/app/data/bootstrap/<environment>-configuration-approver.json",
+              "/var/lib/nvs/bootstrap/staging-fixture-bootstrap.json\n/var/lib/nvs/bootstrap/<environment>-configuration-approver.json",
+          )
+
+          tests = Path('tests/staging-fixture-bootstrap-assets.test.ts')
+          replace_once(
+              tests,
+              "    expect(source).toContain(\"filePath.startsWith('/app/data/bootstrap/')\");\n",
+              "    expect(source).toContain(\"process.env.NVS_DATA_DIR || '/var/lib/nvs'\");\n"
+              "    expect(source).toContain('path.relative(PRIVATE_BOOTSTRAP_DIR, filePath)');\n"
+              "    expect(source).not.toContain(\"const INVENTORY_PATH = '/app/data/bootstrap\");\n",
+          )
+          PY
+
+          rm -f .github/workflows/one-shot-patch-bootstrap-private-data-dir.yml
+          pnpm exec prettier --write \
+            ops/staging-fixture-bootstrap.mjs \
+            tests/staging-fixture-bootstrap-assets.test.ts \
+            docs/operations/STAGING_FIXTURE_BOOTSTRAP.md
+          node --check ops/staging-fixture-bootstrap.mjs
+          pnpm exec eslint ops/staging-fixture-bootstrap.mjs tests/staging-fixture-bootstrap-assets.test.ts
+          pnpm exec vitest run tests/staging-fixture-bootstrap-assets.test.ts
+          pnpm run typecheck
+          git diff --check
+
+          changed="$(git diff --name-only | sort)"
+          expected="$(printf '%s\n' \
+            '.github/workflows/one-shot-patch-bootstrap-private-data-dir.yml' \
+            'docs/operations/STAGING_FIXTURE_BOOTSTRAP.md' \
+            'ops/staging-fixture-bootstrap.mjs' \
+            'tests/staging-fixture-bootstrap-assets.test.ts' | sort)"
+          [[ "$changed" == "$expected" ]]
+
+          git add -A
+          git commit -m 'fix: store bootstrap private state in configured data mount'
+          git push origin HEAD:fix/bootstrap-private-data-dir
+          echo "implementation_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Publish sanitized patch result
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMPLEMENTATION_SHA: ${{ steps.patch.outputs.implementation_sha }}
+        run: |
+          set -euo pipefail
+          body="$RUNNER_TEMP/bootstrap-private-data-dir-result.md"
+          {
+            echo '# Sanitized bootstrap private-data-directory patch result'
+            echo
+            echo "- Implementation branch: \`fix/bootstrap-private-data-dir\`"
+            echo "- Implementation SHA: \`$IMPLEMENTATION_SHA\`"
+            echo '- Deterministic blocker corrected: private bootstrap state now follows `NVS_DATA_DIR` and the writable staging data mount.'
+            echo '- Validation: formatting, Node syntax, ESLint, focused tests, TypeScript, and diff checks passed.'
+            echo '- Staging access or mutation: none'
+            echo '- Live Incident acceptance: not executed'
+          } > "$body"
+          gh issue edit 23 \
+            --repo "$GITHUB_REPOSITORY" \
+            --title '[Closed] Bootstrap private data directory correction' \
+            --body-file "$body"
+
+  cleanup:
+    needs: patch
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: main
+          persist-credentials: true
+          fetch-depth: 0
+      - name: Remove completed patch workflow
+        run: |
+          set -euo pipefail
+          git config user.name 'nvs-maintenance-bot'
+          git config user.email 'nvs-maintenance-bot@users.noreply.github.com'
+          git pull --ff-only origin main
+          rm -f .github/workflows/one-shot-patch-bootstrap-private-data-dir.yml
+          if git diff --quiet --exit-code; then
+            exit 0
+          fi
+          git add .github/workflows/one-shot-patch-bootstrap-private-data-dir.yml
+          git commit -m 'chore: remove completed bootstrap data directory patch workflow'
+          git push origin HEAD:main

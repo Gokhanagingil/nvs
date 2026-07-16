@@ -1,18 +1,21 @@
 name: one-shot apply empty choice-catalog compatibility
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - .github/workflows/one-shot-apply-empty-choice-compatibility.yml
+  issue_comment:
+    types:
+      - created
 
 permissions:
   contents: write
+  issues: write
 
 jobs:
   patch:
-    if: github.actor != 'github-actions[bot]'
+    if: >-
+      github.event.issue.number == 23 &&
+      github.event.issue.pull_request == null &&
+      github.event.comment.user.login == github.repository_owner &&
+      github.event.comment.body == 'APPLY_REVIEWED_CHOICE_COMPATIBILITY_PATCH'
     runs-on: ubuntu-latest
     timeout-minutes: 35
     steps:
@@ -33,44 +36,74 @@ jobs:
           cache: pnpm
 
       - name: Apply, format, and validate the compatibility patch
+        id: patch
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          log="$RUNNER_TEMP/choice-compatibility-patch.log"
+          {
+            set -euo pipefail
+            pnpm install --frozen-lockfile
+            python3 tools/apply-empty-choice-catalog-compatibility.py
+            pnpm exec prettier --write \
+              packages/core/src/index.ts \
+              packages/adapter-niles/src/index.ts \
+              ops/staging-fixture-bootstrap.mjs \
+              ops/staging-fixture-discovery.mjs \
+              tests/live-incident.test.ts \
+              tests/staging-fixture-plan-selection.test.ts \
+              tests/staging-fixture-bootstrap-assets.test.ts \
+              tests/niles-incident-adapter.test.ts \
+              tests/staging-operator-assets.test.ts \
+              docs/operations/STAGING_FIXTURE_BOOTSTRAP.md
+            python3 -m py_compile ops/staging-fixture-plan.py
+            node --check ops/staging-fixture-bootstrap.mjs
+            node --check ops/staging-fixture-discovery.mjs
+            pnpm exec tsc --noEmit
+            pnpm exec eslint \
+              packages/core/src/index.ts \
+              packages/adapter-niles/src/index.ts \
+              ops/staging-fixture-bootstrap.mjs \
+              ops/staging-fixture-discovery.mjs \
+              tests/live-incident.test.ts \
+              tests/staging-fixture-plan-selection.test.ts \
+              tests/staging-fixture-bootstrap-assets.test.ts \
+              tests/niles-incident-adapter.test.ts \
+              tests/staging-operator-assets.test.ts
+            pnpm exec vitest run \
+              tests/live-incident.test.ts \
+              tests/niles-incident-adapter.test.ts \
+              tests/staging-fixture-plan-selection.test.ts \
+              tests/staging-fixture-bootstrap-assets.test.ts \
+              tests/staging-operator-assets.test.ts
+            git diff --check
+          } 2>&1 | tee "$log"
+
+      - name: Publish sanitized failure diagnostics
+        if: steps.patch.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          pnpm install --frozen-lockfile
-          python3 tools/apply-empty-choice-catalog-compatibility.py
-          pnpm exec prettier --write \
-            packages/core/src/index.ts \
-            packages/adapter-niles/src/index.ts \
-            ops/staging-fixture-bootstrap.mjs \
-            ops/staging-fixture-discovery.mjs \
-            tests/live-incident.test.ts \
-            tests/staging-fixture-plan-selection.test.ts \
-            tests/staging-fixture-bootstrap-assets.test.ts \
-            tests/niles-incident-adapter.test.ts \
-            tests/staging-operator-assets.test.ts \
-            docs/operations/STAGING_FIXTURE_BOOTSTRAP.md
-          python3 -m py_compile ops/staging-fixture-plan.py
-          node --check ops/staging-fixture-bootstrap.mjs
-          node --check ops/staging-fixture-discovery.mjs
-          pnpm exec tsc --noEmit
-          pnpm exec eslint \
-            packages/core/src/index.ts \
-            packages/adapter-niles/src/index.ts \
-            ops/staging-fixture-bootstrap.mjs \
-            ops/staging-fixture-discovery.mjs \
-            tests/live-incident.test.ts \
-            tests/staging-fixture-plan-selection.test.ts \
-            tests/staging-fixture-bootstrap-assets.test.ts \
-            tests/niles-incident-adapter.test.ts \
-            tests/staging-operator-assets.test.ts
-          pnpm exec vitest run \
-            tests/live-incident.test.ts \
-            tests/niles-incident-adapter.test.ts \
-            tests/staging-fixture-plan-selection.test.ts \
-            tests/staging-fixture-bootstrap-assets.test.ts \
-            tests/staging-operator-assets.test.ts
-          git diff --check
+          log="$RUNNER_TEMP/choice-compatibility-patch.log"
+          safe="$RUNNER_TEMP/choice-compatibility-patch-safe.log"
+          tail -n 220 "$log" \
+            | sed -E 's/(authorization:|bearer |password|token)[^ ]*/\1 [redacted]/Ig' \
+            > "$safe"
+          body="$RUNNER_TEMP/choice-compatibility-patch-failure.md"
+          {
+            echo '## Reviewed choice-compatibility patch failed'
+            echo
+            echo 'The implementation branch was not pushed. Sanitized diagnostic tail:'
+            echo
+            echo '```text'
+            cat "$safe"
+            echo '```'
+          } > "$body"
+          gh issue comment 23 --repo "$GITHUB_REPOSITORY" --body-file "$body"
 
       - name: Push only the implementation change
+        if: steps.patch.outcome == 'success'
         run: |
           set -euo pipefail
           rm -f tools/apply-empty-choice-catalog-compatibility.py
@@ -80,14 +113,17 @@ jobs:
           git commit -m 'fix: support NILES product-default choice contracts'
           git push origin HEAD:fix/empty-choice-catalog-compatibility
 
+      - name: Preserve failed job conclusion
+        if: steps.patch.outcome == 'failure'
+        run: exit 1
+
   cleanup:
     needs: patch
-    if: always()
+    if: needs.patch.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - name: Check out main for self-removal
-        if: needs.patch.result == 'success'
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           ref: main
@@ -95,7 +131,6 @@ jobs:
           fetch-depth: 0
 
       - name: Remove this one-shot workflow
-        if: needs.patch.result == 'success'
         run: |
           set -euo pipefail
           git config user.name 'nvs-maintenance-bot'
@@ -104,6 +139,3 @@ jobs:
           git add .github/workflows/one-shot-apply-empty-choice-compatibility.yml
           git commit -m 'chore: remove completed choice-compatibility fixer'
           git push origin HEAD:main
-
-# Reviewed manual retrigger: 2026-07-16
-# PR-mediated retrigger: 2026-07-16

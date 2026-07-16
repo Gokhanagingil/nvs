@@ -205,6 +205,15 @@ jobs:
           ssh "${ssh_options[@]}" "$remote" "rm -rf '$remote_dir'" || true
           exit "$status"
 
+      - name: Upload sanitized fixture result
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: nvs-staging-fixture-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/nvs-staging-fixture.md
+          if-no-files-found: ignore
+          retention-days: 1
+
       - name: Remove local SSH material
         if: always()
         run: rm -rf "$HOME/.ssh"

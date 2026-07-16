@@ -1,0 +1,8 @@
+$ corepack pnpm format:check && corepack pnpm lint && corepack pnpm typecheck && corepack pnpm test && corepack pnpm build && corepack pnpm test:e2e
+$ prettier --check "apps/**/*.{ts,tsx,css,json,html}" "packages/**/*.{ts,tsx,json}" "scripts/**/*.{ts,tsx}" "tests/**/*.{ts,tsx}" "e2e/**/*.{ts,tsx}" ".github/**/*.yml" "actors/**/*.yaml" "environments/**/*.yaml" "fixtures/**/*.yaml" "scenarios/**/*.yaml" "*.{ts,json,js,yaml,yml}"
+Checking formatting...
+[[33mwarn[39m] packages/core/src/index.ts
+[[33mwarn[39m] tests/live-incident.test.ts
+[[33mwarn[39m] Code style issues found in 2 files. Run Prettier with --write to fix.
+[ELIFECYCLE] Command failed with exit code 1.
+[ELIFECYCLE] Command failed with exit code 1.

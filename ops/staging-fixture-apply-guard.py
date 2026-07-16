@@ -211,6 +211,8 @@ def _run_guard(args: argparse.Namespace) -> int:
     environment_backup = _snapshot(environment_path, "environment", suffix)
     fixture_backup = _snapshot(fixture_path, "fixture", suffix)
 
+    apply_environment = dict(os.environ)
+    apply_environment["NVS_FIXTURE_APPLY_GUARDED"] = "1"
     completed = _run(
         [
             "python3",
@@ -222,6 +224,7 @@ def _run_guard(args: argparse.Namespace) -> int:
             "--confirmation",
             args.confirmation,
         ],
+        env=apply_environment,
         timeout=420,
         check=False,
     )

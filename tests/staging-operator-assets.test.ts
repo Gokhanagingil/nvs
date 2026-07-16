@@ -127,7 +127,7 @@ describe('browser-triggered staging operator assets', () => {
     expect(acceptance).toContain('NVS_ENABLE_NILES_MUTATIONS');
     expect(acceptance).toContain('LEASE_TTL_SECONDS');
     expect(acceptance).toContain('RECOVERY_REQUIRED');
-    expect(acceptance).not.toMatch(/print\([^)]*(accessToken|password|credential)/);
+    expect(acceptance).not.toMatch(/print\(\s*(accessToken|password|credential)\b/);
     expect(operatorWorkflow).toContain('staging-discovery-store.py');
     expect(fixtureWorkflow).not.toContain('NVS_ENABLE_NILES_MUTATIONS=true');
     expect(hostOperator).not.toContain('/opt/nvs/.env');

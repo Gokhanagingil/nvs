@@ -1,0 +1,155 @@
+name: one-shot diagnose configuration approver apply failure
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/one-shot-diagnose-configuration-approver-apply.yml
+
+permissions:
+  actions: write
+  contents: write
+  issues: write
+
+concurrency:
+  group: nvs-one-shot-diagnose-configuration-approver-apply
+  cancel-in-progress: false
+
+jobs:
+  diagnose:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      TARGET_SHA: fffbee58755b6873ab17c34ab35774d29b9c1da4
+      ENVIRONMENT_ID: staging-example
+    steps:
+      - name: Produce a fresh read-only post-failure plan
+        id: plan
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          repo="$GITHUB_REPOSITORY"
+          previous="$(
+            gh run list \
+              --repo "$repo" \
+              --workflow staging-fixture-bootstrap.yml \
+              --branch main \
+              --event workflow_dispatch \
+              --limit 1 \
+              --json databaseId \
+              --jq '.[0].databaseId // 0'
+          )"
+
+          gh workflow run staging-fixture-bootstrap.yml \
+            --repo "$repo" \
+            --ref main \
+            --field operation=plan \
+            --field environment_id="$ENVIRONMENT_ID" \
+            --field expected_sha="$TARGET_SHA" \
+            --field bootstrap_digest='' \
+            --field confirmation=''
+
+          run_id=''
+          for _attempt in $(seq 1 60); do
+            sleep 2
+            candidate="$(
+              gh run list \
+                --repo "$repo" \
+                --workflow staging-fixture-bootstrap.yml \
+                --branch main \
+                --event workflow_dispatch \
+                --limit 1 \
+                --json databaseId \
+                --jq '.[0].databaseId // 0'
+            )"
+            if [[ "$candidate" != '0' && "$candidate" != "$previous" ]]; then
+              run_id="$candidate"
+              break
+            fi
+          done
+          [[ -n "$run_id" ]]
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+          gh run watch "$run_id" --repo "$repo" --exit-status
+
+      - name: Download sanitized diagnostic artifact
+        if: always() && steps.plan.outputs.run_id != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PLAN_RUN: ${{ steps.plan.outputs.run_id }}
+        run: |
+          set -euo pipefail
+          result_dir="$RUNNER_TEMP/post-failure-plan"
+          mkdir -p "$result_dir"
+          gh run download "$PLAN_RUN" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name "nvs-staging-fixture-bootstrap-${PLAN_RUN}-1" \
+            --dir "$result_dir"
+          test -f "$result_dir/nvs-staging-fixture-bootstrap.md"
+          cp "$result_dir/nvs-staging-fixture-bootstrap.md" "$RUNNER_TEMP/post-failure-plan.md"
+
+      - name: Publish sanitized diagnostic
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PLAN_RUN: ${{ steps.plan.outputs.run_id }}
+          PLAN_OUTCOME: ${{ steps.plan.outcome }}
+        run: |
+          set -euo pipefail
+          body="$RUNNER_TEMP/configuration-approver-apply-diagnostic.md"
+          {
+            echo '# Sanitized Configuration Approver apply diagnostic'
+            echo
+            echo "- Deployed target SHA: \`$TARGET_SHA\`"
+            echo '- Previous deploy: `success`'
+            echo '- Previous authorized apply: `failure` with `BOOTSTRAP_INTERNAL_ERROR`'
+            echo "- Fresh post-failure plan run: \`${PLAN_RUN:-unavailable}\` — \`$PLAN_OUTCOME\`"
+            echo '- NILES mutation switch: required disabled by the staging-control workflow'
+            echo '- Live Incident acceptance: not executed'
+            echo
+            if [[ -f "$RUNNER_TEMP/post-failure-plan.md" ]]; then
+              cat "$RUNNER_TEMP/post-failure-plan.md"
+            else
+              echo '**Sanitized post-failure plan artifact:** unavailable'
+            fi
+          } > "$body"
+          gh issue edit 23 \
+            --repo "$GITHUB_REPOSITORY" \
+            --title '[Closed] Configuration Approver apply diagnostic' \
+            --body-file "$body"
+
+      - name: Enforce diagnostic completion
+        if: always()
+        env:
+          PLAN_OUTCOME: ${{ steps.plan.outcome }}
+        run: |
+          set -euo pipefail
+          [[ "$PLAN_OUTCOME" == success ]]
+
+  cleanup:
+    needs: diagnose
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: main
+          persist-credentials: true
+          fetch-depth: 0
+      - name: Remove completed diagnostic workflow
+        run: |
+          set -euo pipefail
+          git config user.name 'nvs-maintenance-bot'
+          git config user.email 'nvs-maintenance-bot@users.noreply.github.com'
+          git pull --ff-only origin main
+          rm -f .github/workflows/one-shot-diagnose-configuration-approver-apply.yml
+          if git diff --quiet --exit-code; then
+            exit 0
+          fi
+          git add .github/workflows/one-shot-diagnose-configuration-approver-apply.yml
+          git commit -m 'chore: remove completed configuration approver apply diagnostic'
+          git push origin HEAD:main

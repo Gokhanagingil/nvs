@@ -8,6 +8,7 @@ on:
       - .github/workflows/m1-02b-finalize.yml
       - .github/scripts/m1-02b-finalize.mjs
       - .github/scripts/m1-02b-finalize-hotfix.mjs
+      - .github/scripts/m1-02b-finalize-anchor-hotfix.mjs
       - .github/scripts/m1-02b-test-timeout.mjs
 
 permissions:
@@ -37,6 +38,7 @@ jobs:
       - name: Apply final blocker fixes
         run: |
           node .github/scripts/m1-02b-finalize-hotfix.mjs
+          node .github/scripts/m1-02b-finalize-anchor-hotfix.mjs
           node .github/scripts/m1-02b-finalize.mjs
           node .github/scripts/m1-02b-test-timeout.mjs
           rm -f .github/workflows/nvs-final-m1-02b-fix.yml
@@ -57,6 +59,7 @@ jobs:
             .github/finalizer-error.txt \
             .github/verification-error.txt \
             .github/scripts/m1-02b-finalize-hotfix.mjs \
+            .github/scripts/m1-02b-finalize-anchor-hotfix.mjs \
             .github/scripts/m1-02b-test-timeout.mjs \
             .github/workflows/nvs-final-m1-02b-fix.yml
       - name: Commit verified changes

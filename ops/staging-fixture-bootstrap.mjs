@@ -137,7 +137,10 @@ async function readYamlDirectory(directory) {
 
 function credentialEnvironmentName(reference) {
   if (!/^[A-Za-z0-9._-]+$/u.test(reference)) {
-    throw new BootstrapError('CREDENTIAL_REFERENCE_INVALID', 'An actor credential reference is invalid.');
+    throw new BootstrapError(
+      'CREDENTIAL_REFERENCE_INVALID',
+      'An actor credential reference is invalid.',
+    );
   }
   return `NVS_CREDENTIAL_${[...reference]
     .map((character) =>
@@ -149,7 +152,10 @@ function credentialEnvironmentName(reference) {
 function resolveCredential(reference) {
   const raw = process.env[credentialEnvironmentName(reference)];
   if (!raw) {
-    throw new BootstrapError('CREDENTIAL_MISSING', 'A required staging actor credential is missing.');
+    throw new BootstrapError(
+      'CREDENTIAL_MISSING',
+      'A required staging actor credential is missing.',
+    );
   }
   let value = raw.trim();
   if (
@@ -162,13 +168,19 @@ function resolveCredential(reference) {
   try {
     parsed = JSON.parse(value);
   } catch {
-    throw new BootstrapError('CREDENTIAL_INVALID', 'A required staging actor credential is invalid.');
+    throw new BootstrapError(
+      'CREDENTIAL_INVALID',
+      'A required staging actor credential is invalid.',
+    );
   }
   const record = asRecord(parsed);
   const email = safeString(record?.email);
   const password = typeof record?.password === 'string' ? record.password : '';
   if (!email || !password) {
-    throw new BootstrapError('CREDENTIAL_INVALID', 'A required staging actor credential is incomplete.');
+    throw new BootstrapError(
+      'CREDENTIAL_INVALID',
+      'A required staging actor credential is incomplete.',
+    );
   }
   return { email, password };
 }
@@ -184,7 +196,9 @@ function canonicalize(value) {
 }
 
 function digest(value) {
-  return createHash('sha256').update(JSON.stringify(canonicalize(value))).digest('hex');
+  return createHash('sha256')
+    .update(JSON.stringify(canonicalize(value)))
+    .digest('hex');
 }
 
 function exactMatches(values, field, expected) {
@@ -203,7 +217,10 @@ function requireUnique(scope, matches) {
 
 function requireUuid(scope, value) {
   const candidate = safeString(value);
-  if (!candidate || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(candidate)) {
+  if (
+    !candidate ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(candidate)
+  ) {
     throw new BootstrapError('BOOTSTRAP_RESPONSE_INVALID', `${scope} did not expose a valid UUID.`);
   }
   return candidate;
@@ -257,7 +274,7 @@ async function login(baseUrl, profile, expectedTenantId) {
         headers: {
           accept: 'application/json',
           'content-type': 'application/json',
-          'x-correlation-id': `bootstrap_login_${randomUUID().replaceAll('-', '')}`,
+          'x-correlation-id': randomUUID(),
         },
         body: JSON.stringify({ email: credential.email, password: credential.password }),
       },
@@ -269,7 +286,10 @@ async function login(baseUrl, profile, expectedTenantId) {
     const userId = requireUuid(`${profile.persona} login user`, user?.id);
     const tenantId = requireUuid(`${profile.persona} login tenant`, user?.tenantId);
     if (!accessToken || tenantId !== expectedTenantId) {
-      throw new BootstrapError('TENANT_MISMATCH', 'A staging actor authenticated into an unexpected tenant.');
+      throw new BootstrapError(
+        'TENANT_MISMATCH',
+        'A staging actor authenticated into an unexpected tenant.',
+      );
     }
     return { accessToken, userId, tenantId, persona: profile.persona };
   } finally {
@@ -283,7 +303,7 @@ function headers(session, tenantId, idempotencyKey) {
     accept: 'application/json',
     authorization: `Bearer ${session.accessToken}`,
     'x-tenant-id': tenantId,
-    'x-correlation-id': `bootstrap_${randomUUID().replaceAll('-', '')}`,
+    'x-correlation-id': randomUUID(),
     ...(idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : {}),
   };
 }
@@ -352,95 +372,124 @@ function compatibleSnapshot(observed, expected) {
     'order',
   ];
   return keys.every(
-    (key) => JSON.stringify(canonicalize(record[key])) === JSON.stringify(canonicalize(expected[key])),
+    (key) =>
+      JSON.stringify(canonicalize(record[key])) === JSON.stringify(canonicalize(expected[key])),
   );
 }
 
 async function discover(context) {
   const { admin, serviceDesk } = context.sessions;
   const encoded = encodeURIComponent;
-  const [groupsPayload, classesPayload, servicesPayload, offeringsPayload, cisPayload, policiesPayload, writesPayload] =
-    await Promise.all([
-      api(
-        context,
-        admin,
-        'GET',
-        `/grc/groups/directory?page=1&pageSize=100&search=${encoded(DESIRED.group.name)}`,
-        undefined,
-        undefined,
-        'list assignment groups',
-      ),
-      api(
-        context,
-        admin,
-        'GET',
-        `/grc/cmdb/classes?page=1&pageSize=100&search=${encoded(DESIRED.ciClass.name)}`,
-        undefined,
-        undefined,
-        'list CI classes',
-      ),
-      api(
-        context,
-        admin,
-        'GET',
-        `/grc/cmdb/services?page=1&pageSize=100&search=${encoded(DESIRED.service.name)}`,
-        undefined,
-        undefined,
-        'list CMDB services',
-      ),
-      api(
-        context,
-        admin,
-        'GET',
-        `/grc/cmdb/service-offerings?page=1&pageSize=100&search=${encoded(DESIRED.offering.name)}`,
-        undefined,
-        undefined,
-        'list service offerings',
-      ),
-      api(
-        context,
-        admin,
-        'GET',
-        `/grc/cmdb/cis/search?limit=100&q=${encoded(DESIRED.ci.name)}`,
-        undefined,
-        undefined,
-        'list configuration items',
-      ),
-      api(
-        context,
-        admin,
-        'GET',
-        '/grc/itsm/sla/governed/policies',
-        undefined,
-        undefined,
-        'list governed SLA policies',
-      ),
-      api(
-        context,
-        admin,
-        'GET',
-        '/grc/itsm/sla/governed/writes-enabled',
-        undefined,
-        undefined,
-        'read governed SLA write state',
-      ),
-    ]);
+  const [
+    groupsPayload,
+    classesPayload,
+    servicesPayload,
+    offeringsPayload,
+    cisPayload,
+    policiesPayload,
+    writesPayload,
+  ] = await Promise.all([
+    api(
+      context,
+      admin,
+      'GET',
+      `/grc/groups/directory?page=1&pageSize=100&search=${encoded(DESIRED.group.name)}`,
+      undefined,
+      undefined,
+      'list assignment groups',
+    ),
+    api(
+      context,
+      admin,
+      'GET',
+      `/grc/cmdb/classes?page=1&pageSize=100&search=${encoded(DESIRED.ciClass.name)}`,
+      undefined,
+      undefined,
+      'list CI classes',
+    ),
+    api(
+      context,
+      admin,
+      'GET',
+      `/grc/cmdb/services?page=1&pageSize=100&search=${encoded(DESIRED.service.name)}`,
+      undefined,
+      undefined,
+      'list CMDB services',
+    ),
+    api(
+      context,
+      admin,
+      'GET',
+      `/grc/cmdb/service-offerings?page=1&pageSize=100&search=${encoded(DESIRED.offering.name)}`,
+      undefined,
+      undefined,
+      'list service offerings',
+    ),
+    api(
+      context,
+      admin,
+      'GET',
+      `/grc/cmdb/cis/search?limit=100&q=${encoded(DESIRED.ci.name)}`,
+      undefined,
+      undefined,
+      'list configuration items',
+    ),
+    api(
+      context,
+      admin,
+      'GET',
+      '/grc/itsm/sla/governed/policies',
+      undefined,
+      undefined,
+      'list governed SLA policies',
+    ),
+    api(
+      context,
+      admin,
+      'GET',
+      '/grc/itsm/sla/governed/writes-enabled',
+      undefined,
+      undefined,
+      'read governed SLA write state',
+    ),
+  ]);
 
-  const group = requireUnique('assignment group', exactMatches(arrayFrom(groupsPayload), 'name', DESIRED.group.name));
-  const ciClass = requireUnique('CI class', exactMatches(arrayFrom(classesPayload), 'name', DESIRED.ciClass.name));
-  const service = requireUnique('CMDB service', exactMatches(arrayFrom(servicesPayload), 'name', DESIRED.service.name));
-  const offering = requireUnique('service offering', exactMatches(arrayFrom(offeringsPayload), 'name', DESIRED.offering.name));
-  const ci = requireUnique('configuration item', exactMatches(arrayFrom(cisPayload), 'name', DESIRED.ci.name));
+  const group = requireUnique(
+    'assignment group',
+    exactMatches(arrayFrom(groupsPayload), 'name', DESIRED.group.name),
+  );
+  const ciClass = requireUnique(
+    'CI class',
+    exactMatches(arrayFrom(classesPayload), 'name', DESIRED.ciClass.name),
+  );
+  const service = requireUnique(
+    'CMDB service',
+    exactMatches(arrayFrom(servicesPayload), 'name', DESIRED.service.name),
+  );
+  const offering = requireUnique(
+    'service offering',
+    exactMatches(arrayFrom(offeringsPayload), 'name', DESIRED.offering.name),
+  );
+  const ci = requireUnique(
+    'configuration item',
+    exactMatches(arrayFrom(cisPayload), 'name', DESIRED.ci.name),
+  );
   const policy = requireUnique(
     'governed SLA policy',
     exactMatches(arrayFrom(policiesPayload, 'policies'), 'policyName', DESIRED.sla.name),
   );
 
   if (group?.isActive === false) {
-    throw new BootstrapError('BOOTSTRAP_RESOURCE_INCOMPATIBLE', 'The deterministic assignment group exists but is inactive.');
+    throw new BootstrapError(
+      'BOOTSTRAP_RESOURCE_INCOMPATIBLE',
+      'The deterministic assignment group exists but is inactive.',
+    );
   }
   if (ciClass && safeString(ciClass.label) !== DESIRED.ciClass.label) {
-    throw new BootstrapError('BOOTSTRAP_RESOURCE_INCOMPATIBLE', 'The deterministic CI class has incompatible metadata.');
+    throw new BootstrapError(
+      'BOOTSTRAP_RESOURCE_INCOMPATIBLE',
+      'The deterministic CI class has incompatible metadata.',
+    );
   }
   if (service) {
     for (const [field, expected] of [
@@ -450,7 +499,10 @@ async function discover(context) {
       ['criticality', DESIRED.service.criticality],
     ]) {
       if (safeString(service[field]) !== expected) {
-        throw new BootstrapError('BOOTSTRAP_RESOURCE_INCOMPATIBLE', 'The deterministic CMDB service has incompatible metadata.');
+        throw new BootstrapError(
+          'BOOTSTRAP_RESOURCE_INCOMPATIBLE',
+          'The deterministic CMDB service has incompatible metadata.',
+        );
       }
     }
   }
@@ -462,10 +514,16 @@ async function discover(context) {
   const ciId = ci ? requireUuid('configuration item', ci.id) : undefined;
 
   if (offering && (!serviceId || safeString(offering.serviceId) !== serviceId)) {
-    throw new BootstrapError('BOOTSTRAP_RESOURCE_INCOMPATIBLE', 'The deterministic offering is not linked to the deterministic service.');
+    throw new BootstrapError(
+      'BOOTSTRAP_RESOURCE_INCOMPATIBLE',
+      'The deterministic offering is not linked to the deterministic service.',
+    );
   }
   if (ci && (!classId || safeString(ci.classId) !== classId)) {
-    throw new BootstrapError('BOOTSTRAP_RESOURCE_INCOMPATIBLE', 'The deterministic CI is not linked to the deterministic CI class.');
+    throw new BootstrapError(
+      'BOOTSTRAP_RESOURCE_INCOMPATIBLE',
+      'The deterministic CI is not linked to the deterministic CI class.',
+    );
   }
 
   let groupMemberPresent = false;
@@ -498,14 +556,23 @@ async function discover(context) {
     const matches = exactMatches(arrayFrom(payload), 'value', desiredChoice.value);
     const choice = requireUnique(`${desiredChoice.table}.${desiredChoice.field} choice`, matches);
     if (choice?.isActive === false) {
-      throw new BootstrapError('BOOTSTRAP_RESOURCE_INCOMPATIBLE', 'A deterministic choice exists but is inactive.');
+      throw new BootstrapError(
+        'BOOTSTRAP_RESOURCE_INCOMPATIBLE',
+        'A deterministic choice exists but is inactive.',
+      );
     }
-    choiceState.push({ desired: desiredChoice, existingId: choice ? requireUuid('choice', choice.id) : undefined });
+    choiceState.push({
+      desired: desiredChoice,
+      existingId: choice ? requireUuid('choice', choice.id) : undefined,
+    });
   }
 
   const writes = asRecord(writesPayload);
   if (writes?.writesEnabled !== true) {
-    throw new BootstrapError('GOVERNED_SLA_WRITES_DISABLED', 'Governed SLA policy writes are disabled in staging.');
+    throw new BootstrapError(
+      'GOVERNED_SLA_WRITES_DISABLED',
+      'Governed SLA policy writes are disabled in staging.',
+    );
   }
 
   let policyState = { kind: 'MISSING' };
@@ -526,17 +593,26 @@ async function discover(context) {
     const draft = asRecord(details?.activeDraft);
     if (published) {
       if (!serviceId || !compatibleSnapshot(published.snapshot, policySnapshot(serviceId))) {
-        throw new BootstrapError('BOOTSTRAP_RESOURCE_INCOMPATIBLE', 'The deterministic governed SLA policy has an incompatible published snapshot.');
+        throw new BootstrapError(
+          'BOOTSTRAP_RESOURCE_INCOMPATIBLE',
+          'The deterministic governed SLA policy has an incompatible published snapshot.',
+        );
       }
       policyState = {
         kind: 'PUBLISHED',
         policyId,
         revisionId: requireUuid('published SLA revision', published.id),
-        runtimeDefinitionId: requireUuid('published SLA runtime definition', published.runtimeDefinitionId),
+        runtimeDefinitionId: requireUuid(
+          'published SLA runtime definition',
+          published.runtimeDefinitionId,
+        ),
       };
     } else if (draft) {
       if (!serviceId || !compatibleSnapshot(draft.snapshot, policySnapshot(serviceId))) {
-        throw new BootstrapError('BOOTSTRAP_RESOURCE_INCOMPATIBLE', 'The deterministic governed SLA policy has an incompatible draft snapshot.');
+        throw new BootstrapError(
+          'BOOTSTRAP_RESOURCE_INCOMPATIBLE',
+          'The deterministic governed SLA policy has an incompatible draft snapshot.',
+        );
       }
       policyState = {
         kind: 'DRAFT',
@@ -544,14 +620,20 @@ async function discover(context) {
         revisionId: requireUuid('draft SLA revision', draft.id),
       };
     } else {
-      throw new BootstrapError('BOOTSTRAP_RESOURCE_INCOMPATIBLE', 'The deterministic governed SLA policy has no usable revision.');
+      throw new BootstrapError(
+        'BOOTSTRAP_RESOURCE_INCOMPATIBLE',
+        'The deterministic governed SLA policy has no usable revision.',
+      );
     }
   }
 
   if (offering && policyState.kind === 'PUBLISHED') {
     const configuredProfile = safeString(offering.defaultSlaProfileId);
     if (configuredProfile && configuredProfile !== policyState.runtimeDefinitionId) {
-      throw new BootstrapError('BOOTSTRAP_RESOURCE_INCOMPATIBLE', 'The deterministic offering references a different SLA profile.');
+      throw new BootstrapError(
+        'BOOTSTRAP_RESOURCE_INCOMPATIBLE',
+        'The deterministic offering references a different SLA profile.',
+      );
     }
   }
 
@@ -595,7 +677,16 @@ async function discover(context) {
   return {
     internalPlan,
     planDigest: digest(internalPlan),
-    state: { groupId, groupMemberPresent, classId, serviceId, offeringId, ciId, choiceState, policyState },
+    state: {
+      groupId,
+      groupMemberPresent,
+      classId,
+      serviceId,
+      offeringId,
+      ciId,
+      choiceState,
+      policyState,
+    },
     safe: {
       schemaVersion: 'nvs.staging-fixture-bootstrap-result/v1',
       result: 'PASS',
@@ -738,20 +829,31 @@ async function ensurePublishedPolicy(context, serviceId, current) {
       'published governed SLA policy',
       exactMatches(policies, 'policyName', DESIRED.sla.name),
     );
-    const runtimeDefinitionId = safeString(asRecord(match?.publishedRevisionSummary)?.runtimeDefinitionId);
+    const runtimeDefinitionId = safeString(
+      asRecord(match?.publishedRevisionSummary)?.runtimeDefinitionId,
+    );
     if (runtimeDefinitionId) {
-      return { runtimeDefinitionId: requireUuid('published SLA runtime definition', runtimeDefinitionId), disposition: current.kind === 'MISSING' ? 'CREATED' : 'PUBLISHED' };
+      return {
+        runtimeDefinitionId: requireUuid('published SLA runtime definition', runtimeDefinitionId),
+        disposition: current.kind === 'MISSING' ? 'CREATED' : 'PUBLISHED',
+      };
     }
     await new Promise((resolve) => globalThis.setTimeout(resolve, 500));
   }
-  throw new BootstrapError('SLA_PUBLISH_NOT_OBSERVED', 'The governed SLA publication was not observable within its deadline.');
+  throw new BootstrapError(
+    'SLA_PUBLISH_NOT_OBSERVED',
+    'The governed SLA publication was not observable within its deadline.',
+  );
 }
 
 async function atomicInventory(payload) {
   const directory = path.dirname(INVENTORY_PATH);
   await mkdir(directory, { recursive: true });
   const temporary = `${INVENTORY_PATH}.${process.pid}.${Date.now()}.tmp`;
-  await writeFile(temporary, `${JSON.stringify(payload, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+  await writeFile(temporary, `${JSON.stringify(payload, null, 2)}\n`, {
+    encoding: 'utf8',
+    mode: 0o600,
+  });
   await rename(temporary, INVENTORY_PATH);
   await chmod(INVENTORY_PATH, 0o600);
 }
@@ -909,16 +1011,25 @@ async function applyPlan(context, plan) {
 
 async function loadContext() {
   if (!['plan', 'apply'].includes(OPERATION)) {
-    throw new BootstrapError('BOOTSTRAP_OPERATION_INVALID', 'Bootstrap operation must be plan or apply.');
+    throw new BootstrapError(
+      'BOOTSTRAP_OPERATION_INVALID',
+      'Bootstrap operation must be plan or apply.',
+    );
   }
   if (!/^[a-z0-9][a-z0-9._-]{0,95}$/u.test(ENVIRONMENT_ID)) {
-    throw new BootstrapError('ENVIRONMENT_IDENTIFIER_INVALID', 'The NVS environment identifier is invalid.');
+    throw new BootstrapError(
+      'ENVIRONMENT_IDENTIFIER_INVALID',
+      'The NVS environment identifier is invalid.',
+    );
   }
   const environments = await readYamlDirectory(path.join(CONFIG_DIR, 'environments'));
   const environment = environments.find((candidate) => candidate.id === ENVIRONMENT_ID);
   const baseUrl = safeString(environment?.baseUrl);
   if (!baseUrl || environment?.kind === 'production') {
-    throw new BootstrapError('ENVIRONMENT_INVALID', 'Bootstrap requires a configured non-production environment.');
+    throw new BootstrapError(
+      'ENVIRONMENT_INVALID',
+      'Bootstrap requires a configured non-production environment.',
+    );
   }
   const profiles = await readYamlDirectory(path.join(CONFIG_DIR, 'actors', 'profiles'));
   const profile = (persona) =>
@@ -932,12 +1043,18 @@ async function loadContext() {
   const managerProfile = profile('incident-manager');
   const serviceDeskProfile = profile('service-desk-agent');
   if (!adminProfile || !managerProfile || !serviceDeskProfile) {
-    throw new BootstrapError('ACTOR_PROFILE_MISSING', 'Required staging actor profiles are unavailable.');
+    throw new BootstrapError(
+      'ACTOR_PROFILE_MISSING',
+      'Required staging actor profiles are unavailable.',
+    );
   }
   const tenantId = requireUuid('fixture tenant', adminProfile.tenantId);
   for (const actor of [adminProfile, managerProfile, serviceDeskProfile]) {
     if (!actor.credentialRef || actor.tenantId !== tenantId) {
-      throw new BootstrapError('ACTOR_PROFILE_INVALID', 'A required staging actor profile is invalid.');
+      throw new BootstrapError(
+        'ACTOR_PROFILE_INVALID',
+        'A required staging actor profile is invalid.',
+      );
     }
   }
   const sessions = {
@@ -957,10 +1074,16 @@ async function main() {
       return;
     }
     if (!/^[a-f0-9]{64}$/u.test(EXPECTED_DIGEST) || EXPECTED_DIGEST !== plan.planDigest) {
-      throw new BootstrapError('BOOTSTRAP_DIGEST_MISMATCH', 'The supplied bootstrap digest does not match current staging state.');
+      throw new BootstrapError(
+        'BOOTSTRAP_DIGEST_MISMATCH',
+        'The supplied bootstrap digest does not match current staging state.',
+      );
     }
     if (CONFIRMATION !== APPLY_CONFIRMATION) {
-      throw new BootstrapError('BOOTSTRAP_CONFIRMATION_REQUIRED', 'Bootstrap apply requires the exact confirmation phrase.');
+      throw new BootstrapError(
+        'BOOTSTRAP_CONFIRMATION_REQUIRED',
+        'Bootstrap apply requires the exact confirmation phrase.',
+      );
     }
     console.log(JSON.stringify(await applyPlan(context, plan)));
   } finally {
@@ -975,7 +1098,10 @@ main().catch((error) => {
     error instanceof BootstrapError
       ? {
           schemaVersion: 'nvs.staging-fixture-bootstrap-result/v1',
-          result: error.code.startsWith('BOOTSTRAP_') || error.code.includes('DISABLED') ? 'BLOCKED' : 'FAIL',
+          result:
+            error.code.startsWith('BOOTSTRAP_') || error.code.includes('DISABLED')
+              ? 'BLOCKED'
+              : 'FAIL',
           operation: OPERATION,
           error: {
             code: error.code,

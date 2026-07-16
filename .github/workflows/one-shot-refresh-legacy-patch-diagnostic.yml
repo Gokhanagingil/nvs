@@ -1,0 +1,58 @@
+name: one-shot refresh legacy patch diagnostic
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/one-shot-refresh-legacy-patch-diagnostic.yml
+
+permissions:
+  actions: read
+  contents: read
+  issues: write
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Refresh temporary sanitized diagnostic issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          repo="$GITHUB_REPOSITORY"
+          run_json="$(gh run list \
+            --repo "$repo" \
+            --workflow one-shot-apply-legacy-assignment-patch.yml \
+            --limit 1 \
+            --json databaseId,status,conclusion,headSha,url,createdAt \
+            --jq '.[0]')"
+          run_id="$(printf '%s' "$run_json" | jq -r '.databaseId')"
+          raw="$RUNNER_TEMP/legacy-patch-failed.log"
+          safe="$RUNNER_TEMP/legacy-patch-failed-safe.log"
+          set +e
+          gh run view "$run_id" --repo "$repo" --log-failed > "$raw"
+          log_status=$?
+          set -e
+          if [[ "$log_status" -eq 0 ]]; then
+            tail -n 220 "$raw" \
+              | sed -E 's/(authorization:|bearer |password|token)[^ ]*/\1 [redacted]/Ig' \
+              > "$safe"
+          else
+            printf '%s\n' 'No failed log is available; the workflow may still be running or may have succeeded.' > "$safe"
+          fi
+          body="$RUNNER_TEMP/legacy-patch-diagnostic.md"
+          {
+            echo 'Temporary sanitized diagnostic for the latest legacy assignment patch workflow.'
+            echo
+            echo '```json'
+            printf '%s\n' "$run_json"
+            echo '```'
+            echo
+            echo '```text'
+            cat "$safe"
+            echo '```'
+          } > "$body"
+          gh issue edit 22 --repo "$repo" --body-file "$body" >/dev/null

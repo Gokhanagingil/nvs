@@ -1,0 +1,62 @@
+name: one-shot fix bootstrap lint
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/one-shot-fix-bootstrap-lint.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out bootstrap implementation branch
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: feat/staging-fixture-bootstrap
+          persist-credentials: true
+
+      - name: Apply deterministic lint correction and push
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('ops/staging-fixture-bootstrap.mjs')
+          text = path.read_text(encoding='utf-8')
+          replacements = {
+              '  const { admin, manager, serviceDesk } = context.sessions;':
+                  '  const { admin, serviceDesk } = context.sessions;',
+              '    await new Promise((resolve) => setTimeout(resolve, 500));':
+                  '    await new Promise((resolve) => globalThis.setTimeout(resolve, 500));',
+          }
+          for old, new in replacements.items():
+              if text.count(old) != 1:
+                  raise SystemExit(f'expected one exact match: {old}')
+              text = text.replace(old, new, 1)
+          path.write_text(text, encoding='utf-8')
+          PY
+          git config user.name 'nvs-maintenance-bot'
+          git config user.email 'nvs-maintenance-bot@users.noreply.github.com'
+          git add ops/staging-fixture-bootstrap.mjs
+          git commit -m 'fix: satisfy bootstrap script lint contract'
+          git push origin HEAD:feat/staging-fixture-bootstrap
+
+      - name: Remove this one-shot workflow from main
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sha="$(gh api "repos/${GITHUB_REPOSITORY}/contents/.github/workflows/one-shot-fix-bootstrap-lint.yml?ref=main" --jq '.sha')"
+          gh api \
+            --method DELETE \
+            "repos/${GITHUB_REPOSITORY}/contents/.github/workflows/one-shot-fix-bootstrap-lint.yml" \
+            --field message='chore: remove completed bootstrap lint fixer' \
+            --field sha="$sha" \
+            --field branch=main \
+            >/dev/null

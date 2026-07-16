@@ -32,7 +32,7 @@ describe('staging fixture bootstrap assets', () => {
 
     expect(source).toContain('http://127.0.0.1:4100/api/version');
     expect(source).toContain('NVS_ENABLE_NILES_MUTATIONS');
-    expect(source).toContain('[[ "$mutation" != true ]]');
+    expect(source).toContain(String.raw`[[ \"\$mutation\" != true ]]`);
     expect(source).toContain('expected_sha');
     expect(source).toContain('bootstrap_digest');
   });

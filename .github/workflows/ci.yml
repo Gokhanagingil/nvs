@@ -166,57 +166,40 @@ jobs:
           if count != 1:
               raise SystemExit(f'atomicInventory source replacement count={count}')
 
-          old = """  const adminProfile = profile('tenant-admin');
-          const managerProfile = profile('incident-manager');
-          const serviceDeskProfile = profile('service-desk-agent');
-          if (!adminProfile || !managerProfile || !serviceDeskProfile) {
-            throw new BootstrapError(
-              'ACTOR_PROFILE_MISSING',
-              'Required staging actor profiles are unavailable.',
-            );
-          }
-          const tenantId = requireUuid('fixture tenant', adminProfile.tenantId);
-          for (const actor of [adminProfile, managerProfile, serviceDeskProfile]) {
-            if (!actor.credentialRef || actor.tenantId !== tenantId) {
-              throw new BootstrapError(
-                'ACTOR_PROFILE_INVALID',
-                'A required staging actor profile is invalid.',
-              );
-            }
-          }
-          const sessions = {
-            admin: await login(baseUrl, adminProfile, tenantId),
-            manager: await login(baseUrl, managerProfile, tenantId),
-            serviceDesk: await login(baseUrl, serviceDeskProfile, tenantId),
-          };
-          return { baseUrl, tenantId, sessions };
-          """
-          new = """  const adminProfile = profile('tenant-admin');
-          const serviceDeskProfile = profile('service-desk-agent');
-          if (!adminProfile || !serviceDeskProfile) {
-            throw new BootstrapError(
-              'ACTOR_PROFILE_MISSING',
-              'Required staging actor profiles are unavailable.',
-            );
-          }
-          const tenantId = requireUuid('fixture tenant', adminProfile.tenantId);
-          for (const actor of [adminProfile, serviceDeskProfile]) {
-            if (!actor.credentialRef || actor.tenantId !== tenantId) {
-              throw new BootstrapError(
-                'ACTOR_PROFILE_INVALID',
-                'A required staging actor profile is invalid.',
-              );
-            }
-          }
-          const sessions = {
-            admin: await login(baseUrl, adminProfile, tenantId),
-            serviceDesk: await login(baseUrl, serviceDeskProfile, tenantId),
-          };
-          return { baseUrl, tenantId, sessions };
-          """
-          if text.count(old) != 1:
-              raise SystemExit(f'loadContext source replacement count={text.count(old)}')
-          text = text.replace(old, new, 1)
+          start_marker = "  const adminProfile = profile('tenant-admin');\n"
+          end_marker = "  return { baseUrl, tenantId, sessions };\n"
+          start = text.find(start_marker)
+          if start < 0 or text.find(start_marker, start + len(start_marker)) >= 0:
+              raise SystemExit('loadContext start marker was not unique')
+          end = text.find(end_marker, start + len(start_marker))
+          if end < 0:
+              raise SystemExit('loadContext end marker was not found')
+          end += len(end_marker)
+          replacement = (
+              "  const adminProfile = profile('tenant-admin');\n"
+              "  const serviceDeskProfile = profile('service-desk-agent');\n"
+              "  if (!adminProfile || !serviceDeskProfile) {\n"
+              "    throw new BootstrapError(\n"
+              "      'ACTOR_PROFILE_MISSING',\n"
+              "      'Required staging actor profiles are unavailable.',\n"
+              "    );\n"
+              "  }\n"
+              "  const tenantId = requireUuid('fixture tenant', adminProfile.tenantId);\n"
+              "  for (const actor of [adminProfile, serviceDeskProfile]) {\n"
+              "    if (!actor.credentialRef || actor.tenantId !== tenantId) {\n"
+              "      throw new BootstrapError(\n"
+              "        'ACTOR_PROFILE_INVALID',\n"
+              "        'A required staging actor profile is invalid.',\n"
+              "      );\n"
+              "    }\n"
+              "  }\n"
+              "  const sessions = {\n"
+              "    admin: await login(baseUrl, adminProfile, tenantId),\n"
+              "    serviceDesk: await login(baseUrl, serviceDeskProfile, tenantId),\n"
+              "  };\n"
+              "  return { baseUrl, tenantId, sessions };\n"
+          )
+          text = text[:start] + replacement + text[end:]
           target.write_text(text, encoding='utf-8')
           PY
 

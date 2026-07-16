@@ -42,7 +42,8 @@ jobs:
           pnpm run ci > "$raw" 2>&1
           status=$?
           set -e
-          tail -n 220 "$raw" \
+          tail -n 50 "$raw" \
+            | sed -E $'s/\x1B\[[0-9;]*[mK]//g' \
             | sed -E 's/(authorization:|bearer |password|token)[^ ]*/\1 [redacted]/Ig' \
             > "$safe"
           body="$RUNNER_TEMP/pr26-ci.md"

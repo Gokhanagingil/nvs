@@ -19,6 +19,27 @@ UUID = re.compile(
 )
 ALLOWED_ROOT = Path("/opt/nvs/releases")
 INACTIVE_VALUES = {"inactive", "retired", "decommissioned", "disabled", "deleted"}
+GROUP_PHRASE_WEIGHTS = {
+    "service desk": 140,
+    "help desk": 130,
+    "it support": 120,
+    "technical support": 110,
+    "application support": 100,
+    "service operations": 90,
+}
+GROUP_TOKEN_WEIGHTS = {
+    "support": 80,
+    "desk": 70,
+    "help": 60,
+    "service": 50,
+    "incident": 45,
+    "operations": 40,
+    "ops": 40,
+    "technical": 35,
+    "application": 30,
+    "platform": 25,
+    "it": 20,
+}
 
 
 class PlanError(RuntimeError):
@@ -74,7 +95,7 @@ def _safe_discovery_error(stderr: str, return_code: int) -> str:
     return f"fixture discovery failed inside the NVS container (exit {return_code})"
 
 
-def _run_discovery(args: argparse.Namespace) -> dict[str, Any]:
+def _invoke_discovery(args: argparse.Namespace, assignment_group_query: str) -> dict[str, Any]:
     discovery_script = Path(args.discovery_script)
     if not discovery_script.is_file():
         raise PlanError("the container discovery script was not found.")
@@ -86,7 +107,7 @@ def _run_discovery(args: argparse.Namespace) -> dict[str, Any]:
         "-e",
         f"NVS_DISCOVERY_ENVIRONMENT_ID={args.environment_id}",
         "-e",
-        f"NVS_DISCOVERY_GROUP_QUERY={args.assignment_group_query}",
+        f"NVS_DISCOVERY_GROUP_QUERY={assignment_group_query}",
         "-e",
         f"NVS_DISCOVERY_SERVICE_QUERY={args.service_query}",
         "-e",
@@ -135,6 +156,24 @@ def _run_discovery(args: argparse.Namespace) -> dict[str, Any]:
     return discovery
 
 
+def _run_discovery(args: argparse.Namespace) -> dict[str, Any]:
+    discovery = _invoke_discovery(args, args.assignment_group_query)
+    candidates = discovery.get("candidates")
+    candidate_map = candidates if isinstance(candidates, dict) else {}
+    groups = candidate_map.get("assignmentGroups")
+    if isinstance(groups, list) and groups:
+        return discovery
+
+    fallback = _invoke_discovery(args, "")
+    fallback_candidates = fallback.get("candidates")
+    fallback_map = fallback_candidates if isinstance(fallback_candidates, dict) else {}
+    fallback_groups = fallback_map.get("assignmentGroups")
+    candidate_map["assignmentGroups"] = fallback_groups if isinstance(fallback_groups, list) else []
+    discovery["candidates"] = candidate_map
+    discovery["fallbacks"] = {"assignmentGroup": "UNFILTERED_CANONICAL_RANKING"}
+    return discovery
+
+
 def _name_matches(item: dict[str, Any], query: str) -> bool:
     name = item.get("name")
     if not isinstance(name, str):
@@ -152,6 +191,70 @@ def _active(item: dict[str, Any]) -> bool:
         if isinstance(value, str) and value.casefold() in INACTIVE_VALUES:
             return False
     return True
+
+
+def _words(value: Any) -> set[str]:
+    if not isinstance(value, str):
+        return set()
+    return set(re.findall(r"[a-z0-9]+", value.casefold()))
+
+
+def _normalized_text(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    return " ".join(re.findall(r"[a-z0-9]+", value.casefold()))
+
+
+def _assignment_group_score(item: dict[str, Any]) -> int:
+    name = _normalized_text(item.get("name"))
+    description = _normalized_text(item.get("description"))
+    name_words = _words(item.get("name"))
+    description_words = _words(item.get("description"))
+    score = 0
+    for phrase, weight in GROUP_PHRASE_WEIGHTS.items():
+        if phrase in name:
+            score += weight
+        elif phrase in description:
+            score += max(1, weight // 2)
+    for token, weight in GROUP_TOKEN_WEIGHTS.items():
+        if token in name_words:
+            score += weight
+        elif token in description_words:
+            score += max(1, weight // 2)
+    return score
+
+
+def _validate_uuid(scope: str, selected: dict[str, Any]) -> None:
+    identifier = selected.get("id")
+    if not isinstance(identifier, str) or not UUID.fullmatch(identifier):
+        raise PlanError(f"{scope} selection did not expose a valid UUID.")
+
+
+def _choose_assignment_group(values: Any, query: str) -> tuple[dict[str, Any], int, str]:
+    candidates = [item for item in values if isinstance(item, dict)] if isinstance(values, list) else []
+    active = [item for item in candidates if _active(item)]
+    exact = [item for item in active if _name_matches(item, query)]
+    if len(exact) == 1:
+        _validate_uuid("assignment group", exact[0])
+        return exact[0], len(candidates), "EXACT_QUERY"
+    if len(exact) > 1:
+        raise PlanError(
+            f"assignment group selector matched {len(exact)} eligible records; refine the browser workflow query until exactly one remains."
+        )
+    if len(active) == 1:
+        _validate_uuid("assignment group", active[0])
+        return active[0], len(candidates), "SOLE_ACTIVE_FALLBACK"
+
+    scored = [(_assignment_group_score(item), item) for item in active]
+    best_score = max((score for score, _item in scored), default=0)
+    best = [item for score, item in scored if score == best_score and score > 0]
+    if len(best) != 1:
+        raise PlanError(
+            "assignment group selector matched 0 eligible records and canonical fallback "
+            f"could not choose uniquely from {len(active)} active groups; refine the browser workflow query."
+        )
+    _validate_uuid("assignment group", best[0])
+    return best[0], len(candidates), "CANONICAL_RANK_FALLBACK"
 
 
 def _choose_unique(
@@ -173,9 +276,7 @@ def _choose_unique(
             f"{scope} selector matched {len(eligible)} eligible records; refine the browser workflow query until exactly one remains."
         )
     selected = eligible[0]
-    identifier = selected.get("id")
-    if not isinstance(identifier, str) or not UUID.fullmatch(identifier):
-        raise PlanError(f"{scope} selection did not expose a valid UUID.")
+    _validate_uuid(scope, selected)
     return selected, len(candidates)
 
 
@@ -216,10 +317,8 @@ def _run(args: argparse.Namespace) -> int:
 
     candidates = discovery.get("candidates")
     candidate_map = candidates if isinstance(candidates, dict) else {}
-    group, group_count = _choose_unique(
-        "assignment group",
-        candidate_map.get("assignmentGroups"),
-        args.assignment_group_query,
+    group, group_count, group_mode = _choose_assignment_group(
+        candidate_map.get("assignmentGroups"), args.assignment_group_query
     )
     service, service_count = _choose_unique(
         "CMDB service", candidate_map.get("services"), args.service_query
@@ -260,6 +359,12 @@ def _run(args: argparse.Namespace) -> int:
             "offering": args.offering_query,
             "configurationItem": args.ci_query,
         },
+        "selectionModes": {
+            "assignmentGroup": group_mode,
+            "service": "EXACT_QUERY",
+            "offering": "EXACT_QUERY_AND_SERVICE_LINK",
+            "configurationItem": "EXACT_QUERY",
+        },
         "selected": {
             "assignmentGroup": _selection(group),
             "service": _selection(service),
@@ -295,9 +400,12 @@ def _run(args: argparse.Namespace) -> int:
     print()
     print(f"- Environment: `{args.environment_id}`")
     print(f"- Proposal digest: `{digest}`")
-    print(f"- Assignment-group eligible matches: `1` of `{group_count}` returned")
+    print(f"- Assignment-group selection mode: `{group_mode}`")
+    print(f"- Assignment-group eligible selection: `1` of `{group_count}` returned")
     print(f"- Service eligible matches: `1` of `{service_count}` returned")
-    print(f"- Offering eligible matches linked to the selected service: `1` of `{offering_count}` returned")
+    print(
+        f"- Offering eligible matches linked to the selected service: `1` of `{offering_count}` returned"
+    )
     print(f"- CI eligible matches: `1` of `{ci_count}` returned")
     print(f"- Server proposal file: `{proposal_path}`")
     print()

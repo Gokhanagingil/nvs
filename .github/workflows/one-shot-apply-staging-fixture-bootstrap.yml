@@ -1,0 +1,125 @@
+name: one-shot apply staging fixture bootstrap
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/one-shot-apply-staging-fixture-bootstrap.yml
+
+permissions:
+  actions: write
+  contents: write
+  issues: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Check out main for self-cleanup
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: main
+          persist-credentials: true
+          fetch-depth: 0
+
+      - name: Dispatch and publish the authorized bootstrap apply
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          repo="$GITHUB_REPOSITORY"
+          previous="$(
+            gh run list \
+              --repo "$repo" \
+              --workflow staging-fixture-bootstrap.yml \
+              --branch main \
+              --event workflow_dispatch \
+              --limit 1 \
+              --json databaseId \
+              --jq '.[0].databaseId // 0'
+          )"
+
+          gh workflow run staging-fixture-bootstrap.yml \
+            --repo "$repo" \
+            --ref main \
+            --field operation=apply \
+            --field environment_id=staging-example \
+            --field expected_sha=30617d6c576b921607c607c27a2a4d401a1303ed \
+            --field bootstrap_digest=4853c7caa852450e9decb08d8d74985822296450a89c7a67d63d069aaa97c419 \
+            --field confirmation=BOOTSTRAP_M1_02B_FIXTURES
+
+          run_id=''
+          for _attempt in $(seq 1 60); do
+            sleep 2
+            candidate="$(
+              gh run list \
+                --repo "$repo" \
+                --workflow staging-fixture-bootstrap.yml \
+                --branch main \
+                --event workflow_dispatch \
+                --limit 1 \
+                --json databaseId \
+                --jq '.[0].databaseId // 0'
+            )"
+            if [[ "$candidate" != '0' && "$candidate" != "$previous" ]]; then
+              run_id="$candidate"
+              break
+            fi
+          done
+          [[ -n "$run_id" ]]
+
+          set +e
+          gh run watch "$run_id" --repo "$repo" --exit-status
+          run_status=$?
+          set -e
+
+          result_dir="$RUNNER_TEMP/bootstrap-apply"
+          mkdir -p "$result_dir"
+          set +e
+          gh run download "$run_id" \
+            --repo "$repo" \
+            --name "nvs-staging-fixture-bootstrap-${run_id}-1" \
+            --dir "$result_dir"
+          download_status=$?
+          set -e
+
+          metadata="$(gh run view "$run_id" --repo "$repo" --json databaseId,status,conclusion,url,headSha,createdAt)"
+          body="$RUNNER_TEMP/bootstrap-apply.md"
+          {
+            echo '# Sanitized deterministic fixture bootstrap apply'
+            echo
+            echo "- Workflow exit status: \`$run_status\`"
+            echo '- Authorized confirmation: `BOOTSTRAP_M1_02B_FIXTURES`'
+            echo
+            echo '```json'
+            printf '%s\n' "$metadata"
+            echo '```'
+            echo
+            if [[ "$download_status" -eq 0 && -f "$result_dir/nvs-staging-fixture-bootstrap.md" ]]; then
+              cat "$result_dir/nvs-staging-fixture-bootstrap.md"
+            else
+              echo '**Sanitized bootstrap artifact:** unavailable'
+            fi
+          } > "$body"
+
+          gh issue edit 23 \
+            --repo "$repo" \
+            --title '[Closed] Sanitized deterministic fixture bootstrap apply' \
+            --body-file "$body"
+
+          exit "$run_status"
+
+      - name: Remove this one-shot workflow
+        if: always()
+        run: |
+          set -euo pipefail
+          git config user.name 'nvs-maintenance-bot'
+          git config user.email 'nvs-maintenance-bot@users.noreply.github.com'
+          git pull --ff-only origin main
+          rm -f .github/workflows/one-shot-apply-staging-fixture-bootstrap.yml
+          if git diff --quiet --exit-code; then exit 0; fi
+          git add .github/workflows/one-shot-apply-staging-fixture-bootstrap.yml
+          git commit -m 'chore: remove completed bootstrap apply dispatcher'
+          git push origin HEAD:main

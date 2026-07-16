@@ -39,6 +39,7 @@ jobs:
           node .github/scripts/m1-02b-finalize-hotfix.mjs
           node .github/scripts/m1-02b-finalize.mjs
           node .github/scripts/m1-02b-test-timeout.mjs
+          rm -f .github/workflows/nvs-final-m1-02b-fix.yml
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
       - name: Verify focused regressions

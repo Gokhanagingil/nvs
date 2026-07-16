@@ -55,6 +55,27 @@ describe('browser-triggered staging operator assets', () => {
     expect(workflow).not.toContain('set -x');
   });
 
+  it('passes each fixture selector to its matching NILES discovery surface', () => {
+    const discovery = readFileSync(containerDiscoveryPath, 'utf8');
+    const plan = readFileSync(fixturePlanPath, 'utf8');
+
+    expect(plan).toContain('NVS_DISCOVERY_GROUP_QUERY');
+    expect(plan).toContain('NVS_DISCOVERY_SERVICE_QUERY');
+    expect(plan).toContain('NVS_DISCOVERY_OFFERING_QUERY');
+    expect(plan).toContain('NVS_DISCOVERY_CI_QUERY');
+
+    expect(discovery).toContain("scopedQuery('NVS_DISCOVERY_GROUP_QUERY')");
+    expect(discovery).toContain("scopedQuery('NVS_DISCOVERY_SERVICE_QUERY')");
+    expect(discovery).toContain("scopedQuery('NVS_DISCOVERY_OFFERING_QUERY')");
+    expect(discovery).toContain("scopedQuery('NVS_DISCOVERY_CI_QUERY')");
+    expect(discovery).toContain('queries.assignmentGroups ? `&search=${groupSearch}`');
+    expect(discovery).toContain('queries.services ? `&search=${serviceSearch}`');
+    expect(discovery).toContain('queries.offerings ? `&search=${offeringSearch}`');
+    expect(discovery).toContain('queries.configurationItems ? `&q=${ciSearch}`');
+    expect(discovery).toContain('query: commonQuery');
+    expect(discovery).toContain('queries,');
+  });
+
   it('requires static fixture readiness, explicit live confirmation, and unconditional cleanup', () => {
     const workflow = readFileSync(acceptanceWorkflowPath, 'utf8');
 

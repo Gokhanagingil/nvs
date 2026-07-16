@@ -11,18 +11,50 @@ on:
         options:
           - verify
           - discover
+          - plan-fixture
+          - apply-fixture
       environment_id:
         description: NVS environment identifier
         required: true
         default: staging-example
         type: string
       expected_sha:
-        description: Optional deployed 40-character Git SHA for verify
+        description: Optional deployed 40-character Git SHA for verify/apply
         required: false
         default: ''
         type: string
       query:
-        description: Optional discovery search text (maximum 100 printable characters)
+        description: Optional common discovery search text (maximum 100 printable characters)
+        required: false
+        default: ''
+        type: string
+      assignment_group_query:
+        description: Unique assignment-group selector for plan-fixture
+        required: false
+        default: service desk
+        type: string
+      service_query:
+        description: Unique CMDB service selector for plan-fixture
+        required: false
+        default: payment
+        type: string
+      offering_query:
+        description: Unique service-offering selector for plan-fixture
+        required: false
+        default: payment
+        type: string
+      ci_query:
+        description: Unique configuration-item selector for plan-fixture
+        required: false
+        default: payment
+        type: string
+      proposal_digest:
+        description: Proposal SHA-256 printed by plan-fixture
+        required: false
+        default: ''
+        type: string
+      confirmation:
+        description: apply-fixture requires APPLY_M1_02B_FIXTURE
         required: false
         default: ''
         type: string
@@ -38,7 +70,7 @@ jobs:
   operator:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     environment: staging
     steps:
       - name: Check out reviewed operator code
@@ -53,6 +85,12 @@ jobs:
           ENVIRONMENT_ID: ${{ inputs.environment_id }}
           EXPECTED_SHA: ${{ inputs.expected_sha }}
           QUERY: ${{ inputs.query }}
+          ASSIGNMENT_GROUP_QUERY: ${{ inputs.assignment_group_query }}
+          SERVICE_QUERY: ${{ inputs.service_query }}
+          OFFERING_QUERY: ${{ inputs.offering_query }}
+          CI_QUERY: ${{ inputs.ci_query }}
+          PROPOSAL_DIGEST: ${{ inputs.proposal_digest }}
+          CONFIRMATION: ${{ inputs.confirmation }}
         run: |
           python3 - <<'PY'
           import os
@@ -62,15 +100,33 @@ jobs:
           environment_id = os.environ["ENVIRONMENT_ID"]
           expected_sha = os.environ["EXPECTED_SHA"]
           query = os.environ["QUERY"]
+          selectors = [
+              os.environ["ASSIGNMENT_GROUP_QUERY"],
+              os.environ["SERVICE_QUERY"],
+              os.environ["OFFERING_QUERY"],
+              os.environ["CI_QUERY"],
+          ]
+          proposal_digest = os.environ["PROPOSAL_DIGEST"]
+          confirmation = os.environ["CONFIRMATION"]
 
-          if operation not in {"verify", "discover"}:
+          if operation not in {"verify", "discover", "plan-fixture", "apply-fixture"}:
               raise SystemExit("Unsupported staging operator operation.")
           if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,95}", environment_id):
               raise SystemExit("Invalid NVS environment identifier.")
           if expected_sha and not re.fullmatch(r"[0-9a-f]{40}", expected_sha):
               raise SystemExit("expected_sha must be empty or a full lowercase Git SHA.")
-          if len(query) > 100 or any(ord(character) < 32 for character in query):
-              raise SystemExit("query must be at most 100 printable characters.")
+          for label, value in [("query", query), *[("selector", item) for item in selectors]]:
+              if len(value) > 100 or any(ord(character) < 32 for character in value):
+                  raise SystemExit(f"{label} must be at most 100 printable characters.")
+          if operation == "plan-fixture" and any(not item.strip() for item in selectors):
+              raise SystemExit("plan-fixture selectors must not be empty.")
+          if proposal_digest and not re.fullmatch(r"[0-9a-f]{64}", proposal_digest):
+              raise SystemExit("proposal_digest must be empty or a lowercase SHA-256 digest.")
+          if operation == "apply-fixture":
+              if not proposal_digest:
+                  raise SystemExit("apply-fixture requires proposal_digest.")
+              if confirmation != "APPLY_M1_02B_FIXTURE":
+                  raise SystemExit("apply-fixture requires the exact confirmation phrase.")
           PY
 
       - name: Configure pinned SSH trust
@@ -99,6 +155,12 @@ jobs:
           ENVIRONMENT_ID: ${{ inputs.environment_id }}
           EXPECTED_SHA: ${{ inputs.expected_sha }}
           QUERY: ${{ inputs.query }}
+          ASSIGNMENT_GROUP_QUERY: ${{ inputs.assignment_group_query }}
+          SERVICE_QUERY: ${{ inputs.service_query }}
+          OFFERING_QUERY: ${{ inputs.offering_query }}
+          CI_QUERY: ${{ inputs.ci_query }}
+          PROPOSAL_DIGEST: ${{ inputs.proposal_digest }}
+          CONFIRMATION: ${{ inputs.confirmation }}
           RUN_ID: ${{ github.run_id }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
@@ -119,24 +181,47 @@ jobs:
             ops/staging-operator.py \
             ops/staging-discovery-store.py \
             ops/staging-fixture-discovery.mjs \
+            ops/staging-fixture-plan.py \
+            ops/staging-fixture-apply.py \
             "${remote}:${remote_dir}/"
 
           printf -v environment_q '%q' "$ENVIRONMENT_ID"
           printf -v expected_q '%q' "$EXPECTED_SHA"
+          printf -v digest_q '%q' "$PROPOSAL_DIGEST"
+          printf -v confirmation_q '%q' "$CONFIRMATION"
           query_b64="$(printf '%s' "$QUERY" | base64 -w0)"
+          group_b64="$(printf '%s' "$ASSIGNMENT_GROUP_QUERY" | base64 -w0)"
+          service_b64="$(printf '%s' "$SERVICE_QUERY" | base64 -w0)"
+          offering_b64="$(printf '%s' "$OFFERING_QUERY" | base64 -w0)"
+          ci_b64="$(printf '%s' "$CI_QUERY" | base64 -w0)"
 
           set +e
-          if [[ "$OPERATION" == verify ]]; then
-            ssh "${ssh_options[@]}" "$remote" \
-              "python3 '$remote_dir/staging-operator.py' verify --environment-id $environment_q --expected-sha $expected_q" \
-              >"$output_file"
-            status=$?
-          else
-            ssh "${ssh_options[@]}" "$remote" \
-              "query=\$(printf '%s' '$query_b64' | base64 --decode); python3 '$remote_dir/staging-discovery-store.py' --environment-id $environment_q --query \"\$query\" --discovery-script '$remote_dir/staging-fixture-discovery.mjs' --output-file '/opt/nvs/releases/nvs-fixture-discovery-latest.json'" \
-              >"$output_file"
-            status=$?
-          fi
+          case "$OPERATION" in
+            verify)
+              ssh "${ssh_options[@]}" "$remote" \
+                "python3 '$remote_dir/staging-operator.py' verify --environment-id $environment_q --expected-sha $expected_q" \
+                >"$output_file"
+              status=$?
+              ;;
+            discover)
+              ssh "${ssh_options[@]}" "$remote" \
+                "query=\$(printf '%s' '$query_b64' | base64 --decode); python3 '$remote_dir/staging-discovery-store.py' --environment-id $environment_q --query \"\$query\" --discovery-script '$remote_dir/staging-fixture-discovery.mjs' --output-file '/opt/nvs/releases/nvs-fixture-discovery-latest.json'" \
+                >"$output_file"
+              status=$?
+              ;;
+            plan-fixture)
+              ssh "${ssh_options[@]}" "$remote" \
+                "group_query=\$(printf '%s' '$group_b64' | base64 --decode); service_query=\$(printf '%s' '$service_b64' | base64 --decode); offering_query=\$(printf '%s' '$offering_b64' | base64 --decode); ci_query=\$(printf '%s' '$ci_b64' | base64 --decode); python3 '$remote_dir/staging-fixture-plan.py' --environment-id $environment_q --assignment-group-query \"\$group_query\" --service-query \"\$service_query\" --offering-query \"\$offering_query\" --ci-query \"\$ci_query\" --discovery-script '$remote_dir/staging-fixture-discovery.mjs'" \
+                >"$output_file"
+              status=$?
+              ;;
+            apply-fixture)
+              ssh "${ssh_options[@]}" "$remote" \
+                "python3 '$remote_dir/staging-fixture-apply.py' --environment-id $environment_q --expected-sha $expected_q --proposal-digest $digest_q --confirmation $confirmation_q" \
+                >"$output_file"
+              status=$?
+              ;;
+          esac
           set -e
 
           cat "$output_file"

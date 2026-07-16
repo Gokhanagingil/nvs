@@ -3,7 +3,9 @@ name: one-shot configuration approver patch v7
 on:
   push:
     branches:
-      - ops/config-approver-trigger-v7
+      - main
+    paths:
+      - .github/workflows/one-shot-config-approver-v7.yml
 
 permissions:
   contents: write

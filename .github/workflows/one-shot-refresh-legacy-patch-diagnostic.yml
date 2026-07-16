@@ -20,36 +20,20 @@ jobs:
       - name: Refresh temporary sanitized diagnostic issue
         env:
           GH_TOKEN: ${{ github.token }}
-          TARGET_HEAD_SHA: 'c1f724f5adf43ea44a63822f2bb4202c8601777e'
+          TARGET_RUN_ID: '29493290355'
         run: |
           set -euo pipefail
           repo="$GITHUB_REPOSITORY"
-          runs_json="$(gh run list \
-            --repo "$repo" \
-            --limit 100 \
-            --json databaseId,status,conclusion,headSha,url,createdAt,name,workflowName)"
-          run_json="$(printf '%s' "$runs_json" | jq -c --arg sha "$TARGET_HEAD_SHA" '[.[] | select(.headSha == $sha and (.name == "one-shot apply legacy assignment patch" or .workflowName == ".github/workflows/one-shot-apply-legacy-assignment-patch.yml"))][0]')"
-          raw="$RUNNER_TEMP/legacy-patch-failed.log"
-          safe="$RUNNER_TEMP/legacy-patch-failed-safe.log"
-          if [[ "$run_json" == 'null' ]]; then
-            printf '%s\n' 'No one-shot legacy patch workflow run exists for the exact target commit.' > "$safe"
-          else
-            run_id="$(printf '%s' "$run_json" | jq -r '.databaseId')"
-            set +e
-            gh run view "$run_id" --repo "$repo" --log-failed > "$raw"
-            log_status=$?
-            set -e
-            if [[ "$log_status" -eq 0 ]]; then
-              tail -n 120 "$raw" \
-                | sed -E 's/(authorization:|bearer |password|token)[^ ]*/\1 [redacted]/Ig' \
-                > "$safe"
-            else
-              printf '%s\n' 'No failed log is available; the workflow may still be running or may have succeeded.' > "$safe"
-            fi
-          fi
-          body="$RUNNER_TEMP/legacy-patch-diagnostic.md"
+          run_json="$(gh run view "$TARGET_RUN_ID" --repo "$repo" --json databaseId,status,conclusion,headSha,url,createdAt,name,workflowName)"
+          raw="$RUNNER_TEMP/pr20-ci-failed.log"
+          safe="$RUNNER_TEMP/pr20-ci-failed-safe.log"
+          gh run view "$TARGET_RUN_ID" --repo "$repo" --log-failed > "$raw"
+          tail -n 160 "$raw" \
+            | sed -E 's/(authorization:|bearer |password|token)[^ ]*/\1 [redacted]/Ig' \
+            > "$safe"
+          body="$RUNNER_TEMP/pr20-ci-diagnostic.md"
           {
-            echo 'Temporary sanitized diagnostic for the valid legacy assignment patch workflow run.'
+            echo 'Temporary sanitized diagnostic for the latest PR #20 CI failure.'
             echo
             echo '```json'
             printf '%s\n' "$run_json"

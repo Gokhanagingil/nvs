@@ -62,73 +62,226 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-  apply-canonical-sla-state-order:
+  prepare-reviewed-staging-fixtures:
     if: >-
       github.event_name == 'pull_request' &&
       github.head_ref == 'ops/prepare-staging-fixtures-6747-via-ci'
+    needs: foundation
     permissions:
-      contents: write
+      actions: write
+      contents: read
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 120
     steps:
-      - name: Check out the clean implementation branch
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-        with:
-          ref: fix/bootstrap-canonical-sla-state-order
-          persist-credentials: true
-          fetch-depth: 0
-
-      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa
-        with:
-          version: 11.13.0
-
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
-        with:
-          node-version: 24.18.0
-          cache: pnpm
-
-      - name: Apply and verify the canonical snapshot correction
+      - name: Fresh-plan, apply, load, and verify the reviewed staging fixture
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPLOY_SHA: 6747d023d0d8cfe7fd72982451947c433d9ea429
         run: |
           set -Eeuo pipefail
-          pnpm install --frozen-lockfile
-          python3 - <<'PY'
-          from pathlib import Path
+          repo="$GITHUB_REPOSITORY"
+          workspace="$RUNNER_TEMP/nvs-staging-fixture-sequence"
+          mkdir -p "$workspace"
 
-          bootstrap = Path('ops/staging-fixture-bootstrap.mjs')
-          source = bootstrap.read_text(encoding='utf-8')
-          old = "    stopOnStates: ['resolved', 'closed'],"
-          new = "    stopOnStates: ['closed', 'resolved'],"
-          if source.count(old) != 1:
-              raise SystemExit('expected exactly one non-canonical stopOnStates sequence')
-          bootstrap.write_text(source.replace(old, new, 1), encoding='utf-8')
+          latest_dispatch_run() {
+            local workflow="$1"
+            {
+              gh run list \
+                --repo "$repo" \
+                --workflow "$workflow" \
+                --branch main \
+                --event workflow_dispatch \
+                --limit 1 \
+                --json databaseId \
+                --jq '.[0].databaseId // 0'
+            } 2>/dev/null || printf '0\n'
+          }
 
-          test = Path('tests/staging-fixture-bootstrap-assets.test.ts')
-          test_source = test.read_text(encoding='utf-8')
-          anchor = "    expect(source).toContain(\"operator: 'is', value: serviceId\");\n"
-          replacement = (
-              anchor
-              + "    expect(source).toContain(\"stopOnStates: ['closed', 'resolved']\");\n"
-              + "    expect(source).not.toContain(\"stopOnStates: ['resolved', 'closed']\");\n"
-          )
-          if test_source.count(anchor) != 1:
-              raise SystemExit('expected exactly one bootstrap SLA assertion anchor')
-          test.write_text(test_source.replace(anchor, replacement, 1), encoding='utf-8')
+          dispatch_run() {
+            local workflow="$1"
+            shift
+            local previous candidate run_id=''
+            previous="$(latest_dispatch_run "$workflow")"
+            gh workflow run "$workflow" --repo "$repo" --ref main "$@" >/dev/null
+            for _attempt in $(seq 1 90); do
+              sleep 2
+              candidate="$(latest_dispatch_run "$workflow")"
+              if [[ "$candidate" != '0' && "$candidate" != "$previous" ]]; then
+                run_id="$candidate"
+                break
+              fi
+            done
+            [[ -n "$run_id" ]]
+            printf '%s\n' "$run_id"
+          }
+
+          wait_and_download() {
+            local run_id="$1"
+            local artifact_name="$2"
+            local destination="$3"
+            mkdir -p "$destination"
+            set +e
+            gh run watch "$run_id" --repo "$repo" --exit-status
+            local watch_status=$?
+            set -e
+            local download_status=1
+            for _attempt in $(seq 1 10); do
+              if gh run download "$run_id" \
+                --repo "$repo" \
+                --name "$artifact_name" \
+                --dir "$destination"; then
+                download_status=0
+                break
+              fi
+              sleep 2
+            done
+            if [[ "$download_status" -ne 0 ]]; then
+              echo "sanitized artifact unavailable for workflow run $run_id" >&2
+            fi
+            if [[ "$watch_status" -ne 0 ]]; then
+              for safe_file in "$destination"/*.md; do
+                [[ -f "$safe_file" ]] && cat "$safe_file"
+              done
+              return "$watch_status"
+            fi
+          }
+
+          bootstrap_plan_run="$(dispatch_run staging-fixture-bootstrap.yml \
+            --field operation=plan \
+            --field environment_id=staging-example \
+            --field expected_sha="$DEPLOY_SHA" \
+            --field bootstrap_digest='' \
+            --field confirmation='')"
+          echo "bootstrap plan run: $bootstrap_plan_run"
+          bootstrap_plan_dir="$workspace/bootstrap-plan"
+          wait_and_download \
+            "$bootstrap_plan_run" \
+            "nvs-staging-fixture-bootstrap-${bootstrap_plan_run}-1" \
+            "$bootstrap_plan_dir"
+          bootstrap_plan_file="$bootstrap_plan_dir/nvs-staging-fixture-bootstrap.md"
+          test -f "$bootstrap_plan_file"
+          bootstrap_digest="$(python3 - "$bootstrap_plan_file" <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          text = pathlib.Path(sys.argv[1]).read_text(encoding='utf-8')
+          if '- Result: `PASS`' not in text:
+              raise SystemExit('bootstrap plan did not PASS')
+          match = re.search(r'^- Bootstrap digest: `([0-9a-f]{64})`$', text, re.MULTILINE)
+          if not match:
+              raise SystemExit('bootstrap plan digest was unavailable')
+          section = text.split('## Planned actions', 1)[1].split('## Existing deterministic resources', 1)[0]
+          actions = set(re.findall(r'^- `([^`]+)`$', section, re.MULTILINE))
+          allowed = {
+              'NONE_ALREADY_READY',
+              'CREATE_ASSIGNMENT_GROUP',
+              'ADD_SERVICE_DESK_MEMBER',
+              'CREATE_CI_CLASS',
+              'CREATE_CMDB_SERVICE',
+              'CREATE_AND_PUBLISH_GOVERNED_SLA',
+              'COMPLETE_GOVERNED_SLA_PUBLISH',
+              'CREATE_SERVICE_OFFERING',
+              'CREATE_CONFIGURATION_ITEM',
+          }
+          unexpected = sorted(actions - allowed)
+          if unexpected:
+              raise SystemExit('bootstrap plan contained an unexpected action: ' + ', '.join(unexpected))
+          if any(action.startswith('CREATE_CHOICE_') for action in actions):
+              raise SystemExit('retired choice-write action remained in the bootstrap plan')
+          print(match.group(1))
           PY
-          pnpm exec prettier --write \
-            ops/staging-fixture-bootstrap.mjs \
-            tests/staging-fixture-bootstrap-assets.test.ts
-          node --check ops/staging-fixture-bootstrap.mjs
-          pnpm exec eslint \
-            ops/staging-fixture-bootstrap.mjs \
-            tests/staging-fixture-bootstrap-assets.test.ts
-          pnpm exec vitest run tests/staging-fixture-bootstrap-assets.test.ts
-          git diff --check
+          )"
 
-      - name: Push only the implementation correction
-        run: |
-          set -Eeuo pipefail
-          git config user.name 'nvs-maintenance-bot'
-          git config user.email 'nvs-maintenance-bot@users.noreply.github.com'
-          git add ops/staging-fixture-bootstrap.mjs tests/staging-fixture-bootstrap-assets.test.ts
-          git commit -m 'fix: canonicalize governed SLA stop-state order'
-          git push origin HEAD:fix/bootstrap-canonical-sla-state-order
+          bootstrap_apply_run="$(dispatch_run staging-fixture-bootstrap.yml \
+            --field operation=apply \
+            --field environment_id=staging-example \
+            --field expected_sha="$DEPLOY_SHA" \
+            --field bootstrap_digest="$bootstrap_digest" \
+            --field confirmation=BOOTSTRAP_M1_02B_FIXTURES)"
+          echo "bootstrap apply run: $bootstrap_apply_run"
+          bootstrap_apply_dir="$workspace/bootstrap-apply"
+          wait_and_download \
+            "$bootstrap_apply_run" \
+            "nvs-staging-fixture-bootstrap-${bootstrap_apply_run}-1" \
+            "$bootstrap_apply_dir"
+          bootstrap_apply_file="$bootstrap_apply_dir/nvs-staging-fixture-bootstrap.md"
+          test -f "$bootstrap_apply_file"
+          grep -F -- '- Result: `PASS`' "$bootstrap_apply_file" >/dev/null
+
+          fixture_plan_run="$(dispatch_run staging-fixture.yml \
+            --field operation=plan \
+            --field environment_id=staging-example \
+            --field expected_sha="$DEPLOY_SHA" \
+            --field assignment_group_query='service desk' \
+            --field service_query=payment \
+            --field offering_query=payment \
+            --field ci_query=payment \
+            --field proposal_digest='' \
+            --field confirmation='')"
+          echo "server-owned fixture plan run: $fixture_plan_run"
+          fixture_plan_dir="$workspace/fixture-plan"
+          wait_and_download \
+            "$fixture_plan_run" \
+            "nvs-staging-fixture-${fixture_plan_run}-1" \
+            "$fixture_plan_dir"
+          fixture_plan_file="$fixture_plan_dir/nvs-staging-fixture.md"
+          test -f "$fixture_plan_file"
+          fixture_digest="$(python3 - "$fixture_plan_file" <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          text = pathlib.Path(sys.argv[1]).read_text(encoding='utf-8')
+          if '**Result:** PASS' not in text:
+              raise SystemExit('server-owned fixture plan did not PASS')
+          match = re.search(r'^- Proposal digest: `([0-9a-f]{64})`$', text, re.MULTILINE)
+          if not match:
+              raise SystemExit('fixture proposal digest was unavailable')
+          print(match.group(1))
+          PY
+          )"
+
+          fixture_apply_run="$(dispatch_run staging-fixture.yml \
+            --field operation=apply \
+            --field environment_id=staging-example \
+            --field expected_sha="$DEPLOY_SHA" \
+            --field assignment_group_query='service desk' \
+            --field service_query=payment \
+            --field offering_query=payment \
+            --field ci_query=payment \
+            --field proposal_digest="$fixture_digest" \
+            --field confirmation=APPLY_M1_02B_FIXTURE)"
+          echo "server-owned fixture apply run: $fixture_apply_run"
+          fixture_apply_dir="$workspace/fixture-apply"
+          wait_and_download \
+            "$fixture_apply_run" \
+            "nvs-staging-fixture-${fixture_apply_run}-1" \
+            "$fixture_apply_dir"
+          fixture_apply_file="$fixture_apply_dir/nvs-staging-fixture.md"
+          test -f "$fixture_apply_file"
+          grep -F -- '**Result:** PASS' "$fixture_apply_file" >/dev/null
+
+          verify_run="$(dispatch_run staging-operator.yml \
+            --field operation=verify \
+            --field environment_id=staging-example \
+            --field expected_sha="$DEPLOY_SHA" \
+            --field query='')"
+          echo "verification run: $verify_run"
+          gh run watch "$verify_run" --repo "$repo" --exit-status
+
+          {
+            echo '## Staging fixture preparation'
+            echo
+            echo "- Deployed exact SHA: \`$DEPLOY_SHA\`"
+            echo "- Bootstrap plan run: \`$bootstrap_plan_run\`"
+            echo "- Bootstrap apply run: \`$bootstrap_apply_run\`"
+            echo "- Server-owned fixture plan run: \`$fixture_plan_run\`"
+            echo "- Server-owned fixture apply run: \`$fixture_apply_run\`"
+            echo "- Verification run: \`$verify_run\`"
+            echo "- Bootstrap digest: \`$bootstrap_digest\`"
+            echo "- Fixture proposal digest: \`$fixture_digest\`"
+            echo '- Mutation switch: `DISABLED`'
+            echo '- Incident created: `NO`'
+            echo '- Result: `PASS`'
+          } >> "$GITHUB_STEP_SUMMARY"

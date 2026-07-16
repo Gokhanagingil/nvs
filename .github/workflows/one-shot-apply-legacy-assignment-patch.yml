@@ -32,6 +32,24 @@ jobs:
         run: |
           set -euo pipefail
           python3 tools/apply-legacy-assignment-patch.py
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('ops/staging-fixture-plan.py')
+          text = path.read_text(encoding='utf-8')
+          marker = 'def _assignment_selection(item: dict[str, Any], mode: str) -> dict[str, Any]:'
+          start = text.find(marker)
+          if start < 0:
+              raise SystemExit('generated assignment selection helper was not found')
+          end = text.find('\n\ndef _run', start)
+          if end < 0:
+              raise SystemExit('generated assignment selection helper boundary was not found')
+          block = text[start:end]
+          fixed = block.replace('\\"', '"')
+          if fixed == block:
+              raise SystemExit('generated assignment selection helper did not contain the reviewed escape defect')
+          path.write_text(text[:start] + fixed + text[end:], encoding='utf-8')
+          PY
           pnpm exec prettier --write \
             packages/contracts/src/index.ts \
             packages/core/src/index.ts \

@@ -300,3 +300,5 @@ jobs:
           git add .github/workflows
           git commit -m 'chore: remove completed deployment and choice workflows'
           git push origin HEAD:main
+
+# Reviewed retrigger after the workflow was established on main: 2026-07-16

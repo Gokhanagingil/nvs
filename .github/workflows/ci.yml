@@ -61,3 +61,129 @@ jobs:
             test-results
           if-no-files-found: ignore
           retention-days: 7
+
+  apply_configuration_approver:
+    needs: foundation
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.head_ref == 'ops/direct-config-approver-ci' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out current main
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: main
+          persist-credentials: true
+          fetch-depth: 0
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa
+        with:
+          version: 11.13.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.18.0
+          cache: pnpm
+      - name: Apply the reviewed source correction to a clean branch
+        run: |
+          set -euo pipefail
+          git config user.name 'nvs-maintenance-bot'
+          git config user.email 'nvs-maintenance-bot@users.noreply.github.com'
+          git fetch origin fix/bootstrap-configuration-approver
+          pnpm install --frozen-lockfile
+
+          git show \
+            origin/fix/bootstrap-configuration-approver:tools/apply-bootstrap-configuration-approver-v2.py \
+            > tools/.tmp-apply-bootstrap-configuration-approver.py
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          patch = Path('tools/.tmp-apply-bootstrap-configuration-approver.py')
+          text = patch.read_text(encoding='utf-8')
+          marker = '''replace_once(
+              bootstrap,
+              """async function atomicInventory(payload) {'''
+          start = text.find(marker)
+          if start < 0:
+              raise SystemExit('atomicInventory patch block start was not found')
+          end = text.find('\n\nreplace_once(', start + len(marker))
+          if end < 0:
+              raise SystemExit('atomicInventory patch block end was not found')
+          patch.write_text(text[:start] + text[end + 2:], encoding='utf-8')
+          PY
+
+          python3 tools/.tmp-apply-bootstrap-configuration-approver.py
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          target = Path('ops/staging-fixture-bootstrap.mjs')
+          text = target.read_text(encoding='utf-8')
+          pattern = r"async function atomicInventory\(payload\) \{.*?\n\}\n\nasync function applyPlan"
+          replacement = """async function atomicInventory(payload) {
+            await writePrivateJson(INVENTORY_PATH, payload);
+          }
+
+          async function applyPlan"""
+          next_text, count = re.subn(pattern, replacement, text, count=1, flags=re.DOTALL)
+          if count != 1:
+              raise SystemExit(f'atomicInventory source replacement count={count}')
+          target.write_text(next_text, encoding='utf-8')
+          PY
+
+          rm -f \
+            tools/.tmp-apply-bootstrap-configuration-approver.py \
+            .github/workflows/one-shot-config-approver-v7.yml
+
+          pnpm exec prettier --write \
+            ops/staging-fixture-bootstrap.mjs \
+            tests/staging-fixture-bootstrap-assets.test.ts \
+            docs/operations/STAGING_FIXTURE_BOOTSTRAP.md
+          node --check ops/staging-fixture-bootstrap.mjs
+          pnpm exec eslint \
+            ops/staging-fixture-bootstrap.mjs \
+            tests/staging-fixture-bootstrap-assets.test.ts
+          pnpm exec vitest run tests/staging-fixture-bootstrap-assets.test.ts
+          pnpm run typecheck
+          git diff --check
+
+          python3 - <<'PY'
+          import subprocess
+
+          allowed = {
+              '.github/workflows/one-shot-config-approver-v7.yml',
+              'docs/operations/STAGING_FIXTURE_BOOTSTRAP.md',
+              'ops/staging-fixture-bootstrap.mjs',
+              'tests/staging-fixture-bootstrap-assets.test.ts',
+          }
+          changed = {
+              line[3:]
+              for line in subprocess.check_output(
+                  ['git', 'status', '--short'], text=True
+              ).splitlines()
+              if len(line) >= 4
+          }
+          unexpected = sorted(changed - allowed)
+          required = {
+              'docs/operations/STAGING_FIXTURE_BOOTSTRAP.md',
+              'ops/staging-fixture-bootstrap.mjs',
+              'tests/staging-fixture-bootstrap-assets.test.ts',
+          }
+          missing = sorted(required - changed)
+          if unexpected or missing:
+              raise SystemExit(
+                  f'unexpected={unexpected}; missing_required={missing}; changed={sorted(changed)}'
+              )
+          PY
+
+          git add \
+            .github/workflows/one-shot-config-approver-v7.yml \
+            docs/operations/STAGING_FIXTURE_BOOTSTRAP.md \
+            ops/staging-fixture-bootstrap.mjs \
+            tests/staging-fixture-bootstrap-assets.test.ts
+          git commit -m 'fix: provision distinct governed SLA configuration approver'
+          git push --force-with-lease origin HEAD:fix/bootstrap-configuration-approver-clean

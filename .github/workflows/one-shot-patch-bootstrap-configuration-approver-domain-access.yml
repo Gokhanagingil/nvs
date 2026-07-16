@@ -9,6 +9,7 @@ on:
 
 permissions:
   contents: write
+  issues: write
 
 concurrency:
   group: nvs-one-shot-patch-bootstrap-configuration-approver-domain-access
@@ -20,72 +21,111 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - name: Check out current main
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           ref: main
           persist-credentials: true
           fetch-depth: 0
+
       - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa
         with:
           version: 11.13.0
+
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: 24.18.0
           cache: pnpm
-      - name: Patch only the supported user domain-access contract
+
+      - name: Apply supported domain-access contract correction
+        id: patch
         run: |
           set -euo pipefail
           git config user.name 'nvs-maintenance-bot'
           git config user.email 'nvs-maintenance-bot@users.noreply.github.com'
-          git checkout -B fix/bootstrap-configuration-approver-domain-access
-          python - <<'PY'
+          git checkout -B fix/bootstrap-configuration-approver-domain-access origin/main
+          pnpm install --frozen-lockfile
+
+          python3 - <<'PY'
           from pathlib import Path
 
-          script_path = Path('ops/staging-fixture-bootstrap.mjs')
-          script = script_path.read_text(encoding='utf-8')
-          old = """          hasItsmAccess: true,
-          mustChangePassword: false,"""
-          new = """          domainAccessGrc: false,
-          domainAccessItsm: true,
-          domainAccessSpace: false,
-          mustChangePassword: false,"""
-          if script.count(old) != 1:
-              raise SystemExit('expected exactly one legacy configuration approver domain-access payload')
-          script_path.write_text(script.replace(old, new), encoding='utf-8')
+          def replace_once(path: Path, old: str, new: str) -> None:
+              text = path.read_text(encoding='utf-8')
+              count = text.count(old)
+              if count != 1:
+                  raise RuntimeError(f'{path}: expected one exact match, found {count}: {old[:160]!r}')
+              path.write_text(text.replace(old, new, 1), encoding='utf-8')
 
-          test_path = Path('tests/staging-fixture-bootstrap-assets.test.ts')
-          test = test_path.read_text(encoding='utf-8')
-          old_test = """    expect(source).toContain(\"role: 'admin'\");
-    expect(source).toContain('mustChangePassword: false');"""
-          new_test = """    expect(source).toContain(\"role: 'admin'\");
-    expect(source).toContain('domainAccessGrc: false');
-    expect(source).toContain('domainAccessItsm: true');
-    expect(source).toContain('domainAccessSpace: false');
-    expect(source).toContain('mustChangePassword: false');
-    expect(source).not.toContain('hasItsmAccess');"""
-          if test.count(old_test) != 1:
-              raise SystemExit('expected exactly one configuration approver regression anchor')
-          test_path.write_text(test.replace(old_test, new_test), encoding='utf-8')
+          bootstrap = Path('ops/staging-fixture-bootstrap.mjs')
+          replace_once(
+              bootstrap,
+              "          hasItsmAccess: true,\n"
+              "          mustChangePassword: false,",
+              "          domainAccessGrc: false,\n"
+              "          domainAccessItsm: true,\n"
+              "          domainAccessSpace: false,\n"
+              "          mustChangePassword: false,",
+          )
+
+          tests = Path('tests/staging-fixture-bootstrap-assets.test.ts')
+          replace_once(
+              tests,
+              "    expect(source).toContain(\"role: 'admin'\");\n"
+              "    expect(source).toContain('mustChangePassword: false');\n",
+              "    expect(source).toContain(\"role: 'admin'\");\n"
+              "    expect(source).toContain('domainAccessGrc: false');\n"
+              "    expect(source).toContain('domainAccessItsm: true');\n"
+              "    expect(source).toContain('domainAccessSpace: false');\n"
+              "    expect(source).toContain('mustChangePassword: false');\n"
+              "    expect(source).not.toContain('hasItsmAccess');\n",
+          )
           PY
+
           rm -f .github/workflows/one-shot-patch-bootstrap-configuration-approver-domain-access.yml
-          git add -A
-          changed="$(git diff --cached --name-only | sort)"
-          expected="$(printf '%s\n' \
-            '.github/workflows/one-shot-patch-bootstrap-configuration-approver-domain-access.yml' \
-            'ops/staging-fixture-bootstrap.mjs' \
-            'tests/staging-fixture-bootstrap-assets.test.ts' | sort)"
-          [[ "$changed" == "$expected" ]]
-          pnpm install --frozen-lockfile
-          pnpm exec prettier --check \
+          pnpm exec prettier --write \
             ops/staging-fixture-bootstrap.mjs \
             tests/staging-fixture-bootstrap-assets.test.ts
           node --check ops/staging-fixture-bootstrap.mjs
           pnpm exec eslint ops/staging-fixture-bootstrap.mjs tests/staging-fixture-bootstrap-assets.test.ts
           pnpm exec vitest run tests/staging-fixture-bootstrap-assets.test.ts
           pnpm run typecheck
-          git diff --cached --check
+          git diff --check
+
+          changed="$(git diff --name-only | sort)"
+          expected="$(printf '%s\n' \
+            '.github/workflows/one-shot-patch-bootstrap-configuration-approver-domain-access.yml' \
+            'ops/staging-fixture-bootstrap.mjs' \
+            'tests/staging-fixture-bootstrap-assets.test.ts' | sort)"
+          [[ "$changed" == "$expected" ]]
+
+          git add -A
           git commit -m 'fix: use supported domain access contract for configuration approver'
-          git push --force-with-lease origin HEAD:fix/bootstrap-configuration-approver-domain-access
+          git push origin HEAD:fix/bootstrap-configuration-approver-domain-access
+          echo "implementation_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Publish sanitized patch result
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMPLEMENTATION_SHA: ${{ steps.patch.outputs.implementation_sha }}
+        run: |
+          set -euo pipefail
+          body="$RUNNER_TEMP/bootstrap-configuration-approver-domain-access-result.md"
+          {
+            echo '# Sanitized Configuration Approver domain-access correction result'
+            echo
+            echo '- Implementation branch: `fix/bootstrap-configuration-approver-domain-access`'
+            echo "- Implementation SHA: \`$IMPLEMENTATION_SHA\`"
+            echo '- Deterministic blocker corrected: unsupported `hasItsmAccess` was replaced with explicit GRC/ITSM/Space domain flags.'
+            echo '- Least privilege: GRC disabled, ITSM enabled, Space disabled, global-admin disabled.'
+            echo '- Validation: formatting, Node syntax, ESLint, focused tests, TypeScript, and diff checks passed.'
+            echo '- Staging access or mutation: none'
+            echo '- NILES mutation switch: unchanged and disabled'
+            echo '- Live Incident acceptance: not executed'
+          } > "$body"
+          gh issue edit 23 \
+            --repo "$GITHUB_REPOSITORY" \
+            --title '[Closed] Configuration Approver domain-access contract correction' \
+            --body-file "$body"
 
   cleanup:
     needs: patch

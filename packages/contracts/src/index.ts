@@ -566,6 +566,22 @@ const fixtureResourceRefSchema = z
   })
   .strict();
 
+const fixtureAssignmentGroupSchema = z.union([
+  z
+    .object({
+      mode: z.literal('CANONICAL_ID').optional(),
+      id: z.uuid(),
+      label: z.string().min(1).max(160).optional(),
+    })
+    .strict(),
+  z
+    .object({
+      mode: z.literal('LEGACY_LABEL'),
+      label: z.string().min(1).max(100),
+    })
+    .strict(),
+]);
+
 export const nilesIncidentFixtureV1Schema = z
   .object({
     schemaVersion: z.literal('nvs.niles-incident-fixture/v1'),
@@ -577,7 +593,7 @@ export const nilesIncidentFixtureV1Schema = z
     scenarioAllowlist: z.array(liveRunAllowlistEntrySchema).min(1),
     resources: z
       .object({
-        assignmentGroup: fixtureResourceRefSchema,
+        assignmentGroup: fixtureAssignmentGroupSchema,
         service: fixtureResourceRefSchema,
         offering: fixtureResourceRefSchema.optional(),
         configurationItem: fixtureResourceRefSchema.optional(),
@@ -945,7 +961,16 @@ export type ResourceDisposition = z.infer<typeof resourceDispositionSchema>;
 
 const inventoryResourceSchema = z
   .object({
-    kind: z.enum(['TENANT', 'ASSIGNMENT_GROUP', 'SERVICE', 'OFFERING', 'CI', 'INCIDENT', 'SLA']),
+    kind: z.enum([
+      'TENANT',
+      'ASSIGNMENT_GROUP',
+      'ASSIGNMENT_LABEL',
+      'SERVICE',
+      'OFFERING',
+      'CI',
+      'INCIDENT',
+      'SLA',
+    ]),
     id: z.string().min(1).max(160),
     label: z.string().min(1).max(160).optional(),
     disposition: resourceDispositionSchema,

@@ -38,6 +38,7 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const tenantId = '33333333-3333-4333-8333-333333333333';
+const assignmentGroupId = '55555555-5555-4555-8555-555555555555';
 const userIds = {
   requester: '11111111-1111-4111-8111-111111111111',
   serviceDesk: '22222222-2222-4222-8222-222222222222',
@@ -82,7 +83,7 @@ const fixture: NilesIncidentFixtureV1 = {
     },
   ],
   resources: {
-    assignmentGroup: { id: '55555555-5555-4555-8555-555555555555' },
+    assignmentGroup: { mode: 'CANONICAL_ID', id: assignmentGroupId },
     service: { id: '66666666-6666-4666-8666-666666666666' },
     offering: { id: '77777777-7777-4777-8777-777777777777' },
     configurationItem: { id: '88888888-8888-4888-8888-888888888888' },
@@ -243,7 +244,7 @@ class StatefulIncidentAdapter implements NilesIncidentLiveAdapter {
     number: 'INC-NVS-1',
     status: 'open' as const,
     priority: 'p1' as const,
-    assignmentGroupId: fixture.resources.assignmentGroup.id,
+    assignmentGroupId: assignmentGroupId,
     requesterId: userIds.requester,
   };
 
@@ -284,8 +285,16 @@ class StatefulIncidentAdapter implements NilesIncidentLiveAdapter {
     };
   }
 
-  async createIncident(): Promise<NilesIncidentRecord> {
+  async createIncident(input: {
+    assignmentGroupId?: string;
+    assignmentGroup?: string;
+  }): Promise<NilesIncidentRecord> {
     this.operations.push('POST create incident');
+    this.incident = {
+      ...this.incident,
+      assignmentGroupId: input.assignmentGroupId ?? null,
+      assignmentGroup: input.assignmentGroup ?? null,
+    };
     return {
       ...this.incident,
       transport: {
@@ -312,8 +321,12 @@ class StatefulIncidentAdapter implements NilesIncidentLiveAdapter {
     };
   }
 
-  async assignIncident(input: { assignmentGroupId: string }) {
-    this.incident = { ...this.incident, assignmentGroupId: input.assignmentGroupId };
+  async assignIncident(input: { assignmentGroupId?: string; assignmentGroup?: string }) {
+    this.incident = {
+      ...this.incident,
+      assignmentGroupId: input.assignmentGroupId ?? null,
+      assignmentGroup: input.assignmentGroup ?? null,
+    };
     return this.readIncident();
   }
 
@@ -1570,7 +1583,7 @@ describe('live Incident API orchestration', () => {
       method: 'GET',
       pathTemplate: '/grc/itsm/incidents/:incidentId',
       assignmentGroupId: unexpectedGroupId,
-      expectedAssignmentGroupId: fixture.resources.assignmentGroup.id,
+      expectedAssignmentGroupId: assignmentGroupId,
     });
   });
 
@@ -2144,5 +2157,50 @@ describe('live Incident API orchestration', () => {
     expect(JSON.stringify(await core.getEvidence(run.runId))).not.toMatch(
       /fake-token|actor@example|synthetic-test-value/i,
     );
+  });
+
+  it('uses the reviewed legacy assignment label when the tenant has no group records', async () => {
+    const legacyFixture: NilesIncidentFixtureV1 = {
+      ...fixture,
+      resources: {
+        ...fixture.resources,
+        assignmentGroup: { mode: 'LEGACY_LABEL', label: 'NVS Service Desk' },
+      },
+    };
+    const adapter = new StatefulIncidentAdapter();
+    const core = buildCore(adapter, liveEnvironment, {}, undefined, {}, legacyFixture);
+
+    const run = await core.createLiveApiRun({
+      runId: 'live-legacy-assignment-label',
+      environmentId: 'live-test',
+      scenarioId: 'payment-api-service-degradation',
+      variationValues: { journey: 'normal' },
+      confirmRealMutation: true,
+      now: '2026-07-15T12:00:00.000Z',
+    });
+
+    expect(run.verdict).toBe('BLOCKED');
+    expect(run.error?.code).toBe('NILES_CLOSE_AUTHORITY_UNSATISFIABLE');
+    expect(run.resourceInventory.resources).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: 'ASSIGNMENT_LABEL',
+          id: 'legacy-label:NVS Service Desk',
+          label: 'NVS Service Desk',
+        }),
+      ]),
+    );
+    expect(adapter.incident.assignmentGroup).toBe('NVS Service Desk');
+    expect(adapter.incident.assignmentGroupId).toBeNull();
+    const progress = await core.getRunProgress(run.runId);
+    expect(
+      progress.observations.find(
+        (observation) => observation.sourceStepId === 'assign-service-desk',
+      )?.evidence,
+    ).toMatchObject({
+      assignmentBindingMode: 'LEGACY_LABEL',
+      assignmentGroup: 'NVS Service Desk',
+      expectedAssignmentGroup: 'NVS Service Desk',
+    });
   });
 });

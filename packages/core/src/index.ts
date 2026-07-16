@@ -164,6 +164,7 @@ export interface NilesIncidentRecord {
   status?: 'open' | 'in_progress' | 'on_hold' | 'resolved' | 'closed';
   priority?: 'p1' | 'p2' | 'p3' | 'p4';
   requesterId?: string | null;
+  assignmentGroup?: string | null;
   assignmentGroupId?: string | null;
   assignedTo?: string | null;
   transport?: NilesTransportEvidence;
@@ -234,7 +235,8 @@ export interface NilesIncidentLiveAdapter {
     runId: string;
     runNamespacePrefix: string;
     requesterUserId: string;
-    assignmentGroupId: string;
+    assignmentGroupId?: string;
+    assignmentGroup?: string;
     serviceId: string;
     offeringId?: string;
     impact: 'low' | 'medium' | 'high';
@@ -252,7 +254,8 @@ export interface NilesIncidentLiveAdapter {
     session: ActorSession;
     tenantId: string;
     incidentId: string;
-    assignmentGroupId: string;
+    assignmentGroupId?: string;
+    assignmentGroup?: string;
     correlationId: string;
   }): Promise<NilesIncidentRecord>;
   takeOwnership(input: {
@@ -750,6 +753,62 @@ function isStoppedResolutionSlaRecord(record: NilesSlaSummary['records'][number]
 
 function incidentCreateMarker(runId: string, runNamespacePrefix: string): string {
   return `${runNamespacePrefix}-${runId}`;
+}
+
+type FixtureAssignmentBinding =
+  | {
+      mode: 'CANONICAL_ID';
+      assignmentGroupId: string;
+      label?: string;
+    }
+  | {
+      mode: 'LEGACY_LABEL';
+      assignmentGroup: string;
+      label: string;
+    };
+
+function fixtureAssignmentBinding(fixture: NilesIncidentFixtureV1): FixtureAssignmentBinding {
+  const assignmentGroup = fixture.resources.assignmentGroup;
+  if ('id' in assignmentGroup) {
+    return {
+      mode: 'CANONICAL_ID',
+      assignmentGroupId: assignmentGroup.id,
+      ...(assignmentGroup.label ? { label: assignmentGroup.label } : {}),
+    };
+  }
+  return {
+    mode: 'LEGACY_LABEL',
+    assignmentGroup: assignmentGroup.label,
+    label: assignmentGroup.label,
+  };
+}
+
+function fixtureAssignmentInput(binding: FixtureAssignmentBinding): {
+  assignmentGroupId?: string;
+  assignmentGroup?: string;
+} {
+  return binding.mode === 'CANONICAL_ID'
+    ? { assignmentGroupId: binding.assignmentGroupId }
+    : { assignmentGroup: binding.assignmentGroup };
+}
+
+function fixtureAssignmentInventoryResource(
+  fixture: NilesIncidentFixtureV1,
+): ResourceInventoryV1['resources'][number] {
+  const binding = fixtureAssignmentBinding(fixture);
+  return binding.mode === 'CANONICAL_ID'
+    ? {
+        kind: 'ASSIGNMENT_GROUP',
+        id: binding.assignmentGroupId,
+        ...(binding.label ? { label: binding.label } : {}),
+        disposition: 'VERIFIED_EXISTING',
+      }
+    : {
+        kind: 'ASSIGNMENT_LABEL',
+        id: `legacy-label:${binding.assignmentGroup}`,
+        label: binding.label,
+        disposition: 'VERIFIED_EXISTING',
+      };
 }
 
 type JournalLifecycleAction = 'hold' | 'resume' | 'resolve';
@@ -1592,15 +1651,20 @@ export class NvsCore {
           sessions.tenantAdmin,
           'confirmed_readiness',
         );
+        const assignmentBinding = fixtureAssignmentBinding(fixture);
         const verifiedResources = await Promise.all([
-          live.incidentAdapter.verifyResource({
-            environment,
-            session: sessions.tenantAdmin,
-            tenantId: fixture.tenantId,
-            kind: 'ASSIGNMENT_GROUP',
-            id: fixture.resources.assignmentGroup.id,
-            correlationId: this.liveCorrelation('confirmed_readiness_fixture_group'),
-          }),
+          ...(assignmentBinding.mode === 'CANONICAL_ID'
+            ? [
+                live.incidentAdapter.verifyResource({
+                  environment,
+                  session: sessions.tenantAdmin,
+                  tenantId: fixture.tenantId,
+                  kind: 'ASSIGNMENT_GROUP' as const,
+                  id: assignmentBinding.assignmentGroupId,
+                  correlationId: this.liveCorrelation('confirmed_readiness_fixture_group'),
+                }),
+              ]
+            : []),
           live.incidentAdapter.verifyResource({
             environment,
             session: sessions.tenantAdmin,
@@ -1656,8 +1720,8 @@ export class NvsCore {
           pass(
             'fixture-resources',
             fixture.resources.sla.policyRef
-              ? `Required fixture resources and ${choiceTransports.length} choice-catalog reads were verified read-only; SLA policyRef remains observational because no stable read-only policy endpoint is contracted.`
-              : `Required fixture resources and ${choiceTransports.length} choice-catalog reads were verified read-only.`,
+              ? `Required fixture resources, ${choiceTransports.length} choice-catalog reads, and ${assignmentBinding.mode === 'LEGACY_LABEL' ? 'the reviewed legacy assignment-label contract' : 'the canonical assignment group'} were verified read-only; SLA policyRef remains observational because no stable read-only policy endpoint is contracted.`
+              : `Required fixture resources, ${choiceTransports.length} choice-catalog reads, and ${assignmentBinding.mode === 'LEGACY_LABEL' ? 'the reviewed legacy assignment-label contract' : 'the canonical assignment group'} were verified read-only.`,
           );
         }
       } catch (error) {
@@ -1813,12 +1877,7 @@ export class NvsCore {
       },
       resources: [
         { kind: 'TENANT', id: fixture.tenantId, disposition: 'VERIFIED_EXISTING' },
-        {
-          kind: 'ASSIGNMENT_GROUP',
-          id: fixture.resources.assignmentGroup.id,
-          label: fixture.resources.assignmentGroup.label,
-          disposition: 'VERIFIED_EXISTING',
-        },
+        fixtureAssignmentInventoryResource(fixture),
         {
           kind: 'SERVICE',
           id: fixture.resources.service.id,
@@ -2026,12 +2085,7 @@ export class NvsCore {
         ...(creationOutcome ? { creationOutcome } : {}),
         resources: [
           { kind: 'TENANT', id: fixture.tenantId, disposition: 'VERIFIED_EXISTING' },
-          {
-            kind: 'ASSIGNMENT_GROUP',
-            id: fixture.resources.assignmentGroup.id,
-            label: fixture.resources.assignmentGroup.label,
-            disposition: 'VERIFIED_EXISTING',
-          },
+          fixtureAssignmentInventoryResource(fixture),
           {
             kind: 'SERVICE',
             id: fixture.resources.service.id,
@@ -2186,15 +2240,20 @@ export class NvsCore {
         sessions.tenantAdmin,
         `${input.runId}_fixture`,
       );
+      const assignmentBinding = fixtureAssignmentBinding(fixture);
       const verifiedResources = await Promise.all([
-        live.incidentAdapter.verifyResource({
-          environment,
-          session: sessions.tenantAdmin,
-          tenantId: fixture.tenantId,
-          kind: 'ASSIGNMENT_GROUP',
-          id: fixture.resources.assignmentGroup.id,
-          correlationId: this.liveCorrelation(`${input.runId}_fixture_group`),
-        }),
+        ...(assignmentBinding.mode === 'CANONICAL_ID'
+          ? [
+              live.incidentAdapter.verifyResource({
+                environment,
+                session: sessions.tenantAdmin,
+                tenantId: fixture.tenantId,
+                kind: 'ASSIGNMENT_GROUP' as const,
+                id: assignmentBinding.assignmentGroupId,
+                correlationId: this.liveCorrelation(`${input.runId}_fixture_group`),
+              }),
+            ]
+          : []),
         live.incidentAdapter.verifyResource({
           environment,
           session: sessions.tenantAdmin,
@@ -2263,6 +2322,7 @@ export class NvsCore {
             switch (step.action) {
               case 'incident.report': {
                 const marker = incidentCreateMarker(input.runId, fixture.runNamespacePrefix);
+                const assignmentBinding = fixtureAssignmentBinding(fixture);
                 try {
                   incident = await live.incidentAdapter.createIncident({
                     environment,
@@ -2272,7 +2332,7 @@ export class NvsCore {
                     runId: input.runId,
                     runNamespacePrefix: fixture.runNamespacePrefix,
                     requesterUserId: sessions!.requester.userId,
-                    assignmentGroupId: fixture.resources.assignmentGroup.id,
+                    ...fixtureAssignmentInput(assignmentBinding),
                     serviceId: fixture.resources.service.id,
                     ...(fixture.resources.offering
                       ? { offeringId: fixture.resources.offering.id }
@@ -2375,29 +2435,57 @@ export class NvsCore {
                       'The incident must exist before assignment.',
                     ),
                   );
+                const assignmentBinding = fixtureAssignmentBinding(fixture);
                 incident = await live.incidentAdapter.assignIncident({
                   environment,
                   session: sessions!.serviceDesk,
                   tenantId: fixture.tenantId,
                   incidentId: incident.id,
-                  assignmentGroupId: fixture.resources.assignmentGroup.id,
+                  ...fixtureAssignmentInput(assignmentBinding),
                   correlationId,
                 });
+                const assignmentMatches =
+                  assignmentBinding.mode === 'CANONICAL_ID'
+                    ? incident.assignmentGroupId === assignmentBinding.assignmentGroupId
+                    : incident.assignmentGroup === assignmentBinding.assignmentGroup;
                 requireLiveAssertionWithEvidence(
-                  incident.assignmentGroupId === fixture.resources.assignmentGroup.id,
-                  'INCIDENT_ASSIGNMENT_GROUP_MISMATCH',
-                  'The incident assignment group does not match the configured fixture.',
+                  assignmentMatches,
+                  assignmentBinding.mode === 'CANONICAL_ID'
+                    ? 'INCIDENT_ASSIGNMENT_GROUP_MISMATCH'
+                    : 'INCIDENT_ASSIGNMENT_LABEL_MISMATCH',
+                  assignmentBinding.mode === 'CANONICAL_ID'
+                    ? 'The incident assignment group does not match the configured fixture.'
+                    : 'The incident assignment label does not match the configured fixture.',
                   {
                     ...transportObservation(incident.transport),
                     incidentId: incident.id,
+                    assignmentBindingMode: assignmentBinding.mode,
                     assignmentGroupId: incident.assignmentGroupId ?? null,
-                    expectedAssignmentGroupId: fixture.resources.assignmentGroup.id,
+                    assignmentGroup: incident.assignmentGroup ?? null,
+                    expectedAssignmentGroupId:
+                      assignmentBinding.mode === 'CANONICAL_ID'
+                        ? assignmentBinding.assignmentGroupId
+                        : null,
+                    expectedAssignmentGroup:
+                      assignmentBinding.mode === 'LEGACY_LABEL'
+                        ? assignmentBinding.assignmentGroup
+                        : null,
                   },
                 );
                 return {
                   ...transportObservation(incident.transport),
                   incidentId: incident.id,
+                  assignmentBindingMode: assignmentBinding.mode,
                   assignmentGroupId: incident.assignmentGroupId ?? null,
+                  assignmentGroup: incident.assignmentGroup ?? null,
+                  expectedAssignmentGroupId:
+                    assignmentBinding.mode === 'CANONICAL_ID'
+                      ? assignmentBinding.assignmentGroupId
+                      : null,
+                  expectedAssignmentGroup:
+                    assignmentBinding.mode === 'LEGACY_LABEL'
+                      ? assignmentBinding.assignmentGroup
+                      : null,
                 };
               }
               case 'incident.take_ownership': {

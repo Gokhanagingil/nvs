@@ -17,3 +17,5 @@ fixtures/**/*.override.yaml
 !.env.example
 coverage/
 *.log
+__pycache__/
+*.py[cod]

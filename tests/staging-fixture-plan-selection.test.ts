@@ -60,7 +60,7 @@ assert mode == "CANONICAL_RANK_FALLBACK"
     expect(python.status, python.stderr).toBe(0);
   });
 
-  it('accepts the sole active group but blocks an ambiguous fallback', () => {
+  it('uses a legacy label for zero active groups, accepts the sole active group, and blocks ambiguity', () => {
     const python = runPython(String.raw`
 import importlib.util
 import pathlib
@@ -80,6 +80,11 @@ selected, count, mode = module._choose_assignment_group(sole, "service desk")
 assert selected["name"] == "Routing Team"
 assert count == 2
 assert mode == "SOLE_ACTIVE_FALLBACK"
+
+selected, count, mode = module._choose_assignment_group([], "service desk")
+assert selected == {"mode": "LEGACY_LABEL", "label": "NVS Service Desk"}
+assert count == 0
+assert mode == "LEGACY_LABEL_FALLBACK"
 
 ambiguous = [
     {"id": "33333333-3333-4333-8333-333333333333", "name": "Support Alpha", "isActive": True},

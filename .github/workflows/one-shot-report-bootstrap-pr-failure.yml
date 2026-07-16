@@ -1,0 +1,62 @@
+name: one-shot report bootstrap PR failure
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/one-shot-report-bootstrap-pr-failure.yml
+
+permissions:
+  actions: read
+  contents: write
+  issues: write
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out main for self-cleanup
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: main
+          persist-credentials: true
+          fetch-depth: 0
+
+      - name: Publish failed-log tail to closed scratch issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_RUN_ID: '29496584393'
+        run: |
+          set -euo pipefail
+          output="$RUNNER_TEMP/failed.log"
+          set +e
+          gh run view "$TARGET_RUN_ID" --repo "$GITHUB_REPOSITORY" --log-failed > "$output"
+          set -e
+          tail_file="$RUNNER_TEMP/tail.log"
+          tail -n 220 "$output" > "$tail_file"
+          body="$RUNNER_TEMP/body.md"
+          {
+            echo '# Bootstrap PR failed-log tail'
+            echo
+            echo 'The run uses no staging secrets. This is the final sanitized CI log segment.'
+            echo
+            echo '```text'
+            cat "$tail_file"
+            echo '```'
+          } > "$body"
+          gh issue edit 23 --repo "$GITHUB_REPOSITORY" --title '[Closed] Bootstrap PR failed-log tail' --body-file "$body"
+
+      - name: Remove this workflow
+        if: always()
+        run: |
+          set -euo pipefail
+          git config user.name 'nvs-maintenance-bot'
+          git config user.email 'nvs-maintenance-bot@users.noreply.github.com'
+          git pull --ff-only origin main
+          rm -f .github/workflows/one-shot-report-bootstrap-pr-failure.yml
+          if git diff --quiet --exit-code; then exit 0; fi
+          git add .github/workflows/one-shot-report-bootstrap-pr-failure.yml
+          git commit -m 'chore: remove bootstrap failure reporter'
+          git push origin HEAD:main

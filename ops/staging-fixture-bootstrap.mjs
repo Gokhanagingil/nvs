@@ -357,7 +357,7 @@ function compatibleSnapshot(observed, expected) {
 }
 
 async function discover(context) {
-  const { admin, manager, serviceDesk } = context.sessions;
+  const { admin, serviceDesk } = context.sessions;
   const encoded = encodeURIComponent;
   const [groupsPayload, classesPayload, servicesPayload, offeringsPayload, cisPayload, policiesPayload, writesPayload] =
     await Promise.all([
@@ -742,7 +742,7 @@ async function ensurePublishedPolicy(context, serviceId, current) {
     if (runtimeDefinitionId) {
       return { runtimeDefinitionId: requireUuid('published SLA runtime definition', runtimeDefinitionId), disposition: current.kind === 'MISSING' ? 'CREATED' : 'PUBLISHED' };
     }
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    await new Promise((resolve) => globalThis.setTimeout(resolve, 500));
   }
   throw new BootstrapError('SLA_PUBLISH_NOT_OBSERVED', 'The governed SLA publication was not observable within its deadline.');
 }

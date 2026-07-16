@@ -3,16 +3,18 @@ import { chmod, lstat, mkdir, readFile, readdir, rename, writeFile } from 'node:
 import path from 'node:path';
 
 const CONFIG_DIR = process.env.NVS_CONFIG_DIR || '/app/config';
+const DATA_DIR = process.env.NVS_DATA_DIR || '/var/lib/nvs';
 const OPERATION = (process.env.NVS_BOOTSTRAP_OPERATION || 'plan').trim();
 const EXPECTED_DIGEST = (process.env.NVS_BOOTSTRAP_EXPECTED_DIGEST || '').trim();
 const CONFIRMATION = (process.env.NVS_BOOTSTRAP_CONFIRMATION || '').trim();
 const ENVIRONMENT_ID = (process.env.NVS_BOOTSTRAP_ENVIRONMENT_ID || 'staging-example').trim();
 const REQUEST_TIMEOUT_MS = 10_000;
 const APPLY_CONFIRMATION = 'BOOTSTRAP_M1_02B_FIXTURES';
-const INVENTORY_PATH = '/app/data/bootstrap/staging-fixture-bootstrap.json';
+const PRIVATE_BOOTSTRAP_DIR = path.join(DATA_DIR, 'bootstrap');
+const INVENTORY_PATH = path.join(PRIVATE_BOOTSTRAP_DIR, 'staging-fixture-bootstrap.json');
 const APPROVER_CREDENTIAL_SCHEMA = 'nvs.staging-configuration-approver-credential/v1';
 const APPROVER_CREDENTIAL_PATH = path.join(
-  '/app/data/bootstrap',
+  PRIVATE_BOOTSTRAP_DIR,
   `${ENVIRONMENT_ID}-configuration-approver.json`,
 );
 
@@ -239,7 +241,13 @@ function generateConfigurationApproverPassword() {
 }
 
 async function writePrivateJson(filePath, payload) {
-  if (!filePath.startsWith('/app/data/bootstrap/')) {
+  const relative = path.relative(PRIVATE_BOOTSTRAP_DIR, filePath);
+  if (
+    !relative ||
+    relative === '..' ||
+    relative.startsWith(`..${path.sep}`) ||
+    path.isAbsolute(relative)
+  ) {
     throw new BootstrapError(
       'PRIVATE_STORAGE_PATH_INVALID',
       'Bootstrap private state must remain inside the dedicated data directory.',
@@ -1362,6 +1370,12 @@ async function applyPlan(context, plan) {
 }
 
 async function loadContext() {
+  if (!path.isAbsolute(DATA_DIR)) {
+    throw new BootstrapError(
+      'PRIVATE_STORAGE_PATH_INVALID',
+      'The configured NVS data directory must be an absolute path.',
+    );
+  }
   if (!['plan', 'apply'].includes(OPERATION)) {
     throw new BootstrapError(
       'BOOTSTRAP_OPERATION_INVALID',

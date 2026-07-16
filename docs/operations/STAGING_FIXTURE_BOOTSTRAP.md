@@ -19,7 +19,7 @@ The bootstrap owns only these exact natural keys:
 
 The Service Desk synthetic actor is added to the dedicated assignment group. The governed SLA policy is requested and published by the tenant-admin actor, while a distinct deterministic NVS configuration-approver tenant admin performs the required four-eyes approval. Its condition is limited to the deterministic Payment API service.
 
-The configuration-approver credential is generated inside staging, never returned to the GitHub runner, and stored only as a mode-`0600` server-owned document under `/app/data/bootstrap`. It is not an ordinary Incident actor profile and is not exposed in application evidence or public workflow output.
+The configuration-approver credential is generated inside staging, never returned to the GitHub runner, and stored only as a mode-`0600` server-owned document under the configured NVS data directory (`/var/lib/nvs/bootstrap` in staging). It is not an ordinary Incident actor profile and is not exposed in application evidence or public workflow output.
 
 The bootstrap does not create ITSM choice rows. It accepts the built-in `pending_external_dependency` reason, accepts `affected_by` and `service_impacting` only when the corresponding Incident-CI catalogs are truly unconfigured, reuses matching active catalog records when present, and blocks non-empty incompatible catalogs.
 
@@ -50,8 +50,8 @@ Creation uses deterministic exact-name lookups and idempotency keys. Existing co
 The private resource inventory and configuration-approver credential are stored inside the NVS data mount at:
 
 ```text
-/app/data/bootstrap/staging-fixture-bootstrap.json
-/app/data/bootstrap/<environment>-configuration-approver.json
+/var/lib/nvs/bootstrap/staging-fixture-bootstrap.json
+/var/lib/nvs/bootstrap/<environment>-configuration-approver.json
 ```
 
 Both documents are mode `0600`; the credential document is excluded from public summaries and artifacts.

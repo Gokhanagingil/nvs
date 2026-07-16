@@ -82,7 +82,9 @@ describe('staging fixture bootstrap assets', () => {
     expect(source).toContain('BOOTSTRAP_DIGEST_MISMATCH');
     expect(source).toContain('INVENTORY_PATH');
     expect(source).toContain('mode: 0o600');
-    expect(source).toContain("filePath.startsWith('/app/data/bootstrap/')");
+    expect(source).toContain("process.env.NVS_DATA_DIR || '/var/lib/nvs'");
+    expect(source).toContain('path.relative(PRIVATE_BOOTSTRAP_DIR, filePath)');
+    expect(source).not.toContain("const INVENTORY_PATH = '/app/data/bootstrap");
     expect(source).not.toMatch(/console\.(log|error)\([^)]*password/);
     expect(source).not.toContain("method: 'DELETE'");
     expect(source).not.toContain("'DELETE',");

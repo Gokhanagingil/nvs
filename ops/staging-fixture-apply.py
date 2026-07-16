@@ -6,7 +6,6 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import subprocess
 import tempfile
 import urllib.error
@@ -16,15 +15,14 @@ from pathlib import Path
 from typing import Any
 
 SAFE_ID = re.compile(r"^[a-z0-9][a-z0-9._-]{0,95}$")
-FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 DIGEST = re.compile(r"^[0-9a-f]{64}$")
+FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 UUID = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
     re.IGNORECASE,
 )
 DEPLOY_ROOT = Path("/opt/nvs")
 CONFIG_ROOT = DEPLOY_ROOT / "config"
-RELEASE_ROOT = DEPLOY_ROOT / "releases"
 RUNTIME_GID = 10001
 
 
@@ -32,7 +30,12 @@ class ApplyError(RuntimeError):
     """A sanitized fixture-application failure."""
 
 
-def _run(command: list[str], *, env: dict[str, str] | None = None, timeout: int = 180) -> str:
+def _run(
+    command: list[str],
+    *,
+    env: dict[str, str] | None = None,
+    timeout: int = 180,
+) -> str:
     try:
         completed = subprocess.run(
             command,
@@ -46,7 +49,7 @@ def _run(command: list[str], *, env: dict[str, str] | None = None, timeout: int 
     except (FileNotFoundError, subprocess.TimeoutExpired) as error:
         raise ApplyError(f"required local command failed to start: {command[0]}") from error
     if completed.returncode != 0:
-        raise ApplyError(f"local command failed safely: {command[0]} {command[1] if len(command) > 1 else ''}".strip())
+        raise ApplyError(f"local command failed safely: {command[0]}")
     return completed.stdout.strip()
 
 
@@ -200,7 +203,7 @@ def _render_fixture(proposal: dict[str, Any]) -> str:
             "  onFail: RETAIN_FOR_DIAGNOSIS",
             "  onBlockedBeforeClose: DELETE_IF_RUN_OWNED",
             "provenance:",
-            "  source: Server-owned proposal produced by the reviewed staging operator.",
+            "  source: Server-owned proposal produced by the reviewed staging fixture workflow.",
             "  grcCommit: 33af470e10fa753b79e092d9a99ef4f570854b10",
             f"  reviewedAt: {_yaml_string(reviewed_at)}",
             "",
@@ -232,21 +235,19 @@ def _load_proposal(path: Path, expected_digest: str, environment_id: str) -> dic
         generated = datetime.fromisoformat(generated_at)
     except (TypeError, ValueError) as error:
         raise ApplyError("proposal generation timestamp is invalid.") from error
-    if generated.tzinfo is None or datetime.now(timezone.utc) - generated > timedelta(hours=24):
+    now = datetime.now(timezone.utc)
+    if generated.tzinfo is None or generated > now + timedelta(minutes=5):
+        raise ApplyError("proposal generation timestamp is outside the accepted clock window.")
+    if now - generated > timedelta(hours=24):
         raise ApplyError("proposal is older than the 24-hour application window.")
     return proposal
 
 
-def _atomic_replace(path: Path, content: str, *, backup_suffix: str) -> Path | None:
+def _atomic_replace(path: Path, content: str) -> None:
     if path.is_symlink():
         raise ApplyError(f"refusing to replace symbolic link {path}.")
     path.parent.mkdir(parents=True, exist_ok=True)
-    backup: Path | None = None
     existing_stat = path.stat() if path.exists() else None
-    if path.exists():
-        backup = RELEASE_ROOT / f"{path.name}.{backup_suffix}.bak"
-        shutil.copy2(path, backup)
-        os.chmod(backup, 0o600)
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
     )
@@ -268,17 +269,51 @@ def _atomic_replace(path: Path, content: str, *, backup_suffix: str) -> Path | N
             temporary.unlink()
         except FileNotFoundError:
             pass
-    return backup
 
 
-def _normalize_config_file(path: Path, image_ref: str) -> None:
-    os.chmod(path, 0o640)
-    try:
-        os.chown(path, path.stat().st_uid, RUNTIME_GID)
-        return
-    except PermissionError:
-        pass
+def _runtime_metadata() -> tuple[str, str, str, str]:
+    image_ref = _run(["docker", "inspect", "--format", "{{.Config.Image}}", "nvs"])
+    image_id = _run(["docker", "inspect", "--format", "{{.Image}}", "nvs"])
+    build_sha = _run(
+        [
+            "docker",
+            "image",
+            "inspect",
+            "--format",
+            "{{ index .Config.Labels \"org.opencontainers.image.revision\" }}",
+            image_id,
+        ]
+    )
+    build_timestamp = _run(
+        [
+            "docker",
+            "image",
+            "inspect",
+            "--format",
+            "{{ index .Config.Labels \"org.opencontainers.image.created\" }}",
+            image_id,
+        ]
+    )
+    release_version = _run(
+        [
+            "docker",
+            "image",
+            "inspect",
+            "--format",
+            "{{ index .Config.Labels \"org.opencontainers.image.version\" }}",
+            image_id,
+        ]
+    )
+    if not FULL_SHA.fullmatch(build_sha):
+        raise ApplyError("running NVS image does not expose a valid build SHA.")
+    return image_ref, build_sha, build_timestamp, release_version
+
+
+def _normalize_config(image_ref: str, paths: list[Path]) -> None:
     deploy_uid = os.getuid()
+    relative_files = " ".join(f"'/config/{path.relative_to(CONFIG_ROOT)}'" for path in paths)
+    relative_dirs = sorted({path.parent.relative_to(CONFIG_ROOT) for path in paths})
+    directory_args = " ".join(f"'/config/{directory}'" for directory in relative_dirs)
     _run(
         [
             "docker",
@@ -292,26 +327,12 @@ def _normalize_config_file(path: Path, image_ref: str) -> None:
             f"{CONFIG_ROOT}:/config:rw",
             image_ref,
             "-c",
-            f"chown {deploy_uid}:{RUNTIME_GID} '/config/{path.relative_to(CONFIG_ROOT)}' && chmod 0640 '/config/{path.relative_to(CONFIG_ROOT)}'",
+            (
+                f"chown {deploy_uid}:{RUNTIME_GID} {directory_args} {relative_files} && "
+                f"chmod 0750 {directory_args} && chmod 0640 {relative_files}"
+            ),
         ]
     )
-
-
-def _runtime_metadata() -> tuple[str, str, str, str, str]:
-    image_ref = _run(["docker", "inspect", "--format", "{{.Config.Image}}", "nvs"])
-    image_id = _run(["docker", "inspect", "--format", "{{.Image}}", "nvs"])
-    build_sha = _run(
-        ["docker", "image", "inspect", "--format", "{{ index .Config.Labels \"org.opencontainers.image.revision\" }}", image_id]
-    )
-    build_timestamp = _run(
-        ["docker", "image", "inspect", "--format", "{{ index .Config.Labels \"org.opencontainers.image.created\" }}", image_id]
-    )
-    release_version = _run(
-        ["docker", "image", "inspect", "--format", "{{ index .Config.Labels \"org.opencontainers.image.version\" }}", image_id]
-    )
-    if not FULL_SHA.fullmatch(build_sha):
-        raise ApplyError("running NVS image does not expose a valid build SHA.")
-    return image_ref, image_id, build_sha, build_timestamp, release_version
 
 
 def _recreate(image_ref: str, build_sha: str, build_timestamp: str, release_version: str) -> None:
@@ -345,17 +366,9 @@ def _recreate(image_ref: str, build_sha: str, build_timestamp: str, release_vers
     )
 
 
-def _restore(path: Path, backup: Path | None) -> None:
-    if backup and backup.exists():
-        shutil.copy2(backup, path)
-    else:
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            pass
-
-
 def _run_apply(args: argparse.Namespace) -> int:
+    if os.environ.get("NVS_FIXTURE_APPLY_GUARDED") != "1":
+        raise ApplyError("direct fixture application is forbidden; use the reviewed guard workflow.")
     if not SAFE_ID.fullmatch(args.environment_id):
         raise ApplyError("environment_id is not a safe NVS identifier.")
     if not DIGEST.fullmatch(args.proposal_digest):
@@ -377,69 +390,54 @@ def _run_apply(args: argparse.Namespace) -> int:
     if not isinstance(environment, dict):
         raise ApplyError("the requested environment is not loaded by NVS.")
 
-    image_ref, _image_id, build_sha, build_timestamp, release_version = _runtime_metadata()
+    image_ref, build_sha, build_timestamp, release_version = _runtime_metadata()
     environment_path = CONFIG_ROOT / "environments" / "staging.yaml"
     fixture_path = CONFIG_ROOT / "fixtures" / "niles-incident" / "staging.yaml"
-    suffix = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    environment_backup: Path | None = None
-    fixture_backup: Path | None = None
 
-    try:
-        environment_backup = _atomic_replace(
-            environment_path, _render_environment(environment), backup_suffix=suffix
-        )
-        fixture_backup = _atomic_replace(
-            fixture_path, _render_fixture(proposal), backup_suffix=suffix
-        )
-        _normalize_config_file(environment_path, image_ref)
-        _normalize_config_file(fixture_path, image_ref)
+    _atomic_replace(environment_path, _render_environment(environment))
+    _atomic_replace(fixture_path, _render_fixture(proposal))
+    _normalize_config(image_ref, [environment_path, fixture_path])
 
-        validation_environment = dict(os.environ)
-        validation_environment["NVS_VALIDATE_IMAGE"] = image_ref
-        _run(
-            [
-                str(DEPLOY_ROOT / "ops" / "validate-staging-config.sh"),
-                str(CONFIG_ROOT),
-                str(DEPLOY_ROOT / "data"),
-            ],
-            env=validation_environment,
-            timeout=120,
-        )
-        _recreate(image_ref, build_sha, build_timestamp, release_version)
-    except Exception:
-        _restore(environment_path, environment_backup)
-        _restore(fixture_path, fixture_backup)
-        if environment_path.exists():
-            _normalize_config_file(environment_path, image_ref)
-        if fixture_path.exists():
-            _normalize_config_file(fixture_path, image_ref)
-        try:
-            _recreate(image_ref, build_sha, build_timestamp, release_version)
-        except Exception:
-            pass
-        raise
+    validation_environment = dict(os.environ)
+    validation_environment["NVS_VALIDATE_IMAGE"] = image_ref
+    _run(
+        [
+            str(DEPLOY_ROOT / "ops" / "validate-staging-config.sh"),
+            str(CONFIG_ROOT),
+            str(DEPLOY_ROOT / "data"),
+        ],
+        env=validation_environment,
+        timeout=120,
+    )
+    _recreate(image_ref, build_sha, build_timestamp, release_version)
 
     readiness = _json_request(
         "/api/environments/"
         + args.environment_id
         + "/execution-readiness?scenarioId=payment-api-service-degradation&journey=normal"
     )
-    blocked = [
-        check
-        for check in readiness.get("checks", [])
-        if isinstance(check, dict) and check.get("status") == "BLOCKED"
-    ] if isinstance(readiness, dict) else []
+    blocked = (
+        [
+            check
+            for check in readiness.get("checks", [])
+            if isinstance(check, dict) and check.get("status") == "BLOCKED"
+        ]
+        if isinstance(readiness, dict)
+        else []
+    )
 
     print("# NVS staging fixture application")
     print()
-    print("The reviewed server-side proposal was applied and NVS was reloaded with mutation still disabled.")
+    print("The reviewed proposal was applied and NVS was reloaded with mutation still disabled.")
     print()
     print(f"- Environment: `{args.environment_id}`")
     print(f"- Proposal digest: `{args.proposal_digest}`")
     print(f"- Running build SHA: `{build_sha}`")
-    print(f"- Local config validation: `PASS`")
-    print(f"- NVS reload verification: `PASS`")
-    print(f"- Static readiness verdict: `{readiness.get('verdict') if isinstance(readiness, dict) else 'UNKNOWN'}`")
+    print("- Local config validation: `PASS`")
+    print("- NVS reload verification: `PASS`")
+    print(
+        f"- Static readiness verdict: `{readiness.get('verdict') if isinstance(readiness, dict) else 'UNKNOWN'}`"
+    )
     print(f"- Remaining blocked gates: `{len(blocked)}`")
     for check in blocked:
         print(f"  - `{check.get('id')}`: `{check.get('code') or 'NO_CODE'}`")
@@ -474,7 +472,7 @@ def main() -> int:
         print()
         print("**Result:** FAIL")
         print()
-        print("An unexpected local application error occurred; NVS configuration rollback was attempted.")
+        print("An unexpected local application error occurred; outer rollback is required.")
         return 1
 
 

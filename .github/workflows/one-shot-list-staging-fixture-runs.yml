@@ -1,0 +1,79 @@
+name: one-shot list staging fixture runs
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/one-shot-list-staging-fixture-runs.yml
+
+permissions:
+  actions: read
+  contents: write
+  issues: write
+
+jobs:
+  inspect:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Publish sanitized recent run inventory
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          repo="$GITHUB_REPOSITORY"
+          workflow='staging-fixture-bootstrap.yml'
+          runs="$RUNNER_TEMP/runs.json"
+          body="$RUNNER_TEMP/recent-fixture-runs.md"
+          gh api "repos/$repo/actions/workflows/$workflow/runs?event=workflow_dispatch&per_page=15" > "$runs"
+          {
+            echo '# Sanitized recent staging fixture runs'
+            echo
+            jq -r '.workflow_runs[] | "- Run `\(.id)` — created `\(.created_at)` — status `\(.status)` — conclusion `\(.conclusion // "pending")` — attempt `\(.run_attempt)`"' "$runs"
+            echo
+            echo '## Sanitized artifacts'
+            echo
+          } > "$body"
+
+          mapfile -t ids < <(jq -r '.workflow_runs[].id' "$runs")
+          for run_id in "${ids[@]}"; do
+            attempt="$(jq -r --argjson id "$run_id" '.workflow_runs[] | select(.id == $id) | .run_attempt' "$runs")"
+            dir="$RUNNER_TEMP/run-$run_id"
+            mkdir -p "$dir"
+            artifact="nvs-staging-fixture-bootstrap-${run_id}-${attempt}"
+            if gh run download "$run_id" --repo "$repo" --name "$artifact" --dir "$dir" >/dev/null 2>&1 && [[ -f "$dir/nvs-staging-fixture-bootstrap.md" ]]; then
+              echo "### Run \`$run_id\`" >> "$body"
+              echo >> "$body"
+              cat "$dir/nvs-staging-fixture-bootstrap.md" >> "$body"
+              echo >> "$body"
+            fi
+          done
+          {
+            echo '- NILES mutation switch: not modified'
+            echo '- Live Incident acceptance: not executed'
+          } >> "$body"
+          gh issue edit 23 --repo "$repo" --title '[Blocked] Recent staging fixture runs inspected' --body-file "$body"
+
+  cleanup:
+    needs: inspect
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: main
+          persist-credentials: true
+          fetch-depth: 0
+      - run: |
+          set -euo pipefail
+          git config user.name 'nvs-maintenance-bot'
+          git config user.email 'nvs-maintenance-bot@users.noreply.github.com'
+          git pull --ff-only origin main
+          rm -f .github/workflows/one-shot-list-staging-fixture-runs.yml
+          if git diff --quiet --exit-code; then exit 0; fi
+          git add .github/workflows/one-shot-list-staging-fixture-runs.yml
+          git commit -m 'chore: remove recent staging fixture run inspector'
+          git push origin HEAD:main

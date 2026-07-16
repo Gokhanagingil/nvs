@@ -1,11 +1,12 @@
+import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
 import { describe, expect, it } from 'vitest';
 
 const root = process.cwd();
 const workflowPath = path.join(root, '.github', 'workflows', 'staging-operator.yml');
 const hostOperatorPath = path.join(root, 'ops', 'staging-operator.py');
+const discoveryStorePath = path.join(root, 'ops', 'staging-discovery-store.py');
 const containerDiscoveryPath = path.join(root, 'ops', 'staging-fixture-discovery.mjs');
 
 describe('browser-triggered staging operator assets', () => {
@@ -18,22 +19,27 @@ describe('browser-triggered staging operator assets', () => {
     expect(workflow).toContain('environment: staging');
     expect(workflow).toContain('- verify');
     expect(workflow).toContain('- discover');
+    expect(workflow).toContain('ops/staging-discovery-store.py');
+    expect(workflow).toContain('/opt/nvs/releases/nvs-fixture-discovery-latest.json');
+    expect(workflow).not.toContain("staging-operator.py' discover");
     expect(workflow).not.toContain('pull_request:');
     expect(workflow).not.toContain('NVS_ENABLE_NILES_MUTATIONS=true');
     expect(workflow).not.toContain('set -x');
   });
 
   it('parses the Python and Node operator scripts without generating artifacts', () => {
-    const python = spawnSync(
-      'python3',
-      [
-        '-c',
-        'import ast,pathlib,sys; ast.parse(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))',
-        hostOperatorPath,
-      ],
-      { encoding: 'utf8' },
-    );
-    expect(python.status, python.stderr).toBe(0);
+    for (const pythonPath of [hostOperatorPath, discoveryStorePath]) {
+      const python = spawnSync(
+        'python3',
+        [
+          '-c',
+          'import ast,pathlib,sys; ast.parse(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))',
+          pythonPath,
+        ],
+        { encoding: 'utf8' },
+      );
+      expect(python.status, python.stderr).toBe(0);
+    }
 
     const node = spawnSync(process.execPath, ['--check', containerDiscoveryPath], {
       encoding: 'utf8',
@@ -42,12 +48,16 @@ describe('browser-triggered staging operator assets', () => {
   });
 
   it('never serializes credentials or bearer material into discovery output', () => {
+    const workflow = readFileSync(workflowPath, 'utf8');
     const hostOperator = readFileSync(hostOperatorPath, 'utf8');
+    const discoveryStore = readFileSync(discoveryStorePath, 'utf8');
     const discovery = readFileSync(containerDiscoveryPath, 'utf8');
 
     expect(discovery).toContain("schemaVersion: 'nvs.staging-fixture-discovery/v1'");
     expect(discovery).toContain('authorization: `Bearer ${accessToken}`');
     expect(discovery).not.toMatch(/console\.(log|error)\([^)]*(accessToken|password|credential)/);
+    expect(discoveryStore).toContain('was not written to public GitHub logs');
+    expect(workflow).toContain('staging-discovery-store.py');
     expect(hostOperator).not.toContain('/opt/nvs/.env');
     expect(hostOperator).not.toContain('Authorization');
   });

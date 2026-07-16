@@ -1,0 +1,1 @@
+merge-trigger configuration approver patch v7

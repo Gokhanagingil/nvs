@@ -1,0 +1,142 @@
+$ corepack pnpm format:check && corepack pnpm lint && corepack pnpm typecheck && corepack pnpm test && corepack pnpm build && corepack pnpm test:e2e
+$ prettier --check "apps/**/*.{ts,tsx,css,json,html}" "packages/**/*.{ts,tsx,json}" "scripts/**/*.{ts,tsx}" "tests/**/*.{ts,tsx}" "e2e/**/*.{ts,tsx}" ".github/**/*.yml" "actors/**/*.yaml" "environments/**/*.yaml" "fixtures/**/*.yaml" "scenarios/**/*.yaml" "*.{ts,json,js,yaml,yml}"
+Checking formatting...
+All matched files use Prettier code style!
+$ eslint .
+$ corepack pnpm -r --if-present typecheck && tsc --noEmit
+Scope: 8 of 9 workspace projects
+apps/web typecheck$ tsc --noEmit
+apps/web typecheck: Done
+$ vitest run
+
+[1m[30m[46m RUN [49m[39m[22m [36mv4.1.10 [39m[90m/home/runner/work/nvs/nvs[39m
+
+ [32m✓[39m tests/storage.test.ts [2m([22m[2m15 tests[22m[2m)[22m[33m 440[2mms[22m[39m
+ [32m✓[39m tests/api.test.ts [2m([22m[2m8 tests[22m[2m)[22m[33m 720[2mms[22m[39m
+     [33m[2m✓[22m[39m serves the critical compile-only foundation endpoints [33m 420[2mms[22m[39m
+ [32m✓[39m tests/niles-incident-adapter.test.ts [2m([22m[2m18 tests[22m[2m)[22m[32m 55[2mms[22m[39m
+ [32m✓[39m tests/auth-preflight.test.ts [2m([22m[2m4 tests[22m[2m)[22m[32m 24[2mms[22m[39m
+ [32m✓[39m tests/authentication-adapter.test.ts [2m([22m[2m12 tests[22m[2m)[22m[32m 28[2mms[22m[39m
+ [32m✓[39m tests/adapter-niles.test.ts [2m([22m[2m10 tests[22m[2m)[22m[32m 27[2mms[22m[39m
+ [32m✓[39m tests/deployment-assets.test.ts [2m([22m[2m3 tests[22m[2m)[22m[32m 17[2mms[22m[39m
+ [32m✓[39m tests/contracts.test.ts [2m([22m[2m26 tests[22m[2m)[22m[32m 257[2mms[22m[39m
+ [32m✓[39m tests/domain.test.ts [2m([22m[2m13 tests[22m[2m)[22m[32m 100[2mms[22m[39m
+ [32m✓[39m tests/readiness.test.ts [2m([22m[2m6 tests[22m[2m)[22m[32m 270[2mms[22m[39m
+ [32m✓[39m tests/secret-provider.test.ts [2m([22m[2m3 tests[22m[2m)[22m[32m 9[2mms[22m[39m
+ [32m✓[39m tests/live-incident.test.ts [2m([22m[2m35 tests[22m[2m)[22m[33m 2804[2mms[22m[39m
+
+[2m Test Files [22m [1m[32m12 passed[39m[22m[90m (12)[39m
+[2m      Tests [22m [1m[32m153 passed[39m[22m[90m (153)[39m
+[2m   Start at [22m 05:57:13
+[2m   Duration [22m 3.36s[2m (transform 567ms, setup 0ms, import 2.69s, tests 4.75s, environment 2ms)[22m
+
+$ corepack pnpm -r --if-present build
+Scope: 8 of 9 workspace projects
+apps/web build$ vite build
+apps/web build: [36mvite v8.1.4 [32mbuilding client environment for production...[36m[39m
+apps/web build: [2K
+apps/web build: transforming...✓ 26 modules transformed.
+apps/web build: rendering chunks...
+apps/web build: computing gzip size...
+apps/web build: dist/index.html                   0.49 kB │ gzip:  0.30 kB
+apps/web build: dist/assets/index-drC6CXFN.css   18.67 kB │ gzip:  4.94 kB
+apps/web build: dist/assets/index-CTupz8BZ.js   279.22 kB │ gzip: 84.23 kB
+apps/web build: [32m✓ built in 155ms[39m
+apps/web build: Done
+apps/api build$ tsup --config tsup.config.ts
+apps/api build: [34mCLI[39m Building entry: src/cli.ts, src/server.ts
+apps/api build: [34mCLI[39m Using tsconfig: ../../tsconfig.json
+apps/api build: [34mCLI[39m tsup v8.5.1
+apps/api build: [34mCLI[39m Using tsup config: /home/runner/work/nvs/nvs/apps/api/tsup.config.ts
+apps/api build: [34mCLI[39m Target: node24
+apps/api build: [34mCLI[39m Cleaning output folder
+apps/api build: [34mESM[39m Build start
+apps/api build: [32mESM[39m [1mdist/cli.js            [22m[32m2.24 KB[39m
+apps/api build: [32mESM[39m [1mdist/server.js         [22m[32m953.00 B[39m
+apps/api build: [32mESM[39m [1mdist/chunk-53DWLNKH.js [22m[32m212.40 KB[39m
+apps/api build: [32mESM[39m ⚡️ Build success in 29ms
+apps/api build: Done
+$ playwright test --project=chromium
+
+[WebServer] $ vite
+
+Running 3 tests using 1 worker
+
+[1/3] [chromium] › e2e/walking-skeleton.spec.ts:3:1 › reviews the payment narrative and inspects compile-only evidence
+  1) [chromium] › e2e/walking-skeleton.spec.ts:3:1 › reviews the payment narrative and inspects compile-only evidence 
+
+    Error: browserType.launch: Executable doesn't exist at /home/runner/.cache/ms-playwright/chromium_headless_shell-1228/chrome-headless-shell-linux64/chrome-headless-shell
+    ╔════════════════════════════════════════════════════════════╗
+    ║ Looks like Playwright was just installed or updated.       ║
+    ║ Please run the following command to download new browsers: ║
+    ║                                                            ║
+    ║     pnpm exec playwright install                           ║
+    ║                                                            ║
+    ║ <3 Playwright Team                                         ║
+    ╚════════════════════════════════════════════════════════════╝
+
+    Error Context: artifacts/playwright/walking-skeleton-reviews-t-990a8-pects-compile-only-evidence-chromium/error-context.md
+
+    attachment #2: trace (application/zip) ─────────────────────────────────────────────────────────
+    artifacts/playwright/walking-skeleton-reviews-t-990a8-pects-compile-only-evidence-chromium/trace.zip
+    Usage:
+
+        pnpm exec playwright show-trace artifacts/playwright/walking-skeleton-reviews-t-990a8-pects-compile-only-evidence-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+
+[2/3] [chromium] › e2e/walking-skeleton.spec.ts:43:1 › runs safe multi-actor authentication preflight and denies production
+  2) [chromium] › e2e/walking-skeleton.spec.ts:43:1 › runs safe multi-actor authentication preflight and denies production 
+
+    Error: browserType.launch: Executable doesn't exist at /home/runner/.cache/ms-playwright/chromium_headless_shell-1228/chrome-headless-shell-linux64/chrome-headless-shell
+    ╔════════════════════════════════════════════════════════════╗
+    ║ Looks like Playwright was just installed or updated.       ║
+    ║ Please run the following command to download new browsers: ║
+    ║                                                            ║
+    ║     pnpm exec playwright install                           ║
+    ║                                                            ║
+    ║ <3 Playwright Team                                         ║
+    ╚════════════════════════════════════════════════════════════╝
+
+    Error Context: artifacts/playwright/walking-skeleton-runs-safe-18af2-light-and-denies-production-chromium/error-context.md
+
+    attachment #2: trace (application/zip) ─────────────────────────────────────────────────────────
+    artifacts/playwright/walking-skeleton-runs-safe-18af2-light-and-denies-production-chromium/trace.zip
+    Usage:
+
+        pnpm exec playwright show-trace artifacts/playwright/walking-skeleton-runs-safe-18af2-light-and-denies-production-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+
+[3/3] [chromium] › e2e/walking-skeleton.spec.ts:84:1 › shows live run polling progress with retained run inventory
+  3) [chromium] › e2e/walking-skeleton.spec.ts:84:1 › shows live run polling progress with retained run inventory 
+
+    Error: browserType.launch: Executable doesn't exist at /home/runner/.cache/ms-playwright/chromium_headless_shell-1228/chrome-headless-shell-linux64/chrome-headless-shell
+    ╔════════════════════════════════════════════════════════════╗
+    ║ Looks like Playwright was just installed or updated.       ║
+    ║ Please run the following command to download new browsers: ║
+    ║                                                            ║
+    ║     pnpm exec playwright install                           ║
+    ║                                                            ║
+    ║ <3 Playwright Team                                         ║
+    ╚════════════════════════════════════════════════════════════╝
+
+    Error Context: artifacts/playwright/walking-skeleton-shows-liv-19479-with-retained-run-inventory-chromium/error-context.md
+
+    attachment #2: trace (application/zip) ─────────────────────────────────────────────────────────
+    artifacts/playwright/walking-skeleton-shows-liv-19479-with-retained-run-inventory-chromium/trace.zip
+    Usage:
+
+        pnpm exec playwright show-trace artifacts/playwright/walking-skeleton-shows-liv-19479-with-retained-run-inventory-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+
+  3 failed
+    [chromium] › e2e/walking-skeleton.spec.ts:3:1 › reviews the payment narrative and inspects compile-only evidence 
+    [chromium] › e2e/walking-skeleton.spec.ts:43:1 › runs safe multi-actor authentication preflight and denies production 
+    [chromium] › e2e/walking-skeleton.spec.ts:84:1 › shows live run polling progress with retained run inventory 
+[ELIFECYCLE] Command failed with exit code 1.
+[ELIFECYCLE] Command failed with exit code 1.

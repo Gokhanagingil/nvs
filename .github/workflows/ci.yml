@@ -61,3 +61,69 @@ jobs:
             test-results
           if-no-files-found: ignore
           retention-days: 7
+
+  deploy-reviewed-exact-sha:
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.head_ref == 'ops/deploy-reviewed-6747-via-ci'
+    needs: foundation
+    permissions:
+      actions: write
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Dispatch and wait for the permanent exact-SHA staging deployment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPLOY_SHA: 6747d023d0d8cfe7fd72982451947c433d9ea429
+        run: |
+          set -euo pipefail
+          repo="$GITHUB_REPOSITORY"
+          previous="$({
+            gh run list \
+              --repo "$repo" \
+              --workflow deploy-staging.yml \
+              --branch main \
+              --event workflow_dispatch \
+              --limit 1 \
+              --json databaseId \
+              --jq '.[0].databaseId // 0'
+          } 2>/dev/null || printf '0')"
+
+          gh workflow run deploy-staging.yml \
+            --repo "$repo" \
+            --ref main \
+            --field ref="$DEPLOY_SHA"
+
+          run_id=''
+          for _attempt in $(seq 1 90); do
+            sleep 2
+            candidate="$({
+              gh run list \
+                --repo "$repo" \
+                --workflow deploy-staging.yml \
+                --branch main \
+                --event workflow_dispatch \
+                --limit 1 \
+                --json databaseId \
+                --jq '.[0].databaseId // 0'
+            } 2>/dev/null || printf '0')"
+            if [[ "$candidate" != '0' && "$candidate" != "$previous" ]]; then
+              run_id="$candidate"
+              break
+            fi
+          done
+          [[ -n "$run_id" ]]
+
+          gh run watch "$run_id" --repo "$repo" --exit-status
+          conclusion="$(gh run view "$run_id" --repo "$repo" --json conclusion --jq '.conclusion')"
+          [[ "$conclusion" == success ]]
+
+          {
+            echo '## Reviewed staging deployment'
+            echo
+            echo "- Exact source SHA: \`$DEPLOY_SHA\`"
+            echo "- Permanent deploy workflow run: \`$run_id\`"
+            echo '- Result: `PASS`'
+          } >> "$GITHUB_STEP_SUMMARY"

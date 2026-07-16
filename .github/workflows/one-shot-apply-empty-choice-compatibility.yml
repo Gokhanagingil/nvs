@@ -16,8 +16,7 @@ jobs:
     if: >-
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.event == 'pull_request' &&
-      github.event.workflow_run.head_branch == 'ops/choice-compatibility-ci-trigger' &&
-      github.event.workflow_run.head_repository.full_name == github.repository
+      github.event.workflow_run.head_sha == '350f7dc4bf11f1ba337432e5fd2cda97ee9e5d3b'
     runs-on: ubuntu-latest
     timeout-minutes: 35
     steps:

@@ -45,6 +45,17 @@ jobs:
             set -euo pipefail
             pnpm install --frozen-lockfile
             python3 tools/apply-empty-choice-catalog-compatibility.py
+            python3 - <<'PY'
+            from pathlib import Path
+
+            target = Path('tests/live-incident.test.ts')
+            source = target.read_text(encoding='utf-8')
+            old = "      values: [],\n      configuredCount: 0,"
+            new = "      values: [] as string[],\n      configuredCount: 0,"
+            if source.count(old) != 1:
+                raise SystemExit('expected exactly one generated empty choice-value array')
+            target.write_text(source.replace(old, new, 1), encoding='utf-8')
+            PY
             pnpm exec prettier --write \
               packages/core/src/index.ts \
               packages/adapter-niles/src/index.ts \

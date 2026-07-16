@@ -35,20 +35,50 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
 
-          path = Path('ops/staging-fixture-plan.py')
-          text = path.read_text(encoding='utf-8')
+          planner = Path('ops/staging-fixture-plan.py')
+          planner_text = planner.read_text(encoding='utf-8')
           marker = 'def _assignment_selection(item: dict[str, Any], mode: str) -> dict[str, Any]:'
-          start = text.find(marker)
+          start = planner_text.find(marker)
           if start < 0:
               raise SystemExit('generated assignment selection helper was not found')
-          end = text.find('\n\ndef _run', start)
+          end = planner_text.find('\n\ndef _run', start)
           if end < 0:
               raise SystemExit('generated assignment selection helper boundary was not found')
-          block = text[start:end]
+          block = planner_text[start:end]
           fixed = block.replace('\\"', '"')
           if fixed == block:
               raise SystemExit('generated assignment selection helper did not contain the reviewed escape defect')
-          path.write_text(text[:start] + fixed + text[end:], encoding='utf-8')
+          planner.write_text(planner_text[:start] + fixed + planner_text[end:], encoding='utf-8')
+
+          core = Path('packages/core/src/index.ts')
+          core_text = core.read_text(encoding='utf-8')
+          old = """                return {
+                  ...transportObservation(incident.transport),
+                  incidentId: incident.id,
+                  assignmentBindingMode: assignmentBinding.mode,
+                  assignmentGroupId: incident.assignmentGroupId ?? null,
+                  assignmentGroup: incident.assignmentGroup ?? null,
+                };
+"""
+          new = """                return {
+                  ...transportObservation(incident.transport),
+                  incidentId: incident.id,
+                  assignmentBindingMode: assignmentBinding.mode,
+                  assignmentGroupId: incident.assignmentGroupId ?? null,
+                  assignmentGroup: incident.assignmentGroup ?? null,
+                  expectedAssignmentGroupId:
+                    assignmentBinding.mode === 'CANONICAL_ID'
+                      ? assignmentBinding.assignmentGroupId
+                      : null,
+                  expectedAssignmentGroup:
+                    assignmentBinding.mode === 'LEGACY_LABEL'
+                      ? assignmentBinding.assignmentGroup
+                      : null,
+                };
+"""
+          if core_text.count(old) != 1:
+              raise SystemExit('generated successful assignment evidence block was not found exactly once')
+          core.write_text(core_text.replace(old, new, 1), encoding='utf-8')
           PY
           pnpm exec prettier --write \
             packages/contracts/src/index.ts \

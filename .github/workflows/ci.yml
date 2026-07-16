@@ -62,67 +62,73 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-  diagnose-reviewed-staging-fixtures:
+  apply-canonical-sla-state-order:
     if: >-
       github.event_name == 'pull_request' &&
       github.head_ref == 'ops/prepare-staging-fixtures-6747-via-ci'
     permissions:
-      actions: read
-      contents: read
+      contents: write
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 25
     steps:
-      - name: Publish only the sanitized failure tail and latest protected workflow result
-        env:
-          GH_TOKEN: ${{ github.token }}
-          FAILED_RUN_ID: 29512209038
+      - name: Check out the clean implementation branch
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: fix/bootstrap-canonical-sla-state-order
+          persist-credentials: true
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa
+        with:
+          version: 11.13.0
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.18.0
+          cache: pnpm
+
+      - name: Apply and verify the canonical snapshot correction
         run: |
           set -Eeuo pipefail
-          repo="$GITHUB_REPOSITORY"
-          raw="$RUNNER_TEMP/failed-run.log"
-          safe="$RUNNER_TEMP/failed-run-safe.log"
-          set +e
-          gh run view "$FAILED_RUN_ID" --repo "$repo" --log-failed > "$raw" 2>&1
-          view_status=$?
-          set -e
-          tail -n 180 "$raw" \
-            | sed -E 's/(authorization:|bearer |password|token)[^ ]*/\1 [redacted]/Ig' \
-            > "$safe"
+          pnpm install --frozen-lockfile
+          python3 - <<'PY'
+          from pathlib import Path
 
-          bootstrap_json="$(gh run list \
-            --repo "$repo" \
-            --workflow staging-fixture-bootstrap.yml \
-            --branch main \
-            --event workflow_dispatch \
-            --limit 3 \
-            --json databaseId,status,conclusion,createdAt,url,headSha)"
-          latest_bootstrap_id="$(printf '%s' "$bootstrap_json" | jq -r '.[0].databaseId // 0')"
-          artifact_dir="$RUNNER_TEMP/latest-bootstrap"
-          mkdir -p "$artifact_dir"
-          if [[ "$latest_bootstrap_id" != 0 ]]; then
-            gh run download "$latest_bootstrap_id" \
-              --repo "$repo" \
-              --name "nvs-staging-fixture-bootstrap-${latest_bootstrap_id}-1" \
-              --dir "$artifact_dir" || true
-          fi
+          bootstrap = Path('ops/staging-fixture-bootstrap.mjs')
+          source = bootstrap.read_text(encoding='utf-8')
+          old = "    stopOnStates: ['resolved', 'closed'],"
+          new = "    stopOnStates: ['closed', 'resolved'],"
+          if source.count(old) != 1:
+              raise SystemExit('expected exactly one non-canonical stopOnStates sequence')
+          bootstrap.write_text(source.replace(old, new, 1), encoding='utf-8')
 
-          {
-            echo '## Sanitized staging preparation diagnostic'
-            echo
-            echo "- Failed outer run: \`$FAILED_RUN_ID\`"
-            echo "- Failed-log fetch status: \`$view_status\`"
-            echo '- Recent bootstrap runs:'
-            echo '```json'
-            printf '%s\n' "$bootstrap_json"
-            echo '```'
-            echo
-            echo '### Sanitized failed tail'
-            echo '```text'
-            cat "$safe"
-            echo '```'
-            if [[ -f "$artifact_dir/nvs-staging-fixture-bootstrap.md" ]]; then
-              echo
-              echo '### Latest sanitized bootstrap artifact'
-              cat "$artifact_dir/nvs-staging-fixture-bootstrap.md"
-            fi
-          } | tee -a "$GITHUB_STEP_SUMMARY"
+          test = Path('tests/staging-fixture-bootstrap-assets.test.ts')
+          test_source = test.read_text(encoding='utf-8')
+          anchor = "    expect(source).toContain(\"operator: 'is', value: serviceId\");\n"
+          replacement = (
+              anchor
+              + "    expect(source).toContain(\"stopOnStates: ['closed', 'resolved']\");\n"
+              + "    expect(source).not.toContain(\"stopOnStates: ['resolved', 'closed']\");\n"
+          )
+          if test_source.count(anchor) != 1:
+              raise SystemExit('expected exactly one bootstrap SLA assertion anchor')
+          test.write_text(test_source.replace(anchor, replacement, 1), encoding='utf-8')
+          PY
+          pnpm exec prettier --write \
+            ops/staging-fixture-bootstrap.mjs \
+            tests/staging-fixture-bootstrap-assets.test.ts
+          node --check ops/staging-fixture-bootstrap.mjs
+          pnpm exec eslint \
+            ops/staging-fixture-bootstrap.mjs \
+            tests/staging-fixture-bootstrap-assets.test.ts
+          pnpm exec vitest run tests/staging-fixture-bootstrap-assets.test.ts
+          git diff --check
+
+      - name: Push only the implementation correction
+        run: |
+          set -Eeuo pipefail
+          git config user.name 'nvs-maintenance-bot'
+          git config user.email 'nvs-maintenance-bot@users.noreply.github.com'
+          git add ops/staging-fixture-bootstrap.mjs tests/staging-fixture-bootstrap-assets.test.ts
+          git commit -m 'fix: canonicalize governed SLA stop-state order'
+          git push origin HEAD:fix/bootstrap-canonical-sla-state-order

@@ -1,151 +1,18 @@
-packages/core/src/index.ts 431ms
-tests/live-incident.test.ts 171ms
+packages/core/src/index.ts 420ms
+tests/live-incident.test.ts 172ms
 $ corepack pnpm format:check && corepack pnpm lint && corepack pnpm typecheck && corepack pnpm test && corepack pnpm build && corepack pnpm test:e2e
 $ prettier --check "apps/**/*.{ts,tsx,css,json,html}" "packages/**/*.{ts,tsx,json}" "scripts/**/*.{ts,tsx}" "tests/**/*.{ts,tsx}" "e2e/**/*.{ts,tsx}" ".github/**/*.yml" "actors/**/*.yaml" "environments/**/*.yaml" "fixtures/**/*.yaml" "scenarios/**/*.yaml" "*.{ts,json,js,yaml,yml}"
 Checking formatting...
-All matched files use Prettier code style!
-$ eslint .
-$ corepack pnpm -r --if-present typecheck && tsc --noEmit
-Scope: 8 of 9 workspace projects
-apps/web typecheck$ tsc --noEmit
-apps/web typecheck: Done
-$ vitest run
-
-[1m[30m[46m RUN [49m[39m[22m [36mv4.1.10 [39m[90m/home/runner/work/nvs/nvs[39m
-
- [32m✓[39m tests/niles-incident-adapter.test.ts [2m([22m[2m19 tests[22m[2m)[22m[32m 49[2mms[22m[39m
- [32m✓[39m tests/storage.test.ts [2m([22m[2m15 tests[22m[2m)[22m[33m 436[2mms[22m[39m
- [32m✓[39m tests/api.test.ts [2m([22m[2m8 tests[22m[2m)[22m[33m 797[2mms[22m[39m
-     [33m[2m✓[22m[39m serves the critical compile-only foundation endpoints [33m 449[2mms[22m[39m
- [32m✓[39m tests/auth-preflight.test.ts [2m([22m[2m4 tests[22m[2m)[22m[32m 21[2mms[22m[39m
- [32m✓[39m tests/authentication-adapter.test.ts [2m([22m[2m12 tests[22m[2m)[22m[32m 20[2mms[22m[39m
- [32m✓[39m tests/adapter-niles.test.ts [2m([22m[2m10 tests[22m[2m)[22m[32m 23[2mms[22m[39m
- [32m✓[39m tests/contracts.test.ts [2m([22m[2m26 tests[22m[2m)[22m[32m 188[2mms[22m[39m
- [32m✓[39m tests/deployment-assets.test.ts [2m([22m[2m3 tests[22m[2m)[22m[32m 18[2mms[22m[39m
- [32m✓[39m tests/domain.test.ts [2m([22m[2m13 tests[22m[2m)[22m[32m 94[2mms[22m[39m
- [32m✓[39m tests/readiness.test.ts [2m([22m[2m6 tests[22m[2m)[22m[32m 235[2mms[22m[39m
- [32m✓[39m tests/secret-provider.test.ts [2m([22m[2m3 tests[22m[2m)[22m[32m 7[2mms[22m[39m
- [31m❯[39m tests/live-incident.test.ts [2m([22m[2m37 tests[22m[2m | [22m[31m5 failed[39m[2m)[22m[33m 27680[2mms[22m[39m
-     [32m✓[39m blocks production readiness before fixture or actor access[32m 11[2mms[22m[39m
-     [32m✓[39m checks live readiness without actor login or fixture resource network calls[32m 5[2mms[22m[39m
-     [32m✓[39m confirms live readiness with read-only actor and fixture checks[32m 4[2mms[22m[39m
-     [32m✓[39m blocks a live run before mutation when a required fixture resource is missing[32m 154[2mms[22m[39m
-     [32m✓[39m blocks a live run before mutation when offering compatibility cannot be verified[32m 54[2mms[22m[39m
-     [32m✓[39m blocks a live run before mutation when required actor authentication fails[32m 46[2mms[22m[39m
-     [32m✓[39m blocks a live run before mutation when a required actor credential is invalid[32m 45[2mms[22m[39m
-     [32m✓[39m blocks mutation-disabled live runs before actor credential resolution or adapter calls[32m 17[2mms[22m[39m
-     [32m✓[39m accepts live runs asynchronously, exposes RUNNING progress, and rejects a concurrent run[32m 151[2mms[22m[39m
-     [32m✓[39m reserves live run IDs against later compile-only runs before execution starts[32m 15[2mms[22m[39m
-     [32m✓[39m releases live run reservations when initial live-state persistence fails before mutation[32m 37[2mms[22m[39m
-     [32m✓[39m allows only one compile/live run with the same ID to reserve the namespace[32m 29[2mms[22m[39m
-     [32m✓[39m accepts only one of two truly simultaneous live run starts[32m 28[2mms[22m[39m
-     [32m✓[39m rejects duplicate live run IDs before actor login or NILES adapter calls[32m 153[2mms[22m[39m
-     [32m✓[39m keeps run-owned incident inventory discoverable after a create-time persistence failure[32m 40[2mms[22m[39m
-     [32m✓[39m keeps a committed create with malformed 201 response recovery-required[32m 53[2mms[22m[39m
-     [32m✓[39m keeps ambiguous incident create outcomes recovery-required without claiming no incident exists[32m 54[2mms[22m[39m
-     [32m✓[39m keeps observations discoverable after an intermediate-step persistence failure[32m 48[2mms[22m[39m
-     [32m✓[39m leaves finalizing in-flight state recovery-required when final bundle commit fails[32m 124[2mms[22m[39m
-     [33m[2m✓[22m[39m polls read-only SLA state until asynchronous hold, resume, and resolve posture is observable [33m 710[2mms[22m[39m
-     [32m✓[39m finalizes a PASS run when optional SLA evidence is not observed[32m 112[2mms[22m[39m
-     [32m✓[39m passes required SLA objectives from a real GRC wrapped array envelope[32m 139[2mms[22m[39m
-[31m     [31m×[31m blocks required SLA when only the response objective is observable[39m[33m 5027[2mms[22m[39m
-     [32m✓[39m records sanitized transport evidence for a failed multi-call step[32m 55[2mms[22m[39m
-     [32m✓[39m preserves HTTP evidence when priority assertion fails after a successful read[32m 38[2mms[22m[39m
-     [32m✓[39m preserves HTTP evidence when assignment assertion fails after a successful write[32m 39[2mms[22m[39m
-     [32m✓[39m preserves POST and GET evidence when affected-CI read-back assertion fails[32m 65[2mms[22m[39m
-[31m     [31m×[31m blocks required SLA when resume read returns no records[39m[33m 5004[2mms[22m[39m
-     [32m✓[39m accepts resumed SLA records with historical paused duration after current pause clears[32m 84[2mms[22m[39m
-[31m     [31m×[31m fails resumed SLA records when current pause posture remains set[39m[33m 5003[2mms[22m[39m
-[31m     [31m×[31m fails required SLA when active records are cancelled instead of running[39m[33m 5002[2mms[22m[39m
-     [32m✓[39m fails required SLA when observed records reference the wrong policy[32m 51[2mms[22m[39m
-[31m     [31m×[31m blocks required SLA when held posture is not observable[39m[33m 5003[2mms[22m[39m
-     [32m✓[39m blocks audit review when journal entries are not observable[32m 63[2mms[22m[39m
-     [32m✓[39m blocks audit attribution when stable public journal fields are unavailable[32m 64[2mms[22m[39m
-     [32m✓[39m preserves HTTP evidence when close state assertion fails after a successful close call[32m 79[2mms[22m[39m
-     [32m✓[39m persists BLOCKED close-authority evidence and verified run-owned cleanup[32m 72[2mms[22m[39m
-
-[31m⎯⎯⎯⎯⎯⎯⎯[39m[1m[41m Failed Tests 5 [49m[22m[31m⎯⎯⎯⎯⎯⎯⎯[39m
-
-[41m[1m FAIL [22m[49m tests/live-incident.test.ts[2m > [22mlive Incident API orchestration[2m > [22mblocks required SLA when only the response objective is observable
-[31m[1mError[22m: Test timed out in 5000ms.
-If this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".[39m
-[36m [2m❯[22m tests/live-incident.test.ts:[2m1477:3[22m[39m
-    [90m1475|[39m   })[33m;[39m
-    [90m1476|[39m
-    [90m1477|[39m   it('blocks required SLA when only the response objective is observab…
-    [90m   |[39m   [31m^[39m
-    [90m1478|[39m     [35mclass[39m [33mResponseOnlySlaAdapter[39m [35mextends[39m [33mStatefulIncidentAdapter[39m {
-    [90m1479|[39m       override [35masync[39m [34mreadSlaSummary[39m() {
-
-[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/5]⎯[22m[39m
-
-[41m[1m FAIL [22m[49m tests/live-incident.test.ts[2m > [22mlive Incident API orchestration[2m > [22mblocks required SLA when resume read returns no records
-[31m[1mError[22m: Test timed out in 5000ms.
-If this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".[39m
-[36m [2m❯[22m tests/live-incident.test.ts:[2m1690:3[22m[39m
-    [90m1688|[39m   })[33m;[39m
-    [90m1689|[39m
-    [90m1690|[39m   it('blocks required SLA when resume read returns no records', async …
-    [90m   |[39m   [31m^[39m
-    [90m1691|[39m     [35mclass[39m [33mEmptyResumeSlaAdapter[39m [35mextends[39m [33mStatefulIncidentAdapter[39m {
-    [90m1692|[39m       [35mprivate[39m resumed [33m=[39m [35mfalse[39m[33m;[39m
-
-[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/5]⎯[22m[39m
-
-[41m[1m FAIL [22m[49m tests/live-incident.test.ts[2m > [22mlive Incident API orchestration[2m > [22mfails resumed SLA records when current pause posture remains set
-[31m[1mError[22m: Test timed out in 5000ms.
-If this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".[39m
-[36m [2m❯[22m tests/live-incident.test.ts:[2m1814:3[22m[39m
-    [90m1812|[39m   })[33m;[39m
-    [90m1813|[39m
-    [90m1814|[39m   it('fails resumed SLA records when current pause posture remains set…
-    [90m   |[39m   [31m^[39m
-    [90m1815|[39m     class StillPausedAfterResumeAdapter extends StatefulIncidentAdapte…
-    [90m1816|[39m       [35mprivate[39m resumed [33m=[39m [35mfalse[39m[33m;[39m
-
-[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[3/5]⎯[22m[39m
-
-[41m[1m FAIL [22m[49m tests/live-incident.test.ts[2m > [22mlive Incident API orchestration[2m > [22mfails required SLA when active records are cancelled instead of running
-[31m[1mError[22m: Test timed out in 5000ms.
-If this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".[39m
-[36m [2m❯[22m tests/live-incident.test.ts:[2m1882:3[22m[39m
-    [90m1880|[39m   })[33m;[39m
-    [90m1881|[39m
-    [90m1882|[39m   it('fails required SLA when active records are cancelled instead of …
-    [90m   |[39m   [31m^[39m
-    [90m1883|[39m     [35mclass[39m [33mCancelledSlaAdapter[39m [35mextends[39m [33mStatefulIncidentAdapter[39m {
-    [90m1884|[39m       override [35masync[39m [34mreadSlaSummary[39m() {
-
-[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[4/5]⎯[22m[39m
-
-[41m[1m FAIL [22m[49m tests/live-incident.test.ts[2m > [22mlive Incident API orchestration[2m > [22mblocks required SLA when held posture is not observable
-[31m[1mError[22m: Test timed out in 5000ms.
-If this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".[39m
-[36m [2m❯[22m tests/live-incident.test.ts:[2m1985:3[22m[39m
-    [90m1983|[39m   })[33m;[39m
-    [90m1984|[39m
-    [90m1985|[39m   it('blocks required SLA when held posture is not observable', async …
-    [90m   |[39m   [31m^[39m
-    [90m1986|[39m     [35mclass[39m [33mMissingPauseSlaAdapter[39m [35mextends[39m [33mStatefulIncidentAdapter[39m {
-    [90m1987|[39m       override [35masync[39m [34mreadSlaSummary[39m() {
-
-[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[5/5]⎯[22m[39m
-
-
-[2m Test Files [22m [1m[31m1 failed[39m[22m[2m | [22m[1m[32m11 passed[39m[22m[90m (12)[39m
-[2m      Tests [22m [1m[31m5 failed[39m[22m[2m | [22m[1m[32m151 passed[39m[22m[90m (156)[39m
-[2m   Start at [22m 05:34:43
-[2m   Duration [22m 28.29s[2m (transform 626ms, setup 0ms, import 2.72s, tests 29.57s, environment 2ms)[22m
-
-
-::error file=/home/runner/work/nvs/nvs/tests/live-incident.test.ts,title=tests/live-incident.test.ts > live Incident API orchestration > blocks required SLA when only the response objective is observable,line=1477,column=3::Error: Test timed out in 5000ms.%0AIf this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".%0A ❯ tests/live-incident.test.ts:1477:3%0A%0A
-
-::error file=/home/runner/work/nvs/nvs/tests/live-incident.test.ts,title=tests/live-incident.test.ts > live Incident API orchestration > blocks required SLA when resume read returns no records,line=1690,column=3::Error: Test timed out in 5000ms.%0AIf this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".%0A ❯ tests/live-incident.test.ts:1690:3%0A%0A
-
-::error file=/home/runner/work/nvs/nvs/tests/live-incident.test.ts,title=tests/live-incident.test.ts > live Incident API orchestration > fails resumed SLA records when current pause posture remains set,line=1814,column=3::Error: Test timed out in 5000ms.%0AIf this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".%0A ❯ tests/live-incident.test.ts:1814:3%0A%0A
-
-::error file=/home/runner/work/nvs/nvs/tests/live-incident.test.ts,title=tests/live-incident.test.ts > live Incident API orchestration > fails required SLA when active records are cancelled instead of running,line=1882,column=3::Error: Test timed out in 5000ms.%0AIf this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".%0A ❯ tests/live-incident.test.ts:1882:3%0A%0A
-
-::error file=/home/runner/work/nvs/nvs/tests/live-incident.test.ts,title=tests/live-incident.test.ts > live Incident API orchestration > blocks required SLA when held posture is not observable,line=1985,column=3::Error: Test timed out in 5000ms.%0AIf this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".%0A ❯ tests/live-incident.test.ts:1985:3%0A%0A
-[ELIFECYCLE] Test failed. See above for more details.
-[ELIFECYCLE] Command failed with exit code 1.
+[[31merror[39m] .github/workflows/nvs-final-m1-02b-fix.yml: SyntaxError: Implicit keys need to be on a single line (61:1)
+[[31merror[39m]   59 |               """type SlaObservationPhase = 'active' | 'held' | 'resumed' | 'resolved';
+[[31merror[39m]   60 |
+[[31merror[39m] > 61 | function slaObservationReady(
+[[31merror[39m]      | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[[31merror[39m] > 62 |   summary: NilesSlaSummary,
+[[31merror[39m]      | ^^^^^^^^^
+[[31merror[39m]   63 |   phase: SlaObservationPhase,
+[[31merror[39m]   64 |   requiredObjectiveTypes: string[],
+[[31merror[39m]   65 | ): boolean {
+Error occurred when checking code style in the above file.
+[ELIFECYCLE] Command failed with exit code 2.
+[ELIFECYCLE] Command failed with exit code 2.

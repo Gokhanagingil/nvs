@@ -14,9 +14,11 @@ The bootstrap owns only these exact natural keys:
 - service offering: `NVS Payment API Standard`
 - configuration item: `NVS-PAYMENT-API-STG`
 - governed Incident SLA policy: `NVS Payment API Incident SLA`
-- canonical Incident and Incident-CI choice values required by the fixture contract
+- read-only compatibility checks for the Incident and Incident-CI choice contract
 
 The Service Desk synthetic actor is added to the dedicated assignment group. The governed SLA policy is requested by the tenant-admin actor, approved by the incident-manager actor, and published by the tenant-admin actor. Its condition is limited to the deterministic Payment API service.
+
+The bootstrap does not create ITSM choice rows. It accepts the built-in `pending_external_dependency` reason, accepts `affected_by` and `service_impacting` only when the corresponding Incident-CI catalogs are truly unconfigured, reuses matching active catalog records when present, and blocks non-empty incompatible catalogs.
 
 ## Safety model
 
@@ -40,7 +42,7 @@ Before either operation, the workflow verifies:
 - `NVS_ENABLE_NILES_MUTATIONS` is not enabled;
 - no concurrent staging-control workflow is active.
 
-Creation uses deterministic exact-name lookups and idempotency keys. Existing compatible records are reused. Duplicate or incompatible exact records block the operation. There is no broad search-and-delete behavior and no automatic rollback that might remove shared records. A partially completed apply is resumed by running a new plan and applying its new digest.
+Creation uses deterministic exact-name lookups and idempotency keys. Existing compatible records are reused. Duplicate or incompatible exact records block the operation. Choice compatibility is read-only and follows the pinned NILES product-default contract; retired legacy choice-write endpoints are never called. There is no broad search-and-delete behavior and no automatic rollback that might remove shared records. A partially completed apply is resumed by running a new plan and applying its new digest.
 
 The private resource inventory is stored inside the NVS data mount at:
 

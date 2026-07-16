@@ -60,6 +60,39 @@ assert mode == "CANONICAL_RANK_FALLBACK"
     expect(python.status, python.stderr).toBe(0);
   });
 
+  it('accepts product-default choice contracts and blocks configured incompatible values', () => {
+    const python = runPython(String.raw`
+import importlib.util
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+spec = importlib.util.spec_from_file_location("fixture_plan", path)
+module = importlib.util.module_from_spec(spec)
+assert spec and spec.loader
+spec.loader.exec_module(module)
+
+assert module._choice_compatibility(
+    "pendingReason", ["pending_customer"], 1, "pending_external_dependency"
+) == "BUILTIN_PRODUCT_DEFAULT"
+assert module._choice_compatibility(
+    "relationshipType", [], 0, "affected_by"
+) == "EMPTY_CATALOG_VALIDATION_BYPASS"
+assert module._choice_compatibility(
+    "impactScope", ["service_impacting"], 1, "service_impacting"
+) == "CATALOG_RECORD"
+
+try:
+    module._choice_compatibility("relationshipType", ["caused_by"], 1, "affected_by")
+except module.PlanError as error:
+    assert "does not accept" in str(error)
+else:
+    raise AssertionError("a configured incompatible incident-CI catalog must remain blocked")
+`);
+
+    expect(python.status, python.stderr).toBe(0);
+  });
+
   it('uses a legacy label for zero active groups, accepts the sole active group, and blocks ambiguity', () => {
     const python = runPython(String.raw`
 import importlib.util

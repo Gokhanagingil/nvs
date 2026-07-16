@@ -74,6 +74,8 @@ describe('browser-triggered staging operator assets', () => {
     expect(discovery).toContain('queries.configurationItems ? `&q=${ciSearch}`');
     expect(discovery).toContain('query: commonQuery');
     expect(discovery).toContain('queries,');
+    expect(discovery).toContain('includeInactive=true');
+    expect(discovery).toContain('choiceCatalogCounts');
   });
 
   it('requires static fixture readiness, explicit live confirmation, and unconditional cleanup', () => {

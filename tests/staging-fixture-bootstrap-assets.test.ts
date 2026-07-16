@@ -52,6 +52,14 @@ describe('staging fixture bootstrap assets', () => {
     expect(source).toContain("acknowledgement: 'PUBLISH_SLA_POLICY'");
     expect(source).toContain('/publish-requests/${approvalId}/approve');
     expect(source).toContain("operator: 'is', value: serviceId");
+    expect(source).toContain('BUILTIN_PRODUCT_DEFAULT');
+    expect(source).toContain('EMPTY_CATALOG_VALIDATION_BYPASS');
+    expect(source).toContain("disposition: choice.existingId ? 'REUSED' : 'PRODUCT_DEFAULT'");
+    expect(source).toContain('includeInactive=true');
+    expect(source).toContain('safeString(match?.runtimeDefinitionId)');
+    expect(source).toContain('ownedBy: serviceDesk.userId');
+    expect(source).not.toContain("'/grc/itsm/choices',");
+    expect(source).not.toContain('CREATE_CHOICE_');
     expect(source.match(/'x-correlation-id': randomUUID\(\)/g)).toHaveLength(2);
     expect(source).not.toContain('bootstrap_${randomUUID');
   });

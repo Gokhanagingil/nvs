@@ -303,7 +303,11 @@ export interface NilesIncidentLiveAdapter {
     table: 'itsm_incidents' | 'itsm_incident_ci';
     field: 'pendingReason' | 'relationshipType' | 'impactScope';
     correlationId: string;
-  }): Promise<{ values: string[]; transport?: NilesTransportEvidence }>;
+  }): Promise<{
+    values: string[];
+    configuredCount: number;
+    transport?: NilesTransportEvidence;
+  }>;
   readJournalSummary(input: {
     environment: EnvironmentDefinitionV1;
     session: ActorSession;
@@ -1358,10 +1362,24 @@ export class NvsCore {
         ),
       });
       if (result.transport) transports.push(result.transport);
-      if (!result.values.includes(requirement.expected)) {
+      const normalizedExpected = requirement.expected.trim().toLowerCase();
+      const activeValues = new Set(result.values.map((value) => value.trim().toLowerCase()));
+      const builtinPendingReason =
+        requirement.table === 'itsm_incidents' &&
+        requirement.field === 'pendingReason' &&
+        normalizedExpected === 'pending_external_dependency';
+      const emptyIncidentCiCatalog =
+        requirement.table === 'itsm_incident_ci' &&
+        ['relationshipType', 'impactScope'].includes(requirement.field) &&
+        result.configuredCount === 0;
+      if (
+        !activeValues.has(normalizedExpected) &&
+        !builtinPendingReason &&
+        !emptyIncidentCiCatalog
+      ) {
         throw new LiveRunBlockedError(
           'NILES_FIXTURE_CHOICE_UNSUPPORTED',
-          `Configured ${requirement.table}.${requirement.field} value is not available in the tenant choice catalog.`,
+          `Configured ${requirement.table}.${requirement.field} value is not accepted by the tenant choice contract.`,
           'ENVIRONMENT',
         );
       }

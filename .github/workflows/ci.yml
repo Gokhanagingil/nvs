@@ -79,6 +79,7 @@ jobs:
           ref: main
           persist-credentials: true
           fetch-depth: 0
+          show-progress: false
       - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa
         with:
           version: 11.13.0
@@ -87,12 +88,15 @@ jobs:
           node-version: 24.18.0
           cache: pnpm
       - name: Apply the reviewed source correction to a clean branch
+        id: apply
+        continue-on-error: true
         run: |
+          exec > >(tee /tmp/config-approver-apply.log) 2>&1
           set -euo pipefail
           git config user.name 'nvs-maintenance-bot'
           git config user.email 'nvs-maintenance-bot@users.noreply.github.com'
-          git fetch origin fix/bootstrap-configuration-approver
-          pnpm install --frozen-lockfile
+          git fetch --quiet origin fix/bootstrap-configuration-approver
+          pnpm install --frozen-lockfile --reporter=silent
 
           git show \
             origin/fix/bootstrap-configuration-approver:tools/apply-bootstrap-configuration-approver-v2.py \
@@ -187,3 +191,14 @@ jobs:
             tests/staging-fixture-bootstrap-assets.test.ts
           git commit -m 'fix: provision distinct governed SLA configuration approver'
           git push --force-with-lease origin HEAD:fix/bootstrap-configuration-approver-clean
+      - name: Upload sanitized patch diagnostic
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: config-approver-apply-diagnostic
+          path: /tmp/config-approver-apply.log
+          if-no-files-found: error
+          retention-days: 1
+      - name: Propagate patch failure
+        if: steps.apply.outcome != 'success'
+        run: exit 1

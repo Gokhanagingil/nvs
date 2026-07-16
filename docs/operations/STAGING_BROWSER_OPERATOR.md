@@ -92,7 +92,7 @@ RUN_M1_02B_LIVE_INCIDENT
 
 The workflow then:
 
-1. proves the mutation switch is initially disabled and the immutable running image matches `expected_sha`;
+1. proves the immutable running image matches `expected_sha`, the environment/fixture policy is complete, no live or recovery-required run exists, and the mutation switch is the only remaining static blocker;
 2. takes an exact mode-`0600` backup of `.env` and creates an exclusive 15-minute server lease;
 3. starts a detached lease watchdog;
 4. enables the mutation switch only for that lease and recreates the same NVS image;

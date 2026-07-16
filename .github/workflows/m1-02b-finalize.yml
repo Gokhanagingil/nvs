@@ -7,12 +7,19 @@ on:
     paths:
       - .github/workflows/m1-02b-finalize.yml
       - .github/scripts/m1-02b-finalize.mjs
+      - .github/scripts/m1-02b-finalize-hotfix.mjs
+      - .github/scripts/m1-02b-test-timeout.mjs
 
 permissions:
   contents: write
 
+concurrency:
+  group: m1-02b-finalize
+  cancel-in-progress: false
+
 jobs:
   finalize:
+    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -21,20 +28,36 @@ jobs:
           fetch-depth: 0
           persist-credentials: true
       - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa
+        with:
+          version: 11.13.0
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
-          node-version-file: .nvmrc
+          node-version: 24.18.0
           cache: pnpm
       - name: Apply final blocker fixes
-        run: node .github/scripts/m1-02b-finalize.mjs
+        run: |
+          node .github/scripts/m1-02b-finalize-hotfix.mjs
+          node .github/scripts/m1-02b-finalize.mjs
+          node .github/scripts/m1-02b-test-timeout.mjs
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+      - name: Verify focused regressions
+        run: pnpm exec vitest run tests/niles-incident-adapter.test.ts tests/live-incident.test.ts tests/storage.test.ts
       - name: Verify quality gate
         run: corepack pnpm run ci
       - name: Verify shell and diff
         run: |
           bash -n ops/*.sh ops/ci/*.sh
           git diff --check
+      - name: Remove one-time automation artifacts
+        run: |
+          git checkout d61fd4b1e2a81599c3df7da3e7f0032bb508bae6 -- .github/workflows/ci.yml
+          rm -f \
+            .github/finalizer-error.txt \
+            .github/verification-error.txt \
+            .github/scripts/m1-02b-finalize-hotfix.mjs \
+            .github/scripts/m1-02b-test-timeout.mjs \
+            .github/workflows/nvs-final-m1-02b-fix.yml
       - name: Commit verified changes
         run: |
           git config user.name "nvs-maintenance-bot"
@@ -42,4 +65,3 @@ jobs:
           git add -A
           git commit -m "fix: close final M1-02B safety blockers"
           git push origin HEAD:agent/m1-02b-real-incident-api
-# trigger: 2026-07-16

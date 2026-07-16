@@ -1,0 +1,66 @@
+name: apply legacy assignment patch
+
+on:
+  push:
+    branches:
+      - fix/staging-fixture-legacy-label-assignment
+    paths:
+      - tools/apply-legacy-assignment-patch.py
+      - .github/workflows/apply-legacy-assignment-patch.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: fix/staging-fixture-legacy-label-assignment
+          persist-credentials: true
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa
+        with:
+          version: 11.13.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.18.0
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Apply and format the reviewed patch
+        run: |
+          set -euo pipefail
+          python3 tools/apply-legacy-assignment-patch.py
+          pnpm exec prettier --write \
+            packages/contracts/src/index.ts \
+            packages/core/src/index.ts \
+            packages/adapter-niles/src/index.ts \
+            fixtures/niles-incident/staging.example.yaml \
+            tests/live-incident.test.ts \
+            tests/staging-fixture-plan-selection.test.ts \
+            docs/operations/STAGING_BROWSER_OPERATOR.md
+          python3 -m py_compile \
+            ops/staging-fixture-plan.py \
+            ops/staging-fixture-apply.py
+          node --check ops/staging-fixture-discovery.mjs
+      - name: Run focused compile and regression checks
+        run: |
+          set -euo pipefail
+          pnpm exec tsc --noEmit
+          pnpm exec vitest run \
+            tests/live-incident.test.ts \
+            tests/staging-fixture-plan-selection.test.ts \
+            tests/staging-operator-assets.test.ts
+      - name: Remove one-shot patch machinery and push
+        run: |
+          set -euo pipefail
+          rm -f \
+            tools/apply-legacy-assignment-patch.py \
+            .github/workflows/apply-legacy-assignment-patch.yml
+          git config user.name "nvs-maintenance-bot"
+          git config user.email "nvs-maintenance-bot@users.noreply.github.com"
+          git add -A
+          git commit -m "fix: support legacy assignment labels when staging has no groups"
+          git push origin HEAD:fix/staging-fixture-legacy-label-assignment

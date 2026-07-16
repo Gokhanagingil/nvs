@@ -1,0 +1,150 @@
+name: one-shot patch configuration approver domain access
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/one-shot-patch-configuration-approver-domain-access.yml
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: nvs-one-shot-patch-configuration-approver-domain-access
+  cancel-in-progress: false
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out clean reviewed implementation base
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: be8685e19c8ff53020d6d8f83e2e55caca953395
+          persist-credentials: true
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa
+        with:
+          version: 11.13.0
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.18.0
+          cache: pnpm
+
+      - name: Apply deterministic DTO contract correction
+        run: |
+          set -euo pipefail
+          git config user.name 'nvs-maintenance-bot'
+          git config user.email 'nvs-maintenance-bot@users.noreply.github.com'
+          git switch -C fix/bootstrap-configuration-approver-domain-access
+          pnpm install --frozen-lockfile
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          script_path = Path('ops/staging-fixture-bootstrap.mjs')
+          script = script_path.read_text(encoding='utf-8')
+          old_payload = """          isGlobalAdmin: false,
+          hasItsmAccess: true,
+          mustChangePassword: false,"""
+          new_payload = """          isGlobalAdmin: false,
+          domainAccessGrc: false,
+          domainAccessItsm: true,
+          domainAccessSpace: false,
+          mustChangePassword: false,"""
+          if script.count(old_payload) != 1:
+              raise SystemExit(f'configuration approver payload anchor count={script.count(old_payload)}')
+          script_path.write_text(script.replace(old_payload, new_payload, 1), encoding='utf-8')
+
+          test_path = Path('tests/staging-fixture-bootstrap-assets.test.ts')
+          test = test_path.read_text(encoding='utf-8')
+          old_test = """    expect(source).toContain(\"role: 'admin'\");
+    expect(source).toContain('mustChangePassword: false');"""
+          new_test = """    expect(source).toContain(\"role: 'admin'\");
+    expect(source).toContain('domainAccessGrc: false');
+    expect(source).toContain('domainAccessItsm: true');
+    expect(source).toContain('domainAccessSpace: false');
+    expect(source).toContain('mustChangePassword: false');
+    expect(source).not.toContain('hasItsmAccess');"""
+          if test.count(old_test) != 1:
+              raise SystemExit(f'configuration approver regression anchor count={test.count(old_test)}')
+          test_path.write_text(test.replace(old_test, new_test, 1), encoding='utf-8')
+          PY
+
+          pnpm exec prettier --write ops/staging-fixture-bootstrap.mjs tests/staging-fixture-bootstrap-assets.test.ts
+          node --check ops/staging-fixture-bootstrap.mjs
+          pnpm exec eslint ops/staging-fixture-bootstrap.mjs tests/staging-fixture-bootstrap-assets.test.ts
+          pnpm exec vitest run tests/staging-fixture-bootstrap-assets.test.ts
+          pnpm run typecheck
+          git diff --check
+
+          mapfile -t changed < <(git diff --name-only | sort)
+          expected=(
+            'ops/staging-fixture-bootstrap.mjs'
+            'tests/staging-fixture-bootstrap-assets.test.ts'
+          )
+          [[ "${changed[*]}" == "${expected[*]}" ]]
+          ! grep -R --line-number --fixed-strings 'hasItsmAccess' ops/staging-fixture-bootstrap.mjs tests/staging-fixture-bootstrap-assets.test.ts
+          grep -Fq 'domainAccessGrc: false' ops/staging-fixture-bootstrap.mjs
+          grep -Fq 'domainAccessItsm: true' ops/staging-fixture-bootstrap.mjs
+          grep -Fq 'domainAccessSpace: false' ops/staging-fixture-bootstrap.mjs
+
+          git add ops/staging-fixture-bootstrap.mjs tests/staging-fixture-bootstrap-assets.test.ts
+          git commit -m 'fix: use supported domain access fields for configuration approver'
+          git push --force-with-lease origin HEAD:fix/bootstrap-configuration-approver-domain-access
+
+      - name: Publish sanitized patch result
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          body="$RUNNER_TEMP/configuration-approver-domain-access-result.md"
+          {
+            echo '# Sanitized Configuration Approver DTO correction result'
+            echo
+            echo '- Deterministic blocker: unsupported `hasItsmAccess` field caused HTTP 400 under `forbidNonWhitelisted` validation.'
+            echo '- Correction: use `domainAccessGrc=false`, `domainAccessItsm=true`, and `domainAccessSpace=false`.'
+            echo "- Clean implementation SHA: \`$sha\`"
+            echo '- Validation: formatting, Node syntax, ESLint, focused Vitest, strict TypeScript, and diff hygiene passed.'
+            echo '- Changed implementation files: exactly two.'
+            echo '- Staging operation: none'
+            echo '- NILES mutation switch: unchanged'
+            echo '- Live Incident acceptance: not executed'
+          } > "$body"
+          gh issue edit 23 \
+            --repo "$GITHUB_REPOSITORY" \
+            --title '[Closed] Configuration Approver DTO correction prepared' \
+            --body-file "$body"
+
+  cleanup:
+    needs: patch
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: main
+          persist-credentials: true
+          fetch-depth: 0
+
+      - name: Remove completed patch workflow
+        run: |
+          set -euo pipefail
+          git config user.name 'nvs-maintenance-bot'
+          git config user.email 'nvs-maintenance-bot@users.noreply.github.com'
+          git pull --ff-only origin main
+          rm -f .github/workflows/one-shot-patch-configuration-approver-domain-access.yml
+          if git diff --quiet --exit-code; then
+            exit 0
+          fi
+          git add .github/workflows/one-shot-patch-configuration-approver-domain-access.yml
+          git commit -m 'chore: remove completed configuration approver DTO patch workflow'
+          git push origin HEAD:main

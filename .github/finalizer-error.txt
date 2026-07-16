@@ -1,11 +1,16 @@
-file:///home/runner/work/nvs/nvs/.github/scripts/m1-02b-finalize.mjs:14
-    throw new Error(`Replacement target is not unique: ${label}`);
-          ^
+node:internal/fs/promises:640
+  return new FileHandle(await PromisePrototypeThen(
+                        ^
 
-Error: Replacement target is not unique: live choice validation call
-    at replaceOnce (file:///home/runner/work/nvs/nvs/.github/scripts/m1-02b-finalize.mjs:14:11)
-    at file:///home/runner/work/nvs/nvs/.github/scripts/m1-02b-finalize.mjs:62:12
-    at edit (file:///home/runner/work/nvs/nvs/.github/scripts/m1-02b-finalize.mjs:5:17)
-    at async file:///home/runner/work/nvs/nvs/.github/scripts/m1-02b-finalize.mjs:19:1
+Error: ENOENT: no such file or directory, open 'config/fixtures/niles-incident.staging.example.yaml'
+    at async open (node:internal/fs/promises:640:25)
+    at async readFile (node:internal/fs/promises:1290:14)
+    at async edit (file:///home/runner/work/nvs/nvs/.github/scripts/m1-02b-finalize.mjs:4:18)
+    at async file:///home/runner/work/nvs/nvs/.github/scripts/m1-02b-finalize.mjs:110:1 {
+  errno: -2,
+  code: 'ENOENT',
+  syscall: 'open',
+  path: 'config/fixtures/niles-incident.staging.example.yaml'
+}
 
 Node.js v24.18.0

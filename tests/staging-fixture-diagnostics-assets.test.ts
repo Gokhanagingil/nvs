@@ -10,9 +10,7 @@ describe('staging fixture diagnostic artifact', () => {
 
     expect(workflow).toContain('name: Upload sanitized fixture result');
     expect(workflow).toContain('if: always()');
-    expect(workflow).toContain(
-      'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02',
-    );
+    expect(workflow).toContain('actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02');
     expect(workflow).toContain('path: ${{ runner.temp }}/nvs-staging-fixture.md');
     expect(workflow).toContain('retention-days: 1');
     expect(workflow).toContain('if-no-files-found: ignore');

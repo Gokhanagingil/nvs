@@ -1,16 +1,11 @@
-node:internal/fs/promises:640
-  return new FileHandle(await PromisePrototypeThen(
-                        ^
+file:///home/runner/work/nvs/nvs/.github/scripts/m1-02b-finalize.mjs:12
+  if (first < 0) throw new Error(`Missing replacement target: ${label}`);
+                       ^
 
-Error: ENOENT: no such file or directory, open 'config/fixtures/niles-incident.staging.example.yaml'
-    at async open (node:internal/fs/promises:640:25)
-    at async readFile (node:internal/fs/promises:1290:14)
-    at async edit (file:///home/runner/work/nvs/nvs/.github/scripts/m1-02b-finalize.mjs:4:18)
-    at async file:///home/runner/work/nvs/nvs/.github/scripts/m1-02b-finalize.mjs:110:1 {
-  errno: -2,
-  code: 'ENOENT',
-  syscall: 'open',
-  path: 'config/fixtures/niles-incident.staging.example.yaml'
-}
+Error: Missing replacement target: choice adapter regression
+    at replaceOnce (file:///home/runner/work/nvs/nvs/.github/scripts/m1-02b-finalize.mjs:12:24)
+    at file:///home/runner/work/nvs/nvs/.github/scripts/m1-02b-finalize.mjs:120:10
+    at edit (file:///home/runner/work/nvs/nvs/.github/scripts/m1-02b-finalize.mjs:5:17)
+    at async file:///home/runner/work/nvs/nvs/.github/scripts/m1-02b-finalize.mjs:117:1
 
 Node.js v24.18.0

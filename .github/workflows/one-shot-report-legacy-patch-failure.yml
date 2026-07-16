@@ -1,0 +1,47 @@
+name: one-shot report legacy patch failure
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/one-shot-report-legacy-patch-failure.yml
+
+permissions:
+  actions: read
+  contents: read
+  issues: write
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Publish sanitized failed-step tail
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_RUN_ID: '29491922188'
+        run: |
+          set -euo pipefail
+          repo="$GITHUB_REPOSITORY"
+          raw="$RUNNER_TEMP/legacy-patch-failed.log"
+          safe="$RUNNER_TEMP/legacy-patch-failed-safe.log"
+          gh run view "$TARGET_RUN_ID" --repo "$repo" --log-failed > "$raw"
+          tail -n 160 "$raw" \
+            | sed -E 's/(authorization:|bearer |password|token)[^ ]*/\1 [redacted]/Ig' \
+            > "$safe"
+          body="$RUNNER_TEMP/legacy-patch-failed.md"
+          {
+            echo '## Legacy assignment patch failed-step tail'
+            echo
+            echo "Run: \`$TARGET_RUN_ID\`"
+            echo
+            echo '```text'
+            cat "$safe"
+            echo '```'
+          } > "$body"
+          gh api \
+            --method POST \
+            "repos/${repo}/issues/9/comments" \
+            --raw-field "body=$(cat "$body")" \
+            >/dev/null

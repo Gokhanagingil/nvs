@@ -1,0 +1,46 @@
+name: diagnose PR 70
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/diagnose-pr70.yml
+      - .github/workflows/one-shot-format-configuration-approver-patch.yml
+      - .github/workflows/one-shot-patch-configuration-approver-domain-access.yml
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Identify first failing CI stage
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          set -euo pipefail
+          git clone --quiet --depth 1 --branch "$HEAD_REF" \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" repo
+          cd repo
+          corepack enable
+          corepack pnpm install --frozen-lockfile --reporter=silent
+          if ! corepack pnpm format:check >/tmp/nvs-format.log 2>&1; then
+            echo 'NVS_DIAGNOSTIC_STAGE=FORMAT_CHECK'
+            tail -n 20 /tmp/nvs-format.log
+            exit 1
+          fi
+          echo 'NVS_DIAGNOSTIC_FORMAT=PASS'
+          if ! corepack pnpm lint >/tmp/nvs-lint.log 2>&1; then
+            echo 'NVS_DIAGNOSTIC_STAGE=LINT'
+            tail -n 20 /tmp/nvs-lint.log
+            exit 1
+          fi
+          echo 'NVS_DIAGNOSTIC_LINT=PASS'
+          if ! corepack pnpm typecheck >/tmp/nvs-typecheck.log 2>&1; then
+            echo 'NVS_DIAGNOSTIC_STAGE=TYPECHECK'
+            tail -n 20 /tmp/nvs-typecheck.log
+            exit 1
+          fi
+          echo 'NVS_DIAGNOSTIC_TYPECHECK=PASS'

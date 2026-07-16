@@ -37,7 +37,7 @@ jobs:
           log_status=$?
           set -e
           if [[ "$log_status" -eq 0 ]]; then
-            tail -n 220 "$raw" \
+            tail -n 90 "$raw" \
               | sed -E 's/(authorization:|bearer |password|token)[^ ]*/\1 [redacted]/Ig' \
               > "$safe"
           else

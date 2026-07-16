@@ -9,6 +9,7 @@ on:
 
 permissions:
   contents: read
+  issues: write
 
 jobs:
   diagnose:
@@ -26,21 +27,32 @@ jobs:
           cd repo
           corepack enable
           corepack pnpm install --frozen-lockfile --reporter=silent
-          if ! corepack pnpm format:check >/tmp/nvs-format.log 2>&1; then
-            echo 'NVS_DIAGNOSTIC_STAGE=FORMAT_CHECK'
-            tail -n 20 /tmp/nvs-format.log
-            exit 1
+
+          stage='PASS'
+          output='All diagnostic stages passed.'
+          if ! corepack pnpm format:check >/tmp/nvs-stage.log 2>&1; then
+            stage='FORMAT_CHECK'
+            output="$(tail -n 20 /tmp/nvs-stage.log)"
+          elif ! corepack pnpm lint >/tmp/nvs-stage.log 2>&1; then
+            stage='LINT'
+            output="$(tail -n 20 /tmp/nvs-stage.log)"
+          elif ! corepack pnpm typecheck >/tmp/nvs-stage.log 2>&1; then
+            stage='TYPECHECK'
+            output="$(tail -n 20 /tmp/nvs-stage.log)"
           fi
-          echo 'NVS_DIAGNOSTIC_FORMAT=PASS'
-          if ! corepack pnpm lint >/tmp/nvs-lint.log 2>&1; then
-            echo 'NVS_DIAGNOSTIC_STAGE=LINT'
-            tail -n 20 /tmp/nvs-lint.log
-            exit 1
-          fi
-          echo 'NVS_DIAGNOSTIC_LINT=PASS'
-          if ! corepack pnpm typecheck >/tmp/nvs-typecheck.log 2>&1; then
-            echo 'NVS_DIAGNOSTIC_STAGE=TYPECHECK'
-            tail -n 20 /tmp/nvs-typecheck.log
-            exit 1
-          fi
-          echo 'NVS_DIAGNOSTIC_TYPECHECK=PASS'
+
+          body="$RUNNER_TEMP/pr70-diagnostic.md"
+          {
+            echo '<!-- nvs-pr70-diagnostic -->'
+            echo '## Sanitized PR #70 diagnostic'
+            echo
+            echo "- First failing stage: \`$stage\`"
+            echo '- Staging operation: none'
+            echo '- Live Incident acceptance: not executed'
+            echo
+            echo '```text'
+            printf '%s\n' "$output"
+            echo '```'
+          } > "$body"
+          gh issue comment 23 --repo "$GITHUB_REPOSITORY" --body-file "$body"
+          [[ "$stage" == 'PASS' ]]

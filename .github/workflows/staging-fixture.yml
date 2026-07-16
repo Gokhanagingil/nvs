@@ -1,0 +1,210 @@
+name: staging fixture
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Staging fixture operation
+        required: true
+        default: plan
+        type: choice
+        options:
+          - plan
+          - apply
+      environment_id:
+        description: NVS environment identifier
+        required: true
+        default: staging-example
+        type: string
+      expected_sha:
+        description: Optional currently deployed 40-character Git SHA
+        required: false
+        default: 09be26944f836fadca0b564f6516e86600d6c04b
+        type: string
+      assignment_group_query:
+        description: Unique active assignment-group name selector
+        required: true
+        default: service desk
+        type: string
+      service_query:
+        description: Unique active CMDB service name selector
+        required: true
+        default: payment
+        type: string
+      offering_query:
+        description: Unique active offering name selector linked to the service
+        required: true
+        default: payment
+        type: string
+      ci_query:
+        description: Unique active configuration-item name selector
+        required: true
+        default: payment
+        type: string
+      proposal_digest:
+        description: SHA-256 printed by a successful plan operation
+        required: false
+        default: ''
+        type: string
+      confirmation:
+        description: Apply requires APPLY_M1_02B_FIXTURE
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nvs-staging-fixture
+  cancel-in-progress: false
+
+jobs:
+  fixture:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: staging
+    steps:
+      - name: Check out reviewed fixture tooling
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Validate fixture inputs
+        env:
+          OPERATION: ${{ inputs.operation }}
+          ENVIRONMENT_ID: ${{ inputs.environment_id }}
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          ASSIGNMENT_GROUP_QUERY: ${{ inputs.assignment_group_query }}
+          SERVICE_QUERY: ${{ inputs.service_query }}
+          OFFERING_QUERY: ${{ inputs.offering_query }}
+          CI_QUERY: ${{ inputs.ci_query }}
+          PROPOSAL_DIGEST: ${{ inputs.proposal_digest }}
+          CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+
+          operation = os.environ["OPERATION"]
+          environment_id = os.environ["ENVIRONMENT_ID"]
+          expected_sha = os.environ["EXPECTED_SHA"]
+          selectors = {
+              "assignment_group_query": os.environ["ASSIGNMENT_GROUP_QUERY"],
+              "service_query": os.environ["SERVICE_QUERY"],
+              "offering_query": os.environ["OFFERING_QUERY"],
+              "ci_query": os.environ["CI_QUERY"],
+          }
+          digest = os.environ["PROPOSAL_DIGEST"]
+          confirmation = os.environ["CONFIRMATION"]
+
+          if operation not in {"plan", "apply"}:
+              raise SystemExit("Unsupported staging fixture operation.")
+          if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,95}", environment_id):
+              raise SystemExit("Invalid NVS environment identifier.")
+          if expected_sha and not re.fullmatch(r"[0-9a-f]{40}", expected_sha):
+              raise SystemExit("expected_sha must be empty or a full lowercase Git SHA.")
+          for label, value in selectors.items():
+              if not value.strip():
+                  raise SystemExit(f"{label} must not be empty.")
+              if len(value) > 100 or any(ord(character) < 32 for character in value):
+                  raise SystemExit(f"{label} must be at most 100 printable characters.")
+          if digest and not re.fullmatch(r"[0-9a-f]{64}", digest):
+              raise SystemExit("proposal_digest must be empty or a lowercase SHA-256 digest.")
+          if operation == "apply":
+              if not digest:
+                  raise SystemExit("apply requires proposal_digest.")
+              if confirmation != "APPLY_M1_02B_FIXTURE":
+                  raise SystemExit("apply requires the exact confirmation phrase.")
+          PY
+
+      - name: Configure pinned SSH trust
+        env:
+          SSH_HOST: ${{ secrets.NVS_STAGING_SSH_HOST }}
+          SSH_USER: ${{ secrets.NVS_STAGING_SSH_USER }}
+          SSH_KEY_B64: ${{ secrets.NVS_STAGING_SSH_KEY_B64 }}
+          SSH_KNOWN_HOSTS: ${{ secrets.NVS_STAGING_SSH_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          [[ "$SSH_HOST" =~ ^[A-Za-z0-9.-]+$ ]]
+          [[ "$SSH_USER" =~ ^[A-Za-z_][A-Za-z0-9_-]{0,31}$ ]]
+          test -n "$SSH_KEY_B64"
+          test -n "$SSH_KNOWN_HOSTS"
+          install -d -m 0700 "$HOME/.ssh"
+          printf '%s' "$SSH_KEY_B64" | base64 --decode > "$HOME/.ssh/id_nvs_staging"
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 0600 "$HOME/.ssh/id_nvs_staging" "$HOME/.ssh/known_hosts"
+
+      - name: Plan or apply server-owned fixture
+        env:
+          SSH_HOST: ${{ secrets.NVS_STAGING_SSH_HOST }}
+          SSH_USER: ${{ secrets.NVS_STAGING_SSH_USER }}
+          OPERATION: ${{ inputs.operation }}
+          ENVIRONMENT_ID: ${{ inputs.environment_id }}
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          ASSIGNMENT_GROUP_QUERY: ${{ inputs.assignment_group_query }}
+          SERVICE_QUERY: ${{ inputs.service_query }}
+          OFFERING_QUERY: ${{ inputs.offering_query }}
+          CI_QUERY: ${{ inputs.ci_query }}
+          PROPOSAL_DIGEST: ${{ inputs.proposal_digest }}
+          CONFIRMATION: ${{ inputs.confirmation }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          ssh_options=(
+            -i "$HOME/.ssh/id_nvs_staging"
+            -o BatchMode=yes
+            -o IdentitiesOnly=yes
+            -o StrictHostKeyChecking=yes
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts"
+          )
+          remote="${SSH_USER}@${SSH_HOST}"
+          remote_dir="/tmp/nvs-staging-fixture-${RUN_ID}-${RUN_ATTEMPT}"
+          output_file="$RUNNER_TEMP/nvs-staging-fixture.md"
+
+          ssh "${ssh_options[@]}" "$remote" "install -d -m 0700 '$remote_dir'"
+          scp "${ssh_options[@]}" \
+            ops/staging-fixture-discovery.mjs \
+            ops/staging-fixture-plan.py \
+            ops/staging-fixture-apply.py \
+            ops/staging-fixture-apply-guard.py \
+            "${remote}:${remote_dir}/"
+
+          printf -v environment_q '%q' "$ENVIRONMENT_ID"
+          printf -v expected_q '%q' "$EXPECTED_SHA"
+          printf -v digest_q '%q' "$PROPOSAL_DIGEST"
+          printf -v confirmation_q '%q' "$CONFIRMATION"
+          group_b64="$(printf '%s' "$ASSIGNMENT_GROUP_QUERY" | base64 -w0)"
+          service_b64="$(printf '%s' "$SERVICE_QUERY" | base64 -w0)"
+          offering_b64="$(printf '%s' "$OFFERING_QUERY" | base64 -w0)"
+          ci_b64="$(printf '%s' "$CI_QUERY" | base64 -w0)"
+
+          set +e
+          if [[ "$OPERATION" == plan ]]; then
+            ssh "${ssh_options[@]}" "$remote" \
+              "group_query=\$(printf '%s' '$group_b64' | base64 --decode); service_query=\$(printf '%s' '$service_b64' | base64 --decode); offering_query=\$(printf '%s' '$offering_b64' | base64 --decode); ci_query=\$(printf '%s' '$ci_b64' | base64 --decode); python3 '$remote_dir/staging-fixture-plan.py' --environment-id $environment_q --assignment-group-query \"\$group_query\" --service-query \"\$service_query\" --offering-query \"\$offering_query\" --ci-query \"\$ci_query\" --discovery-script '$remote_dir/staging-fixture-discovery.mjs'" \
+              >"$output_file"
+            status=$?
+          else
+            ssh "${ssh_options[@]}" "$remote" \
+              "python3 '$remote_dir/staging-fixture-apply-guard.py' --environment-id $environment_q --expected-sha $expected_q --proposal-digest $digest_q --confirmation $confirmation_q --apply-script '$remote_dir/staging-fixture-apply.py'" \
+              >"$output_file"
+            status=$?
+          fi
+          set -e
+
+          cat "$output_file"
+          {
+            echo
+            cat "$output_file"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          ssh "${ssh_options[@]}" "$remote" "rm -rf '$remote_dir'" || true
+          exit "$status"
+
+      - name: Remove local SSH material
+        if: always()
+        run: rm -rf "$HOME/.ssh"

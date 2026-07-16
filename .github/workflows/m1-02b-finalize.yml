@@ -1,0 +1,44 @@
+name: m1-02b-finalize
+
+on:
+  push:
+    branches:
+      - agent/m1-02b-real-incident-api
+    paths:
+      - .github/workflows/m1-02b-finalize.yml
+      - .github/scripts/m1-02b-finalize.mjs
+
+permissions:
+  contents: write
+
+jobs:
+  finalize:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: agent/m1-02b-real-incident-api
+          fetch-depth: 0
+          persist-credentials: true
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - name: Apply final blocker fixes
+        run: node .github/scripts/m1-02b-finalize.mjs
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Verify quality gate
+        run: corepack pnpm run ci
+      - name: Verify shell and diff
+        run: |
+          bash -n ops/*.sh ops/ci/*.sh
+          git diff --check
+      - name: Commit verified changes
+        run: |
+          git config user.name "nvs-maintenance-bot"
+          git config user.email "nvs-maintenance-bot@users.noreply.github.com"
+          git add -A
+          git commit -m "fix: close final M1-02B safety blockers"
+          git push origin HEAD:agent/m1-02b-real-incident-api

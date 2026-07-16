@@ -1,15 +1,18 @@
-packages/core/src/index.ts 548ms
-tests/live-incident.test.ts 223ms
+packages/core/src/index.ts 407ms
+tests/live-incident.test.ts 163ms
 $ corepack pnpm format:check && corepack pnpm lint && corepack pnpm typecheck && corepack pnpm test && corepack pnpm build && corepack pnpm test:e2e
 $ prettier --check "apps/**/*.{ts,tsx,css,json,html}" "packages/**/*.{ts,tsx,json}" "scripts/**/*.{ts,tsx}" "tests/**/*.{ts,tsx}" "e2e/**/*.{ts,tsx}" ".github/**/*.yml" "actors/**/*.yaml" "environments/**/*.yaml" "fixtures/**/*.yaml" "scenarios/**/*.yaml" "*.{ts,json,js,yaml,yml}"
 Checking formatting...
 All matched files use Prettier code style!
 $ eslint .
-
-/home/runner/work/nvs/nvs/packages/core/src/index.ts
-  1342:14  error  Unexpected constant condition  no-constant-condition
-
-✖ 1 problem (1 error, 0 warnings)
-
-[ELIFECYCLE] Command failed with exit code 1.
-[ELIFECYCLE] Command failed with exit code 1.
+$ corepack pnpm -r --if-present typecheck && tsc --noEmit
+Scope: 8 of 9 workspace projects
+apps/web typecheck$ tsc --noEmit
+apps/web typecheck: Done
+tests/live-incident.test.ts(1271,47): error TS2345: Argument of type 'string | undefined' is not assignable to parameter of type 'string'.
+  Type 'undefined' is not assignable to type 'string'.
+tests/live-incident.test.ts(1272,32): error TS2345: Argument of type 'string | undefined' is not assignable to parameter of type 'string'.
+  Type 'undefined' is not assignable to type 'string'.
+tests/live-incident.test.ts(1307,93): error TS2554: Expected 1-7 arguments, but got 8.
+[ELIFECYCLE] Command failed with exit code 2.
+[ELIFECYCLE] Command failed with exit code 2.

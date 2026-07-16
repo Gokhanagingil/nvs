@@ -104,6 +104,30 @@ def _metadata() -> tuple[str, str, str, str]:
     return image_ref, build_sha, build_timestamp, release_version
 
 
+def _prepare_config_directories(image_ref: str) -> None:
+    deploy_uid = os.getuid()
+    _run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "--user",
+            "0:0",
+            "--entrypoint",
+            "/bin/sh",
+            "-v",
+            f"{CONFIG_ROOT}:/config:rw",
+            image_ref,
+            "-c",
+            (
+                "mkdir -p /config/environments /config/fixtures /config/fixtures/niles-incident && "
+                f"chown {deploy_uid}:{RUNTIME_GID} /config/environments /config/fixtures /config/fixtures/niles-incident && "
+                "chmod 0750 /config/environments /config/fixtures /config/fixtures/niles-incident"
+            ),
+        ]
+    )
+
+
 def _snapshot(path: Path, label: str, suffix: str) -> Path | None:
     if path.is_symlink():
         raise GuardError(f"refusing unsafe symbolic-link config path: {path}.")
@@ -204,6 +228,7 @@ def _run_guard(args: argparse.Namespace) -> int:
     image_ref, build_sha, build_timestamp, release_version = _metadata()
     if args.expected_sha and args.expected_sha != build_sha:
         raise GuardError("the running NVS build does not match expected_sha.")
+    _prepare_config_directories(image_ref)
 
     environment_path = CONFIG_ROOT / "environments" / "staging.yaml"
     fixture_path = CONFIG_ROOT / "fixtures" / "niles-incident" / "staging.yaml"

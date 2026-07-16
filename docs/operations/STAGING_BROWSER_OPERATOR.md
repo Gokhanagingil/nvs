@@ -30,7 +30,13 @@ Executes a short-lived Node process inside the existing NVS container. It reuses
 - Incident hold-reason choices;
 - Incident-CI relationship and impact-scope choices.
 
-The GitHub job summary contains only selected non-secret IDs, names, lifecycle/status fields, and choice values. It never returns the login identifier, password, bearer token, cookie, raw request/response body, or unrestricted upstream record.
+Because this repository is public, the detailed candidate inventory is never printed to GitHub logs or the job summary. It is written atomically on the staging host as:
+
+```text
+/opt/nvs/releases/nvs-fixture-discovery-latest.json
+```
+
+The file is deploy-user owned, mode `0600`, and contains only selected non-secret IDs, names, lifecycle/status fields, and choice values. The GitHub summary reports counts and incomplete scopes only. Neither output contains the login identifier, password, bearer token, cookie, raw request/response body, or unrestricted upstream record.
 
 The optional `query` filters groups, services, offerings, and configuration items. It is limited to 100 printable characters.
 
@@ -41,6 +47,7 @@ The optional `query` filters groups, services, offerings, and configuration item
 - Reviewed scripts are checked out from `main`, copied to a mode-`0700` temporary server directory, and removed after the operation.
 - Discovery runs inside the existing NVS container so it reaches NILES only through the approved private Docker network.
 - Neither operation writes `/opt/nvs/.env`, `/opt/nvs/config`, `/opt/nvs/data`, or a NILES business endpoint.
+- The only discovery write is the mode-`0600` sanitized report under `/opt/nvs/releases`.
 - `NVS_ENABLE_NILES_MUTATIONS` is never changed by this workflow.
 
 Interactive web-console access still requires an approved SSH tunnel or a separately approved authenticated reverse proxy. Do not publish port `4100` directly.

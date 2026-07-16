@@ -1,0 +1,241 @@
+name: one-shot analyze staging fixture candidates
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/one-shot-analyze-staging-fixture-candidates.yml
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: nvs-one-shot-analyze-staging-fixture-candidates
+  cancel-in-progress: false
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: staging
+    steps:
+      - name: Check out main
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: main
+          persist-credentials: true
+          fetch-depth: 0
+
+      - name: Configure pinned SSH trust
+        env:
+          SSH_HOST: ${{ secrets.NVS_STAGING_SSH_HOST }}
+          SSH_USER: ${{ secrets.NVS_STAGING_SSH_USER }}
+          SSH_KEY_B64: ${{ secrets.NVS_STAGING_SSH_KEY_B64 }}
+          SSH_KNOWN_HOSTS: ${{ secrets.NVS_STAGING_SSH_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          [[ "$SSH_HOST" =~ ^[A-Za-z0-9.-]+$ ]]
+          [[ "$SSH_USER" =~ ^[A-Za-z_][A-Za-z0-9_-]{0,31}$ ]]
+          install -d -m 0700 "$HOME/.ssh"
+          printf '%s' "$SSH_KEY_B64" | base64 --decode > "$HOME/.ssh/id_nvs_staging"
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 0600 "$HOME/.ssh/id_nvs_staging" "$HOME/.ssh/known_hosts"
+
+      - name: Analyze sanitized candidates without publishing identities
+        env:
+          SSH_HOST: ${{ secrets.NVS_STAGING_SSH_HOST }}
+          SSH_USER: ${{ secrets.NVS_STAGING_SSH_USER }}
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          ssh_options=(
+            -i "$HOME/.ssh/id_nvs_staging"
+            -o BatchMode=yes
+            -o IdentitiesOnly=yes
+            -o StrictHostKeyChecking=yes
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts"
+          )
+          remote="${SSH_USER}@${SSH_HOST}"
+          remote_dir="/tmp/nvs-fixture-analysis-${RUN_ID}"
+          discovery_file="$RUNNER_TEMP/discovery.json"
+          report_file="$RUNNER_TEMP/report.md"
+
+          ssh "${ssh_options[@]}" "$remote" "install -d -m 0700 '$remote_dir'"
+          scp "${ssh_options[@]}" ops/staging-fixture-discovery.mjs "${remote}:${remote_dir}/"
+          ssh "${ssh_options[@]}" "$remote" \
+            "docker exec -i -e NVS_DISCOVERY_ENVIRONMENT_ID=staging-example -e NVS_DISCOVERY_GROUP_QUERY= -e NVS_DISCOVERY_SERVICE_QUERY= -e NVS_DISCOVERY_OFFERING_QUERY= -e NVS_DISCOVERY_CI_QUERY= nvs node --input-type=module - < '$remote_dir/staging-fixture-discovery.mjs'" \
+            > "$discovery_file"
+          ssh "${ssh_options[@]}" "$remote" "rm -rf '$remote_dir'" || true
+
+          python3 - "$discovery_file" "$report_file" <<'PY'
+          import json, re, sys
+          from pathlib import Path
+
+          source = Path(sys.argv[1])
+          target = Path(sys.argv[2])
+          data = json.loads(source.read_text(encoding='utf-8'))
+          candidates = data.get('candidates') if isinstance(data, dict) else {}
+          candidates = candidates if isinstance(candidates, dict) else {}
+          inactive = {'inactive', 'retired', 'decommissioned', 'disabled', 'deleted'}
+
+          def active(items):
+              result = []
+              for item in items if isinstance(items, list) else []:
+                  if not isinstance(item, dict) or item.get('isActive') is False:
+                      continue
+                  states = [item.get('status'), item.get('lifecycle')]
+                  if any(isinstance(v, str) and v.casefold() in inactive for v in states):
+                      continue
+                  result.append(item)
+              return result
+
+          phrase_weights = {
+              'payment api': 180,
+              'payment': 150,
+              'payments': 150,
+              'card payment': 145,
+              'billing': 120,
+              'checkout': 115,
+              'transaction': 110,
+              'authorization': 100,
+              'banking': 90,
+              'api': 40,
+          }
+          token_weights = {
+              'payment': 100,
+              'payments': 100,
+              'billing': 80,
+              'checkout': 75,
+              'transaction': 70,
+              'authorization': 65,
+              'banking': 55,
+              'card': 45,
+              'api': 30,
+              'application': 15,
+              'service': 10,
+          }
+
+          def normalized(value):
+              if not isinstance(value, str):
+                  return ''
+              return ' '.join(re.findall(r'[a-z0-9]+', value.casefold()))
+
+          def score(item, fields):
+              texts = [normalized(item.get(field)) for field in fields]
+              primary = texts[0] if texts else ''
+              secondary = ' '.join(texts[1:])
+              words = set(primary.split())
+              secondary_words = set(secondary.split())
+              total = 0
+              for phrase, weight in phrase_weights.items():
+                  if phrase in primary:
+                      total += weight
+                  elif phrase in secondary:
+                      total += max(1, weight // 2)
+              for token, weight in token_weights.items():
+                  if token in words:
+                      total += weight
+                  elif token in secondary_words:
+                      total += max(1, weight // 2)
+              return total
+
+          def posture(items, fields):
+              values = active(items)
+              scored = sorted((score(item, fields), item) for item in values)
+              best_score = scored[-1][0] if scored else 0
+              best_count = sum(1 for candidate_score, _ in scored if candidate_score == best_score and candidate_score > 0)
+              return values, best_score, best_count
+
+          services, service_best, service_ties = posture(
+              candidates.get('services'), ['name', 'type', 'tier', 'criticality']
+          )
+          cis, ci_best, ci_ties = posture(
+              candidates.get('configurationItems'), ['name', 'className', 'classLabel', 'environment']
+          )
+          offerings = active(candidates.get('offerings'))
+          groups = active(candidates.get('assignmentGroups'))
+
+          selected_service_id = None
+          service_mode = 'NONE'
+          if len(services) == 1:
+              selected_service_id = services[0].get('id')
+              service_mode = 'SOLE_ACTIVE'
+          elif service_best > 0 and service_ties == 1:
+              selected_service_id = max(services, key=lambda item: score(item, ['name', 'type', 'tier', 'criticality'])).get('id')
+              service_mode = 'UNIQUE_CANONICAL_SCORE'
+          elif services:
+              service_mode = 'AMBIGUOUS'
+
+          linked_offerings = [item for item in offerings if item.get('serviceId') == selected_service_id]
+          offering_best = max((score(item, ['name', 'supportHours']) for item in linked_offerings), default=0)
+          offering_ties = sum(
+              1 for item in linked_offerings if offering_best > 0 and score(item, ['name', 'supportHours']) == offering_best
+          )
+          if len(linked_offerings) == 1:
+              offering_mode = 'SOLE_LINKED_ACTIVE'
+          elif offering_best > 0 and offering_ties == 1:
+              offering_mode = 'UNIQUE_CANONICAL_SCORE'
+          elif not linked_offerings:
+              offering_mode = 'NONE_LINKED'
+          else:
+              offering_mode = 'AMBIGUOUS'
+
+          if len(cis) == 1:
+              ci_mode = 'SOLE_ACTIVE'
+          elif ci_best > 0 and ci_ties == 1:
+              ci_mode = 'UNIQUE_CANONICAL_SCORE'
+          elif not cis:
+              ci_mode = 'NONE'
+          else:
+              ci_mode = 'AMBIGUOUS'
+
+          choices = data.get('choices') if isinstance(data, dict) else {}
+          choices = choices if isinstance(choices, dict) else {}
+          errors = data.get('errors') if isinstance(data, dict) else []
+
+          report = [
+              '# Sanitized staging fixture candidate analysis',
+              '',
+              'No live UUID, label, credential, bearer token, or raw payload is included.',
+              '',
+              f'- Active assignment groups: `{len(groups)}`',
+              f'- Active CMDB services: `{len(services)}`',
+              f'- Service fallback mode: `{service_mode}`',
+              f'- Service best semantic score: `{service_best}`; tied best candidates: `{service_ties}`',
+              f'- Active offerings: `{len(offerings)}`',
+              f'- Active offerings linked to selected service: `{len(linked_offerings)}`',
+              f'- Offering fallback mode: `{offering_mode}`',
+              f'- Active configuration items: `{len(cis)}`',
+              f'- CI fallback mode: `{ci_mode}`',
+              f'- CI best semantic score: `{ci_best}`; tied best candidates: `{ci_ties}`',
+              f'- Pending-reason choices: `{len(choices.get("pendingReason", [])) if isinstance(choices.get("pendingReason"), list) else 0}`',
+              f'- Relationship-type choices: `{len(choices.get("relationshipType", [])) if isinstance(choices.get("relationshipType"), list) else 0}`',
+              f'- Impact-scope choices: `{len(choices.get("impactScope", [])) if isinstance(choices.get("impactScope"), list) else 0}`',
+              f'- Discovery error scopes: `{len(errors) if isinstance(errors, list) else 0}`',
+          ]
+          target.write_text('\n'.join(report) + '\n', encoding='utf-8')
+          PY
+
+          gh issue edit 23 \
+            --repo "$GITHUB_REPOSITORY" \
+            --title '[Closed] Sanitized staging fixture candidate analysis' \
+            --body-file "$report_file"
+
+      - name: Remove temporary material and this workflow
+        if: always()
+        run: |
+          set -euo pipefail
+          rm -rf "$HOME/.ssh"
+          git config user.name 'nvs-maintenance-bot'
+          git config user.email 'nvs-maintenance-bot@users.noreply.github.com'
+          git pull --ff-only origin main
+          rm -f .github/workflows/one-shot-analyze-staging-fixture-candidates.yml
+          if git diff --quiet --exit-code; then
+            exit 0
+          fi
+          git add .github/workflows/one-shot-analyze-staging-fixture-candidates.yml
+          git commit -m 'chore: remove completed staging fixture analyzer'
+          git push origin HEAD:main

@@ -1,0 +1,389 @@
+name: nvs-final-m1-02b-fix
+
+on:
+  push:
+    branches:
+      - agent/m1-02b-real-incident-api
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nvs-final-m1-02b-fix
+  cancel-in-progress: false
+
+jobs:
+  apply-and-verify:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: agent/m1-02b-real-incident-api
+          fetch-depth: 0
+          persist-credentials: true
+
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa
+        with:
+          version: 11.13.0
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.18.0
+          cache: pnpm
+
+      - name: Apply final safety fixes
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          def replace_exact(path: str, old: str, new: str, count: int = 1) -> None:
+              p = Path(path)
+              text = p.read_text()
+              actual = text.count(old)
+              if actual != count:
+                  raise SystemExit(f"{path}: expected {count} matches, found {actual} for replacement starting {old[:80]!r}")
+              p.write_text(text.replace(old, new, count))
+
+          core = 'packages/core/src/index.ts'
+          replace_exact(
+              core,
+              "  'NILES_UPSTREAM_FAILURE',\n  'NILES_LIVE_ADAPTER_FAILURE',\n]);",
+              "  'NILES_UPSTREAM_FAILURE',\n  'NILES_LIVE_ADAPTER_FAILURE',\n  'NILES_MALFORMED_RESPONSE',\n]);",
+          )
+
+          replace_exact(
+              core,
+              "function incidentCreateMarker(runId: string, runNamespacePrefix: string): string {\n  return `${runNamespacePrefix}-${runId}`;\n}\n",
+              """type SlaObservationPhase = 'active' | 'held' | 'resumed' | 'resolved';
+
+function slaObservationReady(
+  summary: NilesSlaSummary,
+  phase: SlaObservationPhase,
+  requiredObjectiveTypes: string[],
+): boolean {
+  const observed = observedSlaObjectiveTypes(summary);
+  if (requiredObjectiveTypes.some((objectiveType) => !observed.has(objectiveType))) {
+    return false;
+  }
+  if (phase === 'active') {
+    return summary.records.some((record) => isRunningSlaStatus(record.status));
+  }
+  if (phase === 'held') {
+    return summary.records.some(isCurrentlyPaused);
+  }
+  if (phase === 'resumed') {
+    return summary.records.length > 0 && !summary.records.some(isCurrentlyPaused);
+  }
+  return summary.records.some(isStoppedResolutionSlaRecord);
+}
+
+function incidentCreateMarker(runId: string, runNamespacePrefix: string): string {
+  return `${runNamespacePrefix}-${runId}`;
+}
+""",
+          )
+
+          replace_exact(
+              core,
+              "  backgroundCoordinator?: (operation: () => Promise<void>) => void;\n}",
+              "  backgroundCoordinator?: (operation: () => Promise<void>) => void;\n  slaObservationTimeoutMs?: number;\n  slaObservationIntervalMs?: number;\n}",
+          )
+
+          anchor = """      if (
+        fixture.resources.offering &&
+        verifiedOfferingServiceId !== fixture.resources.service.id
+      ) {
+        throw new LiveRunBlockedError(
+          'NILES_OFFERING_SERVICE_MISMATCH',
+          'The configured service offering does not belong to the configured CMDB service.',
+          'ENVIRONMENT',
+        );
+      }
+
+      for (const step of plan.steps) {
+"""
+          replacement = """      if (
+        fixture.resources.offering &&
+        verifiedOfferingServiceId !== fixture.resources.service.id
+      ) {
+        throw new LiveRunBlockedError(
+          'NILES_OFFERING_SERVICE_MISMATCH',
+          'The configured service offering does not belong to the configured CMDB service.',
+          'ENVIRONMENT',
+        );
+      }
+
+      const readSlaUntil = async (
+        phase: SlaObservationPhase,
+        correlationId: string,
+      ): Promise<{ summary: NilesSlaSummary; transports: NilesTransportEvidence[] }> => {
+        if (!incident) {
+          throw new LiveStepError(
+            typedError('ASSERTION', 'INCIDENT_NOT_CREATED', 'The incident must exist before SLA observation.'),
+          );
+        }
+        const timeoutMs = Math.max(0, live.slaObservationTimeoutMs ?? 10_000);
+        const intervalMs = Math.max(0, live.slaObservationIntervalMs ?? 250);
+        const deadline = Date.now() + timeoutMs;
+        const transports: NilesTransportEvidence[] = [];
+        let summary: NilesSlaSummary;
+        do {
+          summary = await live.incidentAdapter.readSlaSummary({
+            environment,
+            session: sessions!.serviceDesk,
+            tenantId: fixture.tenantId,
+            incidentId: incident.id,
+            correlationId,
+          });
+          if (summary.transport) transports.push(summary.transport);
+          if (
+            slaObservationReady(summary, phase, fixture.resources.sla.objectiveTypes) ||
+            !fixture.resources.sla.required ||
+            Date.now() >= deadline
+          ) {
+            return { summary, transports };
+          }
+          await new Promise<void>((resolve) => setTimeout(resolve, intervalMs));
+        } while (true);
+      };
+
+      for (const step of plan.steps) {
+"""
+          replace_exact(core, anchor, replacement)
+
+          replace_exact(
+              core,
+              """                const summary = await live.incidentAdapter.readSlaSummary({
+                  environment,
+                  session: sessions!.serviceDesk,
+                  tenantId: fixture.tenantId,
+                  incidentId: incident.id,
+                  correlationId,
+                });
+                const observedObjectiveTypes = observedSlaObjectiveTypes(summary);
+                const requiredObjectiveTypes = fixture.resources.sla.objectiveTypes;
+                const phase =
+                  step.source.blueprintStepId === 'observe-held-sla' ? 'held' : 'active';
+""",
+              """                const phase: SlaObservationPhase =
+                  step.source.blueprintStepId === 'observe-held-sla' ? 'held' : 'active';
+                const slaPoll = await readSlaUntil(phase, correlationId);
+                const summary = slaPoll.summary;
+                const observedObjectiveTypes = observedSlaObjectiveTypes(summary);
+                const requiredObjectiveTypes = fixture.resources.sla.objectiveTypes;
+""",
+          )
+          replace_exact(
+              core,
+              """                  ...transportObservation(summary.transport),
+                  incidentId: incident.id,
+                  slaRecords: summary.records.length,
+                  slaPhase: phase,
+""",
+              """                  ...transportObservation(summary.transport),
+                  ...operationsEvidence(slaPoll.transports),
+                  incidentId: incident.id,
+                  slaRecords: summary.records.length,
+                  slaPhase: phase,
+""",
+              count=2,
+          )
+
+          replace_exact(
+              core,
+              """                const resumedSla = await live.incidentAdapter
+                  .readSlaSummary({
+                    environment,
+                    session: sessions!.serviceDesk,
+                    tenantId: fixture.tenantId,
+                    incidentId: incident.id,
+                    correlationId,
+                  })
+                  .catch((error: Error) => {
+                    throw attachOperationEvidence(error, [incident!.transport]);
+                  });
+""",
+              """                const resumedPoll = await readSlaUntil('resumed', correlationId).catch(
+                  (error: Error) => {
+                    throw attachOperationEvidence(error, [incident!.transport]);
+                  },
+                );
+                const resumedSla = resumedPoll.summary;
+""",
+          )
+          replace_exact(
+              core,
+              "...operationsEvidence([incident.transport, resumedSla.transport]),",
+              "...operationsEvidence([incident.transport, ...resumedPoll.transports]),",
+              count=2,
+          )
+
+          replace_exact(
+              core,
+              """                const resolvedSla = await live.incidentAdapter
+                  .readSlaSummary({
+                    environment,
+                    session: sessions!.serviceDesk,
+                    tenantId: fixture.tenantId,
+                    incidentId: incident.id,
+                    correlationId,
+                  })
+                  .catch((error: Error) => {
+                    throw attachOperationEvidence(error, [incident!.transport]);
+                  });
+""",
+              """                const resolvedPoll = await readSlaUntil('resolved', correlationId).catch(
+                  (error: Error) => {
+                    throw attachOperationEvidence(error, [incident!.transport]);
+                  },
+                );
+                const resolvedSla = resolvedPoll.summary;
+""",
+          )
+          replace_exact(
+              core,
+              "...operationsEvidence([incident.transport, resolvedSla.transport]),",
+              "...operationsEvidence([incident.transport, ...resolvedPoll.transports]),",
+              count=2,
+          )
+
+          contracts = 'packages/contracts/src/index.ts'
+          replace_exact(contracts, ".default({ relationshipType: 'affected', impactScope: 'service-impact' })", ".default({ relationshipType: 'affected_by', impactScope: 'service_impacting' })")
+
+          fixture_file = 'config/fixtures/niles-incident-payment.example.yaml'
+          replace_exact(fixture_file, 'relationshipType: affected\n    impactScope: service-impact', 'relationshipType: affected_by\n    impactScope: service_impacting')
+          replace_exact(fixture_file, 'pendingReason: external_provider', 'pendingReason: pending_external_dependency')
+
+          test_file = 'tests/live-incident.test.ts'
+          replace_exact(test_file, "affectedCi: { relationshipType: 'affected', impactScope: 'service-impact' }", "affectedCi: { relationshipType: 'affected_by', impactScope: 'service_impacting' }")
+          replace_exact(test_file, "pendingReason: 'external_provider'", "pendingReason: 'pending_external_dependency'")
+          replace_exact(
+              test_file,
+              """      correlationIdFactory: (seed) => `live_${seed.replace(/[^a-z0-9]+/gi, '_').toLowerCase()}`,
+      ...(backgroundCoordinator ? { backgroundCoordinator } : {}),
+""",
+              """      correlationIdFactory: (seed) => `live_${seed.replace(/[^a-z0-9]+/gi, '_').toLowerCase()}`,
+      slaObservationTimeoutMs: 20,
+      slaObservationIntervalMs: 1,
+      ...(backgroundCoordinator ? { backgroundCoordinator } : {}),
+""",
+          )
+
+          malformed_test_anchor = """  it('keeps observations discoverable after an intermediate-step persistence failure', async () => {
+"""
+          malformed_test = """  it('keeps malformed successful create responses recovery-required because creation may have committed', async () => {
+    class MalformedCreateError extends Error {
+      readonly code = 'NILES_MALFORMED_RESPONSE';
+      readonly category = 'ADAPTER';
+      readonly retryable = false;
+      readonly transport = {
+        method: 'POST' as const,
+        pathTemplate: '/grc/itsm/incidents',
+        httpStatus: 201,
+        durationMs: 9,
+        correlationId: 'create_201_without_identity',
+      };
+    }
+    class MalformedCreateAdapter extends StatefulIncidentAdapter {
+      serverSideCreateSideEffect = false;
+      override async createIncident(): Promise<NilesIncidentRecord> {
+        this.operations.push('POST create incident');
+        this.serverSideCreateSideEffect = true;
+        throw new MalformedCreateError('201 response omitted the incident identity');
+      }
+    }
+    const adapter = new MalformedCreateAdapter();
+    const core = buildCore(adapter);
+    await expect(
+      core.createLiveApiRun({
+        runId: 'live-malformed-create',
+        environmentId: 'live-test',
+        scenarioId: 'payment-api-service-degradation',
+        variationValues: { journey: 'normal' },
+        confirmRealMutation: true,
+        now: '2026-07-15T12:00:00.000Z',
+      }),
+    ).rejects.toMatchObject({ code: 'NILES_CREATE_OUTCOME_UNKNOWN' });
+    expect(adapter.serverSideCreateSideEffect).toBe(true);
+    expect((await core.getRunProgress('live-malformed-create')).status).toBe('RECOVERY_REQUIRED');
+    await expect(
+      new FilesystemRunBundleRepository(temporaryRoot).get('live-malformed-create'),
+    ).resolves.toBeUndefined();
+  });
+
+""" + malformed_test_anchor
+          replace_exact(test_file, malformed_test_anchor, malformed_test)
+
+          polling_anchor = """  it('blocks required SLA when only the response objective is observable', async () => {
+"""
+          polling_test = """  it('polls read-only SLA observations until the held posture becomes visible', async () => {
+    class EventuallyHeldSlaAdapter extends StatefulIncidentAdapter {
+      heldReads = 0;
+      override async readSlaSummary(): Promise<NilesSlaSummary> {
+        if (this.incident.status === 'on_hold') this.heldReads += 1;
+        const heldVisible = this.incident.status === 'on_hold' && this.heldReads >= 2;
+        const resolved = this.incident.status === 'resolved' || this.incident.status === 'closed';
+        return {
+          transport: {
+            method: 'GET',
+            pathTemplate: '/grc/itsm/sla/records/INCIDENT/:incidentId',
+            httpStatus: 200,
+            durationMs: 1,
+            correlationId: `sla_poll_${this.heldReads}`,
+          },
+          records: ['response', 'resolution'].map((objectiveType) => ({
+            id: `sla-${objectiveType}`,
+            objectiveType,
+            status: resolved ? 'COMPLETED' : heldVisible ? 'PAUSED' : 'IN_PROGRESS',
+            ...(heldVisible ? { pauseAt: '2026-07-15T12:00:00.000Z' } : {}),
+            ...(resolved && objectiveType === 'resolution'
+              ? { stopAt: '2026-07-15T12:00:00.000Z' }
+              : {}),
+          })),
+        };
+      }
+    }
+    const adapter = new EventuallyHeldSlaAdapter();
+    const run = await buildCore(adapter).createLiveApiRun({
+      runId: 'live-eventual-held-sla',
+      environmentId: 'live-test',
+      scenarioId: 'payment-api-service-degradation',
+      variationValues: { journey: 'normal' },
+      confirmRealMutation: true,
+      now: '2026-07-15T12:00:00.000Z',
+    });
+    expect(run.error?.code).not.toBe('SLA_PAUSE_NOT_OBSERVED');
+    expect(adapter.heldReads).toBeGreaterThanOrEqual(2);
+  });
+
+""" + polling_anchor
+          replace_exact(test_file, polling_anchor, polling_test)
+          PY
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run focused regressions
+        run: pnpm exec vitest run tests/niles-incident-adapter.test.ts tests/live-incident.test.ts tests/storage.test.ts
+
+      - name: Run full quality gate
+        run: pnpm run ci
+
+      - name: Validate shell and diff
+        shell: bash
+        run: |
+          bash -n ops/*.sh ops/ci/*.sh
+          git diff --check
+          ! git grep -nE '(-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----|gh[pousr]_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9]{20,}|Bearer[[:space:]]+[A-Za-z0-9._~-]{16,}|AKIA[0-9A-Z]{16})' -- ':!pnpm-lock.yaml' ':!**/node_modules/**' ':!**/dist/**' ':!**/test-results/**' ':!**/playwright-report/**' ':!tests/**' || false
+
+      - name: Commit verified fixes and remove one-time workflow
+        shell: bash
+        run: |
+          rm .github/workflows/nvs-final-m1-02b-fix.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add packages/core/src/index.ts packages/contracts/src/index.ts config/fixtures/niles-incident-payment.example.yaml tests/live-incident.test.ts .github/workflows/nvs-final-m1-02b-fix.yml
+          git commit -m "fix: close final M1-02B safety blockers"
+          git push origin HEAD:agent/m1-02b-real-incident-api

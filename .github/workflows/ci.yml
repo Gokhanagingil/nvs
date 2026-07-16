@@ -98,6 +98,7 @@ jobs:
           git fetch --quiet origin fix/bootstrap-configuration-approver
           pnpm install --frozen-lockfile --reporter=silent
 
+          mkdir -p tools
           git show \
             origin/fix/bootstrap-configuration-approver:tools/apply-bootstrap-configuration-approver-v2.py \
             > tools/.tmp-apply-bootstrap-configuration-approver.py

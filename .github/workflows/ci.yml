@@ -108,10 +108,31 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm exec playwright install --with-deps chromium
       - name: Verify transformed tree
+        shell: bash
         run: |
-          corepack pnpm run ci
-          bash -n ops/*.sh ops/ci/*.sh
-          git diff --check
+          set +e
+          {
+            corepack pnpm run ci
+            verify_status=$?
+            if [ "$verify_status" -eq 0 ]; then
+              bash -n ops/*.sh ops/ci/*.sh
+              verify_status=$?
+            fi
+            if [ "$verify_status" -eq 0 ]; then
+              git diff --check
+              verify_status=$?
+            fi
+          } > .github/verification-error.txt 2>&1
+          cat .github/verification-error.txt
+          if [ "$verify_status" -ne 0 ]; then
+            git config user.name "nvs-maintenance-bot"
+            git config user.email "nvs-maintenance-bot@users.noreply.github.com"
+            git add -f .github/verification-error.txt
+            git commit -m "chore: capture M1-02B verification error"
+            git push origin HEAD:agent/m1-02b-real-incident-api
+            exit "$verify_status"
+          fi
+          rm -f .github/verification-error.txt
       - name: Commit verified changes
         run: |
           git config user.name "nvs-maintenance-bot"

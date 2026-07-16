@@ -106,3 +106,4 @@ jobs:
           git push origin HEAD:main
 
 # Reviewed manual retrigger: 2026-07-16
+# PR-mediated retrigger: 2026-07-16

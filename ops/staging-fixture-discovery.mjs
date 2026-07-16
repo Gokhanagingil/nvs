@@ -3,8 +3,20 @@ import path from 'node:path';
 
 const CONFIG_DIR = process.env.NVS_CONFIG_DIR || '/app/config';
 const environmentId = process.env.NVS_DISCOVERY_ENVIRONMENT_ID || 'staging-example';
-const query = (process.env.NVS_DISCOVERY_QUERY || '').trim();
+const commonQuery = (process.env.NVS_DISCOVERY_QUERY || '').trim();
 const REQUEST_TIMEOUT_MS = 8_000;
+
+function scopedQuery(environmentName) {
+  const value = process.env[environmentName];
+  return (value === undefined ? commonQuery : value).trim();
+}
+
+const queries = Object.freeze({
+  assignmentGroups: scopedQuery('NVS_DISCOVERY_GROUP_QUERY'),
+  services: scopedQuery('NVS_DISCOVERY_SERVICE_QUERY'),
+  offerings: scopedQuery('NVS_DISCOVERY_OFFERING_QUERY'),
+  configurationItems: scopedQuery('NVS_DISCOVERY_CI_QUERY'),
+});
 
 class DiscoveryError extends Error {
   constructor(code, message, httpStatus) {
@@ -243,6 +255,15 @@ function sortByName(items) {
   );
 }
 
+function validateQuery(value, scope) {
+  if (value.length > 100 || /[\u0000-\u001f\u007f]/u.test(value)) {
+    throw new DiscoveryError(
+      'DISCOVERY_QUERY_INVALID',
+      `The ${scope} discovery query is invalid.`,
+    );
+  }
+}
+
 async function main() {
   if (!/^[a-z0-9][a-z0-9._-]{0,95}$/u.test(environmentId)) {
     throw new DiscoveryError(
@@ -250,8 +271,9 @@ async function main() {
       'The requested NVS environment identifier is invalid.',
     );
   }
-  if (query.length > 100 || /[\u0000-\u001f\u007f]/u.test(query)) {
-    throw new DiscoveryError('DISCOVERY_QUERY_INVALID', 'The discovery query is invalid.');
+  validateQuery(commonQuery, 'common');
+  for (const [scope, value] of Object.entries(queries)) {
+    validateQuery(value, scope);
   }
 
   const environments = await readYamlDirectory(path.join(CONFIG_DIR, 'environments'));
@@ -366,25 +388,32 @@ async function main() {
     }
   }
 
-  const search = encodeURIComponent(query);
+  const groupSearch = encodeURIComponent(queries.assignmentGroups);
+  const serviceSearch = encodeURIComponent(queries.services);
+  const offeringSearch = encodeURIComponent(queries.offerings);
+  const ciSearch = encodeURIComponent(queries.configurationItems);
   const assignmentGroups = await discoverScope(
     'assignment-groups',
-    `/grc/groups/directory?page=1&pageSize=100${query ? `&search=${search}` : ''}`,
+    `/grc/groups/directory?page=1&pageSize=100${
+      queries.assignmentGroups ? `&search=${groupSearch}` : ''
+    }`,
     selectGroup,
   );
   const services = await discoverScope(
     'services',
-    `/grc/cmdb/services?page=1&pageSize=100${query ? `&search=${search}` : ''}`,
+    `/grc/cmdb/services?page=1&pageSize=100${queries.services ? `&search=${serviceSearch}` : ''}`,
     selectService,
   );
   const offerings = await discoverScope(
     'service-offerings',
-    `/grc/cmdb/service-offerings?page=1&pageSize=100${query ? `&search=${search}` : ''}`,
+    `/grc/cmdb/service-offerings?page=1&pageSize=100${
+      queries.offerings ? `&search=${offeringSearch}` : ''
+    }`,
     selectOffering,
   );
   const configurationItems = await discoverScope(
     'configuration-items',
-    `/grc/cmdb/cis/search?limit=100${query ? `&q=${search}` : ''}`,
+    `/grc/cmdb/cis/search?limit=100${queries.configurationItems ? `&q=${ciSearch}` : ''}`,
     selectCi,
   );
 
@@ -404,7 +433,8 @@ async function main() {
     schemaVersion: 'nvs.staging-fixture-discovery/v1',
     environmentId,
     tenantId,
-    query,
+    query: commonQuery,
+    queries,
     candidates: {
       assignmentGroups: sortByName(assignmentGroups),
       services: sortByName(services),

@@ -84,16 +84,9 @@ jobs:
         shell: bash
         run: |
           set +e
-          {
-            node .github/scripts/m1-02b-finalize-hotfix.mjs
-            hotfix_status=$?
-            if [ "$hotfix_status" -eq 0 ]; then
-              node .github/scripts/m1-02b-finalize.mjs
-              apply_status=$?
-            else
-              apply_status=$hotfix_status
-            fi
-          } > .github/finalizer-error.txt 2>&1
+          rm -f .github/finalizer-error.txt
+          node .github/scripts/m1-02b-finalize.mjs > .github/finalizer-error.txt 2>&1
+          apply_status=$?
           cat .github/finalizer-error.txt
           if [ "$apply_status" -ne 0 ]; then
             git config user.name "nvs-maintenance-bot"

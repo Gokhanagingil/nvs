@@ -1,0 +1,320 @@
+        latest = progress
+        state = progress.get(\"status\")
+        if state == \"COMPLETED\":
+            _run_status, run = _json_request(f\"/api/runs/{run_id}\", timeout=30)
+            if not isinstance(run, dict):
+                raise AcceptanceError(\"FINAL_RUN_INVALID\", \"NVS returned an invalid final run.\")
+            return progress, run
+        if state == \"RECOVERY_REQUIRED\":
+            return progress, None
+        time.sleep(POLL_INTERVAL_SECONDS)
+    raise AcceptanceError(
+        \"LIVE_RUN_TIMEOUT\",
+        \"The live run did not reach a terminal state before the safety deadline.\",
+        result=\"RECOVERY_REQUIRED\",
+    )
+
+
+def _classify(run: Mapping[str, Any]) -> tuple[str, bool, dict[str, Any]]:
+    verdict = run.get(\"verdict\")
+    error = run.get(\"error\")
+    error_code = error.get(\"code\") if isinstance(error, dict) else None
+    cleanup = run.get(\"cleanup\") if isinstance(run.get(\"cleanup\"), dict) else {}
+    inventory = run.get(\"resourceInventory\") if isinstance(run.get(\"resourceInventory\"), dict) else {}
+    incident = inventory.get(\"incident\") if isinstance(inventory.get(\"incident\"), dict) else {}
+    steps = run.get(\"stepResults\") if isinstance(run.get(\"stepResults\"), list) else []
+    required_steps = [step for step in steps if isinstance(step, dict) and step.get(\"required\", True)]
+    passed_required = [step for step in required_steps if step.get(\"executionStatus\") == \"PASS\"]
+    nonpass_required = [step for step in required_steps if step.get(\"executionStatus\") != \"PASS\"]
+
+    accepted_close_blocker = (
+        verdict == \"BLOCKED\"
+        and error_code == \"NILES_CLOSE_AUTHORITY_UNSATISFIABLE\"
+        and cleanup.get(\"status\") == \"CLEAN\"
+        and cleanup.get(\"policy\") == \"DELETE_IF_RUN_OWNED\"
+        and incident.get(\"disposition\") == \"DELETED\"
+        and len(nonpass_required) == 1
+        and isinstance(nonpass_required[0].get(\"error\"), dict)
+        and nonpass_required[0][\"error\"].get(\"code\") == \"NILES_CLOSE_AUTHORITY_UNSATISFIABLE\"
+    )
+    passed = verdict == \"PASS\" or accepted_close_blocker
+    classification = (
+        \"PASS\"
+        if verdict == \"PASS\"
+        else \"ACCEPTED_WITH_PRODUCT_BLOCKER\"
+        if accepted_close_blocker
+        else \"NOT_ACCEPTED\"
+    )
+    summary = {
+        \"classification\": classification,
+        \"verdict\": verdict,
+        \"errorCode\": error_code,
+        \"requiredStepsPassed\": len(passed_required),
+        \"requiredStepsTotal\": len(required_steps),
+        \"cleanupStatus\": cleanup.get(\"status\"),
+        \"cleanupPolicy\": cleanup.get(\"policy\"),
+        \"incidentDisposition\": incident.get(\"disposition\"),
+    }
+    return classification, passed, summary
+
+
+def _print_summary(
+    *,
+    result: str,
+    run_id: str,
+    build_sha: str,
+    report_path: Path | None,
+    summary: Mapping[str, Any] | None = None,
+    error: AcceptanceError | None = None,
+    restore_status: str | None = None,
+) -> None:
+    print(\"# NVS M1-02B staging acceptance\")
+    print()
+    print(f\"- Result: `{result}`\")
+    print(f\"- Run ID: `{run_id}`\")
+    print(f\"- Deployed build SHA: `{build_sha}`\")
+    if summary:
+        print(f\"- Final NVS verdict: `{summary.get('verdict')}`\")
+        print(f\"- Final error code: `{summary.get('errorCode') or 'NONE'}`\")
+        print(
+            f\"- Required steps: `{summary.get('requiredStepsPassed')}/{summary.get('requiredStepsTotal')}` PASS\"
+        )
+        print(
+            f\"- Cleanup: `{summary.get('cleanupStatus')}` / `{summary.get('cleanupPolicy')}`\"
+        )
+        print(f\"- Incident disposition: `{summary.get('incidentDisposition') or 'UNKNOWN'}`\")
+    if error:
+        print(f\"- Error code: `{error.code}`\")
+        print(f\"- Error: {error}\")
+    if report_path:
+        print(f\"- Private server report: `{report_path}`\")
+    if restore_status:
+        print(f\"- Mutation lease cleanup: `{restore_status}`\")
+    print()
+    print(\"No credential, bearer token, raw payload, Incident UUID, or Incident number is printed here.\")
+
+
+def _run_acceptance(args: argparse.Namespace) -> int:
+    if not SAFE_ID.fullmatch(args.environment_id):
+        raise AcceptanceError(\"INVALID_ENVIRONMENT_ID\", \"environment_id is invalid.\")
+    if not SAFE_ID.fullmatch(args.run_id):
+        raise AcceptanceError(\"INVALID_RUN_ID\", \"run_id is invalid.\")
+    if not FULL_SHA.fullmatch(args.expected_sha):
+        raise AcceptanceError(\"INVALID_EXPECTED_SHA\", \"expected_sha must be a full Git SHA.\")
+    if args.confirmation != \"RUN_M1_02B_LIVE_INCIDENT\":
+        raise AcceptanceError(
+            \"LIVE_MUTATION_CONFIRMATION_REQUIRED\",
+            \"The exact live Incident confirmation phrase is required.\",
+            result=\"BLOCKED\",
+        )
+
+    metadata = _runtime_metadata()
+    if metadata[\"buildSha\"] != args.expected_sha:
+        raise AcceptanceError(
+            \"DEPLOYED_SHA_MISMATCH\",
+            \"The running NVS build does not match expected_sha.\",
+            result=\"BLOCKED\",
+        )
+    raw, _stat = _read_env()
+    if _switch_value(raw) == \"true\":
+        raise AcceptanceError(
+            \"MUTATION_SWITCH_ALREADY_ENABLED\",
+            \"The mutation switch is already enabled outside this workflow.\",
+            result=\"BLOCKED\",
+        )
+
+    lease = _create_lease(args.lease_id, metadata)
+    _launch_watchdog(lease)
+    private_report: Path | None = None
+    final_summary: dict[str, Any] | None = None
+    primary_error: AcceptanceError | None = None
+    result = \"FAIL\"
+    exit_code = 1
+    restore_status: str | None = None
+
+    try:
+        _rewrite_switch(True)
+        _recreate(metadata)
+        readiness = _confirm_readiness(args.environment_id)
+        accepted = _start_live_run(args.environment_id, args.run_id)
+        progress, run = _poll_run(args.run_id)
+        report = {
+            \"schemaVersion\": \"nvs.staging-acceptance-report/v1\",
+            \"runId\": args.run_id,
+            \"deployedBuildSha\": metadata[\"buildSha\"],
+            \"accepted\": accepted,
+            \"confirmedReadiness\": readiness,
+            \"progress\": progress,
+            \"run\": run,
+            \"completedAt\": _iso(_utc_now()),
+        }
+        private_report = _store_private_report(args.run_id, report)
+        if run is None:
+            checkpoint = progress.get(\"checkpoint\") if isinstance(progress.get(\"checkpoint\"), dict) else {}
+            code = (
+                checkpoint.get(\"error\", {}).get(\"code\")
+                if isinstance(checkpoint.get(\"error\"), dict)
+                else \"LIVE_RUN_REQUIRES_RECOVERY\"
+            )
+            raise AcceptanceError(
+                code or \"LIVE_RUN_REQUIRES_RECOVERY\",
+                \"The live run requires operator recovery.\",
+                result=\"RECOVERY_REQUIRED\",
+            )
+        classification, passed, final_summary = _classify(run)
+        result = classification
+        exit_code = 0 if passed else 2
+        if not passed:
+            primary_error = AcceptanceError(
+                str(final_summary.get(\"errorCode\") or \"LIVE_RUN_NOT_ACCEPTED\"),
+                \"The final run did not meet the M1-02B staging acceptance contract.\",
+                result=\"BLOCKED\" if run.get(\"verdict\") == \"BLOCKED\" else \"FAIL\",
+            )
+    except AcceptanceError as error:
+        primary_error = error
+        result = error.result
+        exit_code = 3 if error.result == \"RECOVERY_REQUIRED\" else 2 if error.result == \"BLOCKED\" else 1
+        if private_report is None:
+            try:
+                progress_status, progress = _json_request(
+                    f\"/api/runs/{args.run_id}/progress\",
+                    allow_statuses={404},
+                    timeout=15,
+                )
+                private_report = _store_private_report(
+                    args.run_id,
+                    {
+                        \"schemaVersion\": \"nvs.staging-acceptance-report/v1\",
+                        \"runId\": args.run_id,
+                        \"deployedBuildSha\": metadata[\"buildSha\"],
+                        \"progress\": progress if progress_status != 404 else None,
+                        \"operatorError\": {\"code\": error.code, \"result\": error.result},
+                        \"completedAt\": _iso(_utc_now()),
+                    },
+                )
+            except Exception:
+                private_report = None
+    finally:
+        try:
+            restore_status = _restore_from_lease(args.lease_id, allow_orphan_disable=False)
+        except AcceptanceError as cleanup_error:
+            _print_summary(
+                result=\"MUTATION_DISABLE_RECOVERY_REQUIRED\",
+                run_id=args.run_id,
+                build_sha=metadata[\"buildSha\"],
+                report_path=private_report,
+                summary=final_summary,
+                error=cleanup_error,
+                restore_status=\"FAILED\",
+            )
+            return 4
+
+    _print_summary(
+        result=result,
+        run_id=args.run_id,
+        build_sha=metadata[\"buildSha\"],
+        report_path=private_report,
+        summary=final_summary,
+        error=primary_error,
+        restore_status=restore_status,
+    )
+    return exit_code
+
+
+def _watchdog(args: argparse.Namespace) -> int:
+    try:
+        lease = _read_lease()
+        if lease is None or lease.get(\"leaseId\") != args.lease_id:
+            return 0
+        expires_at = datetime.fromisoformat(str(lease.get(\"expiresAt\")))
+        delay = max(0.0, (expires_at - _utc_now()).total_seconds())
+        time.sleep(delay)
+        _restore_from_lease(args.lease_id, allow_orphan_disable=True)
+        return 0
+    except Exception:
+        return 1
+
+
+def _force_disable(args: argparse.Namespace) -> int:
+    try:
+        status = _restore_from_lease(args.lease_id or None, allow_orphan_disable=True)
+        print(\"# NVS mutation safety cleanup\")
+        print()
+        print(f\"- Status: `{status}`\")
+        print(\"- Mutation switch: `DISABLED`\")
+        return 0
+    except AcceptanceError as error:
+        print(\"# NVS mutation safety cleanup\")
+        print()
+        print(\"**Result:** FAIL\")
+        print()
+        print(f\"- Error code: `{error.code}`\")
+        print(f\"- Error: {error}\")
+        return 1
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=\"Guarded M1-02B live staging acceptance.\")
+    subparsers = parser.add_subparsers(dest=\"command\", required=True)
+
+    run_parser = subparsers.add_parser(\"run\")
+    run_parser.add_argument(\"--environment-id\", default=\"staging-example\")
+    run_parser.add_argument(\"--expected-sha\", required=True)
+    run_parser.add_argument(\"--run-id\", required=True)
+    run_parser.add_argument(\"--lease-id\", required=True)
+    run_parser.add_argument(\"--confirmation\", required=True)
+
+    watchdog_parser = subparsers.add_parser(\"watchdog\")
+    watchdog_parser.add_argument(\"--lease-id\", required=True)
+
+    cleanup_parser = subparsers.add_parser(\"force-disable\")
+    cleanup_parser.add_argument(\"--lease-id\", default=\"\")
+
+    args = parser.parse_args()
+    if args.command == \"run\":
+        try:
+            return _run_acceptance(args)
+        except AcceptanceError as error:
+            print(\"# NVS M1-02B staging acceptance\")
+            print()
+            print(f\"**Result:** {error.result}\")
+            print()
+            print(f\"- Error code: `{error.code}`\")
+            print(f\"- Error: {error}\")
+            return 2 if error.result == \"BLOCKED\" else 1
+        except Exception:
+            print(\"# NVS M1-02B staging acceptance\")
+            print()
+            print(\"**Result:** FAIL\")
+            print()
+            print(\"An unexpected local acceptance error occurred; run force-disable immediately.\")
+            return 1
+    if args.command == \"watchdog\":
+        return _watchdog(args)
+    return _force_disable(args)
+
+
+if __name__ == \"__main__\":
+    raise SystemExit(main())
+"
+
+[36m [2m❯[22m tests/staging-operator-assets.test.ts:[2m130:28[22m[39m
+    [90m128|[39m     [34mexpect[39m(acceptance)[33m.[39m[34mtoContain[39m([32m'LEASE_TTL_SECONDS'[39m)[33m;[39m
+    [90m129|[39m     [34mexpect[39m(acceptance)[33m.[39m[34mtoContain[39m([32m'RECOVERY_REQUIRED'[39m)[33m;[39m
+    [90m130|[39m     expect(acceptance).not.toMatch(/print\([^)]*(accessToken|password|…
+    [90m   |[39m                            [31m^[39m
+    [90m131|[39m     [34mexpect[39m(operatorWorkflow)[33m.[39m[34mtoContain[39m([32m'staging-discovery-store.py'[39m)[33m;[39m
+    [90m132|[39m     expect(fixtureWorkflow).not.toContain('NVS_ENABLE_NILES_MUTATIONS=…
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯[22m[39m
+
+
+[2m Test Files [22m [1m[31m1 failed[39m[22m[2m | [22m[1m[32m13 passed[39m[22m[90m (14)[39m
+[2m      Tests [22m [1m[31m1 failed[39m[22m[2m | [22m[1m[32m159 passed[39m[22m[90m (160)[39m
+[2m   Start at [22m 08:36:05
+[2m   Duration [22m 2.82s[2m (transform 503ms, setup 0ms, import 2.00s, tests 4.34s, environment 1ms)[22m
+
+
+::error file=/home/runner/work/nvs/nvs/tests/staging-operator-assets.test.ts,title=tests/staging-operator-assets.test.ts > browser-triggered staging operator assets > keeps credentials%2C proposal identities%2C and live record identities out of public output,line=130,column=28::AssertionError: expected '#!/usr/bin/env python3\nfrom __future…' not to match /print\([^)]*(accessToken|password|cre…/%0A%0A- Expected:%0A/print\([^)]*(accessToken|password|credential)/%0A%0A+ Received:%0A"#!/usr/bin/env python3%0Afrom __future__ import annotations%0A%0Aimport argparse%0Aimport fcntl%0Aimport hashlib%0Aimport json%0Aimport os%0Aimport re%0Aimport shutil%0Aimport signal%0Aimport subprocess%0Aimport sys%0Aimport tempfile%0Aimport time%0Aimport urllib.error%0Aimport urllib.request%0Afrom datetime import datetime, timedelta, timezone%0Afrom pathlib import Path%0Afrom typing import Any, Mapping%0A%0ASAFE_ID = re.compile(r\"^[a-z0-9][a-z0-9._-]{0,95}$\")%0AFULL_SHA = re.compile(r\"^[0-9a-f]{40}$\")%0ADEPLOY_ROOT = Path(\"/opt/nvs\")%0ARELEASE_ROOT = DEPLOY_ROOT / \"releases\"%0AENV_FILE = DEPLOY_ROOT / \".env\"%0AACTIVE_LEASE = RELEASE_ROOT / \".nvs-mutation-lease-active.json\"%0ACLEANUP_LOCK = RELEASE_ROOT / \".nvs-mutation-cleanup.lock\"%0ABASE_URL = \"http://127.0.0.1:4100\"%0ASCENARIO_ID = \"payment-api-service-degradation\"%0AVARIATION_VALUES = {\"journey\": \"normal\"}%0ALEASE_TTL_SECONDS = 15 * 60%0ARUN_TIMEOUT_SECONDS = 10 * 60%0APOLL_INTERVAL_SECONDS = 2.0%0A%0A%0Aclass AcceptanceError(RuntimeError):%0A    def __init__(self, code: str, message: str, *, result: str = \"FAIL\") -> None:%0A        super().__init__(message)%0A        self.code = code%0A        self.result = result%0A%0A%0Adef _utc_now() -> datetime:%0A    return datetime.now(timezone.utc)%0A%0A%0Adef _iso(value: datetime) -> str:%0A    return value.isoformat()%0A%0A%0Adef _run_command(%0A    command: list[str],%0A    *,%0A    env: dict[str, str] | None = None,%0A    timeout: int = 180,%0A) -> str:%0A    try:%0A        completed = subprocess.run(%0A            command,%0A            env=env,%0A            stdout=subprocess.PIPE,%0A            stderr=subprocess.PIPE,%0A            text=True,%0A            timeout=timeout,%0A            check=False,%0A        )%0A    except (FileNotFoundError, subprocess.TimeoutExpired) as error:%0A        raise AcceptanceError(%0A            \"LOCAL_COMMAND_UNAVAILABLE\",%0A            f\"Required local command could not complete: {command[0]}.\",%0A        ) from error%0A    if completed.returncode != 0:%0A        raise AcceptanceError(%0A            \"LOCAL_COMMAND_FAILED\",%0A            f\"Required local command failed safely: {command[0]}.\",%0A        )%0A    return completed.stdout.strip()%0A%0A%0Adef _read_json_response(response: Any, scope: str) -> Any:%0A    raw = response.read()%0A    try:%0A        return json.loads(raw.decode(\"utf-8\"))%0A    except (UnicodeDecodeError, json.JSONDecodeError) as error:%0A        raise AcceptanceError(%0A            \"NVS_RESPONSE_MALFORMED\",%0A            f\"{scope} returned invalid JSON.\",%0A        ) from error%0A%0A%0Adef _json_request(%0A    path: str,%0A    *,%0A    method: str = \"GET\",%0A    body: Mapping[str, Any] | None = None,%0A    timeout: float = 30.0,%0A    allow_statuses: set[int] | None = None,%0A) -> tuple[int, Any]:%0A    data = None if body is None else json.dumps(body, separators=(\",\", \":\")).encode(\"utf-8\")%0A    request = urllib.request.Request(%0A        f\"{BASE_URL}/{path.lstrip('/')}\",%0A        data=data,%0A        method=method,%0A        headers={%0A            \"accept\": \"application/json\",%0A            **({\"content-type\": \"application/json\"} if body is not None else {}),%0A        },%0A    )%0A    try:%0A        with urllib.request.urlopen(request, timeout=timeout) as response:%0A            return response.status, _read_json_response(response, f\"{method} {path}\")%0A    except urllib.error.HTTPError as error:%0A        payload: Any = None%0A        try:%0A            payload = _read_json_response(error, f\"{method} {path}\")%0A        except AcceptanceError:%0A            payload = None%0A        if allow_statuses and error.code in allow_statuses:%0A            return error.code, payload%0A        code = None%0A        if isinstance(payload, dict) and isinstance(payload.get(\"error\"), dict):%0A            candidate = payload[\"error\"].get(\"code\")%0A            code = candidate if isinstance(candidate, str) else None%0A        raise AcceptanceError(%0A            code or \"NVS_HTTP_FAILURE\",%0A            f\"{method} {path} returned HTTP {error.code}.\",%0A        ) from error%0A    except (urllib.error.URLError, TimeoutError) as error:%0A        raise AcceptanceError(%0A            \"NVS_CONTROL_PLANE_UNREACHABLE\",%0A            f\"{method} {path} could not reach the local NVS control plane.\",%0A        ) from error%0A%0A%0Adef _safe_atomic_write(path: Path, payload: bytes, *, mode: int, uid: int, gid: int) -> None:%0A    if path.is_symlink():%0A        raise AcceptanceError(\"UNSAFE_SYMBOLIC_LINK\", f\"Refusing symbolic-link path: {path}.\")%0A    descriptor, temporary_name = tempfile.mkstemp(%0A        prefix=f\".{path.name}.\", suffix=\".tmp\", dir=path.parent%0A    )%0A    temporary = Path(temporary_name)%0A    try:%0A        os.fchmod(descriptor, mode)%0A        with os.fdopen(descriptor, \"wb\", closefd=True) as handle:%0A            handle.write(payload)%0A            handle.flush()%0A            os.fsync(handle.fileno())%0A        try:%0A            os.chown(temporary, uid, gid)%0A        except PermissionError:%0A            pass%0A        os.replace(temporary, path)%0A        os.chmod(path, mode)%0A    finally:%0A        try:%0A            temporary.unlink()%0A        except FileNotFoundError:%0A            pass%0A%0A%0Adef _read_env() -> tuple[bytes, os.stat_result]:%0A    if ENV_FILE.is_symlink() or not ENV_FILE.is_file():%0A        raise AcceptanceError(%0A            \"ENV_FILE_UNSAFE\",%0A            \"The server-owned NVS .env file is unavailable or unsafe.\",%0A        )%0A    try:%0A        return ENV_FILE.read_bytes(), ENV_FILE.stat()%0A    except OSError as error:%0A        raise AcceptanceError(\"ENV_FILE_UNREADABLE\", \"The NVS .env file could not be read.\") from error%0A%0A%0Adef _switch_value(raw: bytes) -> str:%0A    try:%0A        text = raw.decode(\"utf-8\")%0A    except UnicodeDecodeError as error:%0A        raise AcceptanceError(\"ENV_FILE_INVALID\", \"The NVS .env file is not UTF-8.\") from error%0A    observed = \"false\"%0A    for raw_line in text.splitlines():%0A        line = raw_line.strip()%0A        if not line or line.startswith(\"#\") or \"=\" not in line:%0A            continue%0A        key, value = line.split(\"=\", 1)%0A        if key.strip() == \"NVS_ENABLE_NILES_MUTATIONS\":%0A            observed = value.strip().strip(\"'\\\"\").casefold()%0A    return observed%0A%0A%0Adef _rewrite_switch(enabled: bool) -> None:%0A    raw, stat = _read_env()%0A    text = raw.decode(\"utf-8\")%0A    replacement = f\"NVS_ENABLE_NILES_MUTATIONS={'true' if enabled else 'false'}\"%0A    lines = text.splitlines()%0A    updated: list[str] = []%0A    replaced = False%0A    for line in lines:%0A        if re.match(r\"^\\s*NVS_ENABLE_NILES_MUTATIONS\\s*=\", line):%0A            if not replaced:%0A                updated.append(replacement)%0A                replaced = True%0A            continue%0A        updated.append(line)%0A    if not replaced:%0A        updated.append(replacement)%0A    payload = (\"\\n\".join(updated) + \"\\n\").encode(\"utf-8\")%0A    _safe_atomic_write(%0A        ENV_FILE,%0A        payload,%0A        mode=0o600,%0A        uid=stat.st_uid,%0A        gid=stat.st_gid,%0A    )%0A%0A%0Adef _runtime_metadata() -> dict[str, str]:%0A    image_ref = _run_command([\"docker\", \"inspect\", \"--format\", \"{{.Config.Image}}\", \"nvs\"])%0A    image_id = _run_command([\"docker\", \"inspect\", \"--format\", \"{{.Image}}\", \"nvs\"])%0A    build_sha = _run_command(%0A        [%0A            \"docker\",%0A            \"image\",%0A            \"inspect\",%0A            \"--format\",%0A            \"{{ index .Config.Labels \\\"org.opencontainers.image.revision\\\" }}\",%0A            image_id,%0A        ]%0A    )%0A    build_timestamp = _run_command(%0A        [%0A            \"docker\",%0A            \"image\",%0A            \"inspect\",%0A            \"--format\",%0A            \"{{ index .Config.Labels \\\"org.opencontainers.image.created\\\" }}\",%0A            image_id,%0A        ]%0A    )%0A    release_version = _run_command(%0A        [%0A            \"docker\",%0A            \"image\",%0A            \"inspect\",%0A            \"--format\",%0A            \"{{ index .Config.Labels \\\"org.opencontainers.image.version\\\" }}\",%0A            image_id,%0A        ]%0A    )%0A    if not FULL_SHA.fullmatch(build_sha):%0A        raise AcceptanceError(%0A            \"RUNNING_BUILD_INVALID\",%0A            \"The running NVS image does not expose a valid build SHA.\",%0A        )%0A    return {%0A        \"imageRef\": image_ref,%0A        \"buildSha\": build_sha,%0A        \"buildTimestamp\": build_timestamp,%0A        \"releaseVersion\": release_version,%0A    }%0A%0A%0Adef _recreate(metadata: Mapping[str, str]) -> None:%0A    environment = dict(os.environ)%0A    environment.update(%0A        {%0A            \"NVS_IMAGE\": metadata[\"imageRef\"],%0A            \"NVS_BUILD_SHA\": metadata[\"buildSha\"],%0A            \"NVS_BUILD_TIMESTAMP\": metadata[\"buildTimestamp\"],%0A            \"NVS_RELEASE_VERSION\": metadata[\"releaseVersion\"],%0A        }%0A    )%0A    compose = [%0A        \"docker\",%0A        \"compose\",%0A        \"--project-directory\",%0A        str(DEPLOY_ROOT),%0A        \"-f\",%0A        str(DEPLOY_ROOT / \"docker-compose.staging.yml\"),%0A    ]%0A    _run_command([*compose, \"config\", \"--quiet\"], env=environment)%0A    _run_command(%0A        [*compose, \"up\", \"-d\", \"--no-deps\", \"--force-recreate\", \"nvs\"],%0A        env=environment,%0A    )%0A    _run_command(%0A        [%0A            str(DEPLOY_ROOT / \"ops\" / \"verify-deployment.sh\"),%0A            BASE_URL,%0A            metadata[\"buildSha\"],%0A            \"120\",%0A        ],%0A        timeout=150,%0A    )%0A%0A%0Adef _lease_payload(lease_id: str, backup_path: Path, metadata: Mapping[str, str]) -> dict[str, Any]:%0A    now = _utc_now()%0A    return {%0A        \"schemaVersion\": \"nvs.mutation-lease/v1\",%0A        \"leaseId\": lease_id,%0A        \"createdAt\": _iso(now),%0A        \"expiresAt\": _iso(now + timedelta(seconds=LEASE_TTL_SECONDS)),%0A        \"backupPath\": str(backup_path),%0A        \"watchdogPath\": str(RELEASE_ROOT / f\".nvs-live-watchdog-{lease_id}.py\"),%0A        \"watchdogPidPath\": str(RELEASE_ROOT / f\".nvs-live-watchdog-{lease_id}.pid\"),%0A        \"runtime\": dict(metadata),%0A    }%0A%0A%0Adef _create_lease(lease_id: str, metadata: Mapping[str, str]) -> dict[str, Any]:%0A    if ACTIVE_LEASE.is_symlink() or ACTIVE_LEASE.exists():%0A        raise AcceptanceError(%0A            \"MUTATION_LEASE_ALREADY_ACTIVE\",%0A            \"A staging mutation lease already exists and requires operator recovery.\",%0A            result=\"BLOCKED\",%0A        )%0A    raw, stat = _read_env()%0A    backup_path = RELEASE_ROOT / f\"nvs-env-before-live-{lease_id}.backup\"%0A    if backup_path.exists() or backup_path.is_symlink():%0A        raise AcceptanceError(\"MUTATION_BACKUP_COLLISION\", \"The mutation backup path already exists.\")%0A    _safe_atomic_write(%0A        backup_path,%0A        raw,%0A        mode=0o600,%0A        uid=stat.st_uid,%0A        gid=stat.st_gid,%0A    )%0A    lease = _lease_payload(lease_id, backup_path, metadata)%0A    payload = (json.dumps(lease, indent=2, sort_keys=True) + \"\\n\").encode(\"utf-8\")%0A    try:%0A        descriptor = os.open(ACTIVE_LEASE, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)%0A        with os.fdopen(descriptor, \"wb\", closefd=True) as handle:%0A            handle.write(payload)%0A            handle.flush()%0A            os.fsync(handle.fileno())%0A    except Exception:%0A        try:%0A            backup_path.unlink()%0A        except FileNotFoundError:%0A            pass%0A        raise%0A    os.chmod(ACTIVE_LEASE, 0o600)%0A    return lease%0A%0A%0Adef _read_lease() -> dict[str, Any] | None:%0A    if not ACTIVE_LEASE.exists():%0A        return None%0A    if ACTIVE_LEASE.is_symlink() or not ACTIVE_LEASE.is_file():%0A        raise AcceptanceError(\"MUTATION_LEASE_UNSAFE\", \"The active mutation lease is unsafe.\")%0A    try:%0A        lease = json.loads(ACTIVE_LEASE.read_text(encoding=\"utf-8\"))%0A    except (OSError, json.JSONDecodeError) as error:%0A        raise AcceptanceError(\"MUTATION_LEASE_INVALID\", \"The active mutation lease is invalid.\") from error%0A    if not isinstance(lease, dict) or lease.get(\"schemaVersion\") != \"nvs.mutation-lease/v1\":%0A        raise AcceptanceError(\"MUTATION_LEASE_INVALID\", \"The active mutation lease is invalid.\")%0A    return lease%0A%0A%0Adef _safe_release_path(value: Any) -> Path:%0A    if not isinstance(value, str):%0A        raise AcceptanceError(\"MUTATION_LEASE_INVALID\", \"The mutation lease path is invalid.\")%0A    path = Path(value)%0A    if not path.is_absolute() or path.parent.resolve() != RELEASE_ROOT:%0A        raise AcceptanceError(\"MUTATION_LEASE_INVALID\", \"The mutation lease path escaped releases.\")%0A    return path%0A%0A%0Adef _launch_watchdog(lease: Mapping[str, Any]) -> None:%0A    watchdog_path = _safe_release_path(lease.get(\"watchdogPath\"))%0A    pid_path = _safe_release_path(lease.get(\"watchdogPidPath\"))%0A    if watchdog_path.exists() or pid_path.exists():%0A        raise AcceptanceError(\"WATCHDOG_PATH_COLLISION\", \"The mutation watchdog path already exists.\")%0A    shutil.copy2(Path(__file__), watchdog_path)%0A    os.chmod(watchdog_path, 0o700)%0A    process = subprocess.Popen(%0A        [sys.executable, str(watchdog_path), \"watchdog\", \"--lease-id\", str(lease[\"leaseId\"])],%0A        stdin=subprocess.DEVNULL,%0A        stdout=subprocess.DEVNULL,%0A        stderr=subprocess.DEVNULL,%0A        cwd=\"/\",%0A        start_new_session=True,%0A        close_fds=True,%0A    )%0A    raw, stat = _read_env()%0A    del raw%0A    _safe_atomic_write(%0A        pid_path,%0A        f\"{process.pid}\\n\".encode(\"ascii\"),%0A        mode=0o600,%0A        uid=stat.st_uid,%0A        gid=stat.st_gid,%0A    )%0A%0A%0Adef _terminate_watchdog(lease: Mapping[str, Any]) -> None:%0A    pid_path = _safe_release_path(lease.get(\"watchdogPidPath\"))%0A    if pid_path.is_file() and not pid_path.is_symlink():%0A        try:%0A            pid = int(pid_path.read_text(encoding=\"ascii\").strip())%0A            if pid > 1 and pid != os.getpid():%0A                os.kill(pid, signal.SIGTERM)%0A        except (OSError, ValueError, ProcessLookupError):%0A            pass%0A    try:%0A        pid_path.unlink()%0A    except FileNotFoundError:%0A        pass%0A    watchdog_path = _safe_release_path(lease.get(\"watchdogPath\"))%0A    try:%0A        watchdog_path.unlink()%0A    except FileNotFoundError:%0A        pass%0A%0A%0Adef _restore_from_lease(lease_id: str | None, *, allow_orphan_disable: bool) -> str:%0A    RELEASE_ROOT.mkdir(parents=True, exist_ok=True)%0A    with CLEANUP_LOCK.open(\"a+\", encoding=\"utf-8\") as lock_handle:%0A        os.chmod(CLEANUP_LOCK, 0o600)%0A        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)%0A        lease = _read_lease()%0A        if lease is None:%0A            raw, _stat = _read_env()%0A            if _switch_value(raw) != \"true\":%0A                return \"NO_ACTIVE_LEASE\"%0A            if not allow_orphan_disable:%0A                raise AcceptanceError(%0A                    \"ORPHAN_MUTATION_SWITCH_ENABLED\",%0A                    \"The mutation switch is enabled without a recoverable lease.\",%0A                )%0A            metadata = _runtime_metadata()%0A            _rewrite_switch(False)%0A            _recreate(metadata)%0A            return \"ORPHAN_SWITCH_DISABLED\"%0A%0A        observed_lease_id = lease.get(\"leaseId\")%0A        if lease_id and observed_lease_id != lease_id:%0A            raise AcceptanceError(%0A                \"MUTATION_LEASE_MISMATCH\",%0A                \"The active mutation lease belongs to another operation.\",%0A            )%0A        backup_path = _safe_release_path(lease.get(\"backupPath\"))%0A        if backup_path.is_symlink() or not backup_path.is_file():%0A            raise AcceptanceError(%0A                \"MUTATION_BACKUP_MISSING\",%0A                \"The original NVS .env backup is unavailable for restoration.\",%0A            )%0A        runtime = lease.get(\"runtime\")%0A        if not isinstance(runtime, dict):%0A            raise AcceptanceError(\"MUTATION_LEASE_INVALID\", \"The runtime lease metadata is invalid.\")%0A        required_runtime = {key: runtime.get(key) for key in (\"imageRef\", \"buildSha\", \"buildTimestamp\", \"releaseVersion\")}%0A        if not all(isinstance(value, str) and value for value in required_runtime.values()):%0A            raise AcceptanceError(\"MUTATION_LEASE_INVALID\", \"The runtime lease metadata is incomplete.\")%0A%0A        current_raw, current_stat = _read_env()%0A        del current_raw%0A        _safe_atomic_write(%0A            ENV_FILE,%0A            backup_path.read_bytes(),%0A            mode=0o600,%0A            uid=current_stat.st_uid,%0A            gid=current_stat.st_gid,%0A        )%0A        _recreate(required_runtime)  # type: ignore[arg-type]%0A        restored_raw, _restored_stat = _read_env()%0A        if _switch_value(restored_raw) == \"true\":%0A            raise AcceptanceError(%0A                \"MUTATION_SWITCH_RESTORE_FAILED\",%0A                \"The original environment still enables NILES mutations.\",%0A            )%0A        _terminate_watchdog(lease)%0A        backup_path.unlink(missing_ok=True)%0A        ACTIVE_LEASE.unlink(missing_ok=True)%0A        return \"LEASE_RESTORED\"%0A%0A%0Adef _store_private_report(run_id: str, report: Mapping[str, Any]) -> Path:%0A    path = RELEASE_ROOT / f\"nvs-m1-02b-acceptance-{run_id}.json\"%0A    raw, stat = _read_env()%0A    del raw%0A    payload = (json.dumps(report, indent=2, sort_keys=True) + \"\\n\").encode(\"utf-8\")%0A    _safe_atomic_write(path, payload, mode=0o600, uid=stat.st_uid, gid=stat.st_gid)%0A    return path%0A%0A%0Adef _confirm_readiness(environment_id: str) -> dict[str, Any]:%0A    _status, readiness = _json_request(%0A        f\"/api/environments/{environment_id}/execution-readiness/confirm\",%0A        method=\"POST\",%0A        body={\"scenarioId\": SCENARIO_ID, \"variationValues\": VARIATION_VALUES},%0A        timeout=60,%0A    )%0A    if not isinstance(readiness, dict):%0A        raise AcceptanceError(\"CONFIRMED_READINESS_INVALID\", \"Confirmed readiness is invalid.\")%0A    if (%0A        readiness.get(\"verdict\") != \"PASS\"%0A        or readiness.get(\"confirmed\") is not True%0A        or readiness.get(\"mutationEligible\") is not True%0A    ):%0A        error = readiness.get(\"error\")%0A        code = error.get(\"code\") if isinstance(error, dict) and isinstance(error.get(\"code\"), str) else \"CONFIRMED_READINESS_BLOCKED\"%0A        raise AcceptanceError(code, \"Confirmed read-only staging readiness is blocked.\", result=\"BLOCKED\")%0A    return readiness%0A%0A%0Adef _start_live_run(environment_id: str, run_id: str) -> dict[str, Any]:%0A    _status, accepted = _json_request(%0A        \"/api/runs\",%0A        method=\"POST\",%0A        body={%0A            \"runType\": \"LIVE_API\",%0A            \"runId\": run_id,%0A            \"environmentId\": environment_id,%0A            \"scenarioId\": SCENARIO_ID,%0A            \"variationValues\": VARIATION_VALUES,%0A            \"confirmRealMutation\": True,%0A        },%0A        timeout=60,%0A    )%0A    if not isinstance(accepted, dict) or accepted.get(\"runId\") != run_id:%0A        raise AcceptanceError(\"LIVE_RUN_ACCEPTANCE_INVALID\", \"NVS did not return the requested run ID.\")%0A    return accepted%0A%0A%0Adef _poll_run(run_id: str) -> tuple[dict[str, Any], dict[str, Any] | None]:%0A    deadline = time.monotonic() + RUN_TIMEOUT_SECONDS%0A    latest: dict[str, Any] | None = None%0A    while time.monotonic() < deadline:%0A        status, progress = _json_request(%0A            f\"/api/runs/{run_id}/progress\",%0A            allow_statuses={404},%0A            timeout=30,%0A        )%0A        if status == 404:%0A            time.sleep(POLL_INTERVAL_SECONDS)%0A            continue%0A        if not isinstance(progress, dict):%0A            raise AcceptanceError(\"RUN_PROGRESS_INVALID\", \"NVS returned invalid run progress.\")%0A        latest = progress%0A        state = progress.get(\"status\")%0A        if state == \"COMPLETED\":%0A            _run_status, run = _json_request(f\"/api/runs/{run_id}\", timeout=30)%0A            if not isinstance(run, dict):%0A                raise AcceptanceError(\"FINAL_RUN_INVALID\", \"NVS returned an invalid final run.\")%0A            return progress, run%0A        if state == \"RECOVERY_REQUIRED\":%0A            return progress, None%0A        time.sleep(POLL_INTERVAL_SECONDS)%0A    raise AcceptanceError(%0A        \"LIVE_RUN_TIMEOUT\",%0A        \"The live run did not reach a terminal state before the safety deadline.\",%0A        result=\"RECOVERY_REQUIRED\",%0A    )%0A%0A%0Adef _classify(run: Mapping[str, Any]) -> tuple[str, bool, dict[str, Any]]:%0A    verdict = run.get(\"verdict\")%0A    error = run.get(\"error\")%0A    error_code = error.get(\"code\") if isinstance(error, dict) else None%0A    cleanup = run.get(\"cleanup\") if isinstance(run.get(\"cleanup\"), dict) else {}%0A    inventory = run.get(\"resourceInventory\") if isinstance(run.get(\"resourceInventory\"), dict) else {}%0A    incident = inventory.get(\"incident\") if isinstance(inventory.get(\"incident\"), dict) else {}%0A    steps = run.get(\"stepResults\") if isinstance(run.get(\"stepResults\"), list) else []%0A    required_steps = [step for step in steps if isinstance(step, dict) and step.get(\"required\", True)]%0A    passed_required = [step for step in required_steps if step.get(\"executionStatus\") == \"PASS\"]%0A    nonpass_required = [step for step in required_steps if step.get(\"executionStatus\") != \"PASS\"]%0A%0A    accepted_close_blocker = (%0A        verdict == \"BLOCKED\"%0A        and error_code == \"NILES_CLOSE_AUTHORITY_UNSATISFIABLE\"%0A        and cleanup.get(\"status\") == \"CLEAN\"%0A        and cleanup.get(\"policy\") == \"DELETE_IF_RUN_OWNED\"%0A        and incident.get(\"disposition\") == \"DELETED\"%0A        and len(nonpass_required) == 1%0A        and isinstance(nonpass_required[0].get(\"error\"), dict)%0A        and nonpass_required[0][\"error\"].get(\"code\") == \"NILES_CLOSE_AUTHORITY_UNSATISFIABLE\"%0A    )%0A    passed = verdict == \"PASS\" or accepted_close_blocker%0A    classification = (%0A        \"PASS\"%0A        if verdict == \"PASS\"%0A        else \"ACCEPTED_WITH_PRODUCT_BLOCKER\"%0A        if accepted_close_blocker%0A        else \"NOT_ACCEPTED\"%0A    )%0A    summary = {%0A        \"classification\": classification,%0A        \"verdict\": verdict,%0A        \"errorCode\": error_code,%0A        \"requiredStepsPassed\": len(passed_required),%0A        \"requiredStepsTotal\": len(required_steps),%0A        \"cleanupStatus\": cleanup.get(\"status\"),%0A        \"cleanupPolicy\": cleanup.get(\"policy\"),%0A        \"incidentDisposition\": incident.get(\"disposition\"),%0A    }%0A    return classification, passed, summary%0A%0A%0Adef _print_summary(%0A    *,%0A    result: str,%0A    run_id: str,%0A    build_sha: str,%0A    report_path: Path | None,%0A    summary: Mapping[str, Any] | None = None,%0A    error: AcceptanceError | None = None,%0A    restore_status: str | None = None,%0A) -> None:%0A    print(\"# NVS M1-02B staging acceptance\")%0A    print()%0A    print(f\"- Result: `{result}`\")%0A    print(f\"- Run ID: `{run_id}`\")%0A    print(f\"- Deployed build SHA: `{build_sha}`\")%0A    if summary:%0A        print(f\"- Final NVS verdict: `{summary.get('verdict')}`\")%0A        print(f\"- Final error code: `{summary.get('errorCode') or 'NONE'}`\")%0A        print(%0A            f\"- Required steps: `{summary.get('requiredStepsPassed')}/{summary.get('requiredStepsTotal')}` PASS\"%0A        )%0A        print(%0A            f\"- Cleanup: `{summary.get('cleanupStatus')}` / `{summary.get('cleanupPolicy')}`\"%0A        )%0A        print(f\"- Incident disposition: `{summary.get('incidentDisposition') or 'UNKNOWN'}`\")%0A    if error:%0A        print(f\"- Error code: `{error.code}`\")%0A        print(f\"- Error: {error}\")%0A    if report_path:%0A        print(f\"- Private server report: `{report_path}`\")%0A    if restore_status:%0A        print(f\"- Mutation lease cleanup: `{restore_status}`\")%0A    print()%0A    print(\"No credential, bearer token, raw payload, Incident UUID, or Incident number is printed here.\")%0A%0A%0Adef _run_acceptance(args: argparse.Namespace) -> int:%0A    if not SAFE_ID.fullmatch(args.environment_id):%0A        raise AcceptanceError(\"INVALID_ENVIRONMENT_ID\", \"environment_id is invalid.\")%0A    if not SAFE_ID.fullmatch(args.run_id):%0A        raise AcceptanceError(\"INVALID_RUN_ID\", \"run_id is invalid.\")%0A    if not FULL_SHA.fullmatch(args.expected_sha):%0A        raise AcceptanceError(\"INVALID_EXPECTED_SHA\", \"expected_sha must be a full Git SHA.\")%0A    if args.confirmation != \"RUN_M1_02B_LIVE_INCIDENT\":%0A        raise AcceptanceError(%0A            \"LIVE_MUTATION_CONFIRMATION_REQUIRED\",%0A            \"The exact live Incident confirmation phrase is required.\",%0A            result=\"BLOCKED\",%0A        )%0A%0A    metadata = _runtime_metadata()%0A    if metadata[\"buildSha\"] != args.expected_sha:%0A        raise AcceptanceError(%0A            \"DEPLOYED_SHA_MISMATCH\",%0A            \"The running NVS build does not match expected_sha.\",%0A            result=\"BLOCKED\",%0A        )%0A    raw, _stat = _read_env()%0A    if _switch_value(raw) == \"true\":%0A        raise AcceptanceError(%0A            \"MUTATION_SWITCH_ALREADY_ENABLED\",%0A            \"The mutation switch is already enabled outside this workflow.\",%0A            result=\"BLOCKED\",%0A        )%0A%0A    lease = _create_lease(args.lease_id, metadata)%0A    _launch_watchdog(lease)%0A    private_report: Path | None = None%0A    final_summary: dict[str, Any] | None = None%0A    primary_error: AcceptanceError | None = None%0A    result = \"FAIL\"%0A    exit_code = 1%0A    restore_status: str | None = None%0A%0A    try:%0A        _rewrite_switch(True)%0A        _recreate(metadata)%0A        readiness = _confirm_readiness(args.environment_id)%0A        accepted = _start_live_run(args.environment_id, args.run_id)%0A        progress, run = _poll_run(args.run_id)%0A        report = {%0A            \"schemaVersion\": \"nvs.staging-acceptance-report/v1\",%0A            \"runId\": args.run_id,%0A            \"deployedBuildSha\": metadata[\"buildSha\"],%0A            \"accepted\": accepted,%0A            \"confirmedReadiness\": readiness,%0A            \"progress\": progress,%0A            \"run\": run,%0A            \"completedAt\": _iso(_utc_now()),%0A        }%0A        private_report = _store_private_report(args.run_id, report)%0A        if run is None:%0A            checkpoint = progress.get(\"checkpoint\") if isinstance(progress.get(\"checkpoint\"), dict) else {}%0A            code = (%0A                checkpoint.get(\"error\", {}).get(\"code\")%0A                if isinstance(checkpoint.get(\"error\"), dict)%0A                else \"LIVE_RUN_REQUIRES_RECOVERY\"%0A            )%0A            raise AcceptanceError(%0A                code or \"LIVE_RUN_REQUIRES_RECOVERY\",%0A                \"The live run requires operator recovery.\",%0A                result=\"RECOVERY_REQUIRED\",%0A            )%0A        classification, passed, final_summary = _classify(run)%0A        result = classification%0A        exit_code = 0 if passed else 2%0A        if not passed:%0A            primary_error = AcceptanceError(%0A                str(final_summary.get(\"errorCode\") or \"LIVE_RUN_NOT_ACCEPTED\"),%0A                \"The final run did not meet the M1-02B staging acceptance contract.\",%0A                result=\"BLOCKED\" if run.get(\"verdict\") == \"BLOCKED\" else \"FAIL\",%0A            )%0A    except AcceptanceError as error:%0A        primary_error = error%0A        result = error.result%0A        exit_code = 3 if error.result == \"RECOVERY_REQUIRED\" else 2 if error.result == \"BLOCKED\" else 1%0A        if private_report is None:%0A            try:%0A                progress_status, progress = _json_request(%0A                    f\"/api/runs/{args.run_id}/progress\",%0A                    allow_statuses={404},%0A                    timeout=15,%0A                )%0A                private_report = _store_private_report(%0A                    args.run_id,%0A                    {%0A                        \"schemaVersion\": \"nvs.staging-acceptance-report/v1\",%0A                        \"runId\": args.run_id,%0A                        \"deployedBuildSha\": metadata[\"buildSha\"],%0A                        \"progress\": progress if progress_status != 404 else None,%0A                        \"operatorError\": {\"code\": error.code, \"result\": error.result},%0A                        \"completedAt\": _iso(_utc_now()),%0A                    },%0A                )%0A            except Exception:%0A                private_report = None%0A    finally:%0A        try:%0A            restore_status = _restore_from_lease(args.lease_id, allow_orphan_disable=False)%0A        except AcceptanceError as cleanup_error:%0A            _print_summary(%0A                result=\"MUTATION_DISABLE_RECOVERY_REQUIRED\",%0A                run_id=args.run_id,%0A                build_sha=metadata[\"buildSha\"],%0A                report_path=private_report,%0A                summary=final_summary,%0A                error=cleanup_error,%0A                restore_status=\"FAILED\",%0A            )%0A            return 4%0A%0A    _print_summary(%0A        result=result,%0A        run_id=args.run_id,%0A        build_sha=metadata[\"buildSha\"],%0A        report_path=private_report,%0A        summary=final_summary,%0A        error=primary_error,%0A        restore_status=restore_status,%0A    )%0A    return exit_code%0A%0A%0Adef _watchdog(args: argparse.Namespace) -> int:%0A    try:%0A        lease = _read_lease()%0A        if lease is None or lease.get(\"leaseId\") != args.lease_id:%0A            return 0%0A        expires_at = datetime.fromisoformat(str(lease.get(\"expiresAt\")))%0A        delay = max(0.0, (expires_at - _utc_now()).total_seconds())%0A        time.sleep(delay)%0A        _restore_from_lease(args.lease_id, allow_orphan_disable=True)%0A        return 0%0A    except Exception:%0A        return 1%0A%0A%0Adef _force_disable(args: argparse.Namespace) -> int:%0A    try:%0A        status = _restore_from_lease(args.lease_id or None, allow_orphan_disable=True)%0A        print(\"# NVS mutation safety cleanup\")%0A        print()%0A        print(f\"- Status: `{status}`\")%0A        print(\"- Mutation switch: `DISABLED`\")%0A        return 0%0A    except AcceptanceError as error:%0A        print(\"# NVS mutation safety cleanup\")%0A        print()%0A        print(\"**Result:** FAIL\")%0A        print()%0A        print(f\"- Error code: `{error.code}`\")%0A        print(f\"- Error: {error}\")%0A        return 1%0A%0A%0Adef main() -> int:%0A    parser = argparse.ArgumentParser(description=\"Guarded M1-02B live staging acceptance.\")%0A    subparsers = parser.add_subparsers(dest=\"command\", required=True)%0A%0A    run_parser = subparsers.add_parser(\"run\")%0A    run_parser.add_argument(\"--environment-id\", default=\"staging-example\")%0A    run_parser.add_argument(\"--expected-sha\", required=True)%0A    run_parser.add_argument(\"--run-id\", required=True)%0A    run_parser.add_argument(\"--lease-id\", required=True)%0A    run_parser.add_argument(\"--confirmation\", required=True)%0A%0A    watchdog_parser = subparsers.add_parser(\"watchdog\")%0A    watchdog_parser.add_argument(\"--lease-id\", required=True)%0A%0A    cleanup_parser = subparsers.add_parser(\"force-disable\")%0A    cleanup_parser.add_argument(\"--lease-id\", default=\"\")%0A%0A    args = parser.parse_args()%0A    if args.command == \"run\":%0A        try:%0A            return _run_acceptance(args)%0A        except AcceptanceError as error:%0A            print(\"# NVS M1-02B staging acceptance\")%0A            print()%0A            print(f\"**Result:** {error.result}\")%0A            print()%0A            print(f\"- Error code: `{error.code}`\")%0A            print(f\"- Error: {error}\")%0A            return 2 if error.result == \"BLOCKED\" else 1%0A        except Exception:%0A            print(\"# NVS M1-02B staging acceptance\")%0A            print()%0A            print(\"**Result:** FAIL\")%0A            print()%0A            print(\"An unexpected local acceptance error occurred; run force-disable immediately.\")%0A            return 1%0A    if args.command == \"watchdog\":%0A        return _watchdog(args)%0A    return _force_disable(args)%0A%0A%0Aif __name__ == \"__main__\":%0A    raise SystemExit(main())%0A"%0A%0A ❯ tests/staging-operator-assets.test.ts:130:28%0A%0A
+[ELIFECYCLE] Test failed. See above for more details.
+[ELIFECYCLE] Command failed with exit code 1.

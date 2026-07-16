@@ -1,0 +1,172 @@
+name: one-shot configuration approver finalizer artifact gated
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/one-shot-configuration-approver-finalizer-artifact-gated.yml
+
+permissions:
+  actions: write
+  contents: write
+  issues: write
+
+concurrency:
+  group: nvs-one-shot-configuration-approver-finalizer-artifact-gated
+  cancel-in-progress: false
+
+jobs:
+  operate:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      RESULT_ISSUE: '80'
+      TARGET_SHA: 921198f636b60b00d4eff143570bba38914a7440
+      REVIEWED_CI_RUN: '29539983066'
+      DEPLOY_RUN: '29540003136'
+      ENVIRONMENT_ID: staging-example
+    steps:
+      - name: Mark artifact-gated execution started
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/started.md" <<EOF
+          # Configuration Approver finalizer execution
+
+          - Status: \`RUNNING — sanitized-artifact gated\`
+          - Target SHA: \`$TARGET_SHA\`
+          - Reviewed full CI run: \`$REVIEWED_CI_RUN\`
+          - Successful exact-SHA deployment run: \`$DEPLOY_RUN\`
+          - Authorization: \`BOOTSTRAP_M1_02B_FIXTURES\`
+          - NILES mutation switch: must remain disabled
+          - Live Incident acceptance: not authorized and will not be executed
+          EOF
+          gh issue edit "$RESULT_ISSUE" --repo "$GITHUB_REPOSITORY" --title 'Configuration Approver finalizer running' --body-file "$RUNNER_TEMP/started.md"
+
+      - name: Plan, apply, and prove idempotency from sanitized artifacts
+        id: execute
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          repo="$GITHUB_REPOSITORY"
+
+          dispatch_bootstrap() {
+            local label="$1" operation="$2" digest="$3" confirmation="$4"
+            local previous candidate run_id=''
+            previous="$(gh run list --repo "$repo" --workflow staging-fixture-bootstrap.yml --branch main --event workflow_dispatch --limit 1 --json databaseId --jq '.[0].databaseId // 0')"
+            gh workflow run staging-fixture-bootstrap.yml \
+              --repo "$repo" --ref main \
+              --field operation="$operation" \
+              --field environment_id="$ENVIRONMENT_ID" \
+              --field expected_sha="$TARGET_SHA" \
+              --field bootstrap_digest="$digest" \
+              --field confirmation="$confirmation"
+            for _attempt in $(seq 1 120); do
+              sleep 2
+              candidate="$(gh run list --repo "$repo" --workflow staging-fixture-bootstrap.yml --branch main --event workflow_dispatch --limit 1 --json databaseId --jq '.[0].databaseId // 0')"
+              if [[ "$candidate" != '0' && "$candidate" != "$previous" ]]; then run_id="$candidate"; break; fi
+            done
+            [[ -n "$run_id" ]]
+            printf '%s' "$run_id" > "$RUNNER_TEMP/${label}-run-id"
+            gh run watch "$run_id" --repo "$repo" --exit-status > "$RUNNER_TEMP/${label}-watch.log" 2>&1 || true
+            gh run view "$run_id" --repo "$repo" --json conclusion --jq '.conclusion // "unknown"' > "$RUNNER_TEMP/${label}-conclusion" || echo unknown > "$RUNNER_TEMP/${label}-conclusion"
+            local dir="$RUNNER_TEMP/$label"
+            mkdir -p "$dir"
+            gh run download "$run_id" --repo "$repo" --name "nvs-staging-fixture-bootstrap-${run_id}-1" --dir "$dir"
+            local summary="$dir/nvs-staging-fixture-bootstrap.md"
+            test -f "$summary"
+            grep -Fq -- '- Result: `PASS`' "$summary"
+            cp "$summary" "$RUNNER_TEMP/${label}.md"
+          }
+
+          dispatch_bootstrap plan plan '' ''
+          plan_summary="$RUNNER_TEMP/plan.md"
+          digest="$(sed -n 's/^- Bootstrap digest: `\([0-9a-f]\{64\}\)`$/\1/p' "$plan_summary" | head -n 1)"
+          [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
+          allowed='^(CREATE_ASSIGNMENT_GROUP|ADD_SERVICE_DESK_MEMBER|CREATE_CI_CLASS|CREATE_CMDB_SERVICE|CREATE_CONFIGURATION_APPROVER|RECOVER_CONFIGURATION_APPROVER|CREATE_AND_PUBLISH_GOVERNED_SLA|COMPLETE_GOVERNED_SLA_PUBLISH|CREATE_SERVICE_OFFERING|CREATE_CONFIGURATION_ITEM|NONE_ALREADY_READY)$'
+          count=0
+          while IFS= read -r action; do
+            [[ -z "$action" || "$action" =~ $allowed ]]
+            [[ -z "$action" ]] || count=$((count + 1))
+          done < <(awk '/^## Planned actions$/ { active=1; next } /^## / && active { exit } active && /^- `[^`]+`$/ { line=$0; sub(/^- `/, "", line); sub(/`$/, "", line); print line }' "$plan_summary")
+          [[ "$count" -ge 1 ]]
+
+          dispatch_bootstrap apply apply "$digest" BOOTSTRAP_M1_02B_FIXTURES
+          dispatch_bootstrap verify plan '' ''
+
+          mapfile -t final_actions < <(awk '/^## Planned actions$/ { active=1; next } /^## / && active { exit } active && /^- `[^`]+`$/ { line=$0; sub(/^- `/, "", line); sub(/`$/, "", line); print line }' "$RUNNER_TEMP/verify.md")
+          [[ "${#final_actions[@]}" -eq 1 ]]
+          [[ "${final_actions[0]}" == NONE_ALREADY_READY ]]
+          touch "$RUNNER_TEMP/completed"
+
+      - name: Publish dedicated sanitized result
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXECUTE_OUTCOME: ${{ steps.execute.outcome }}
+        run: |
+          set -euo pipefail
+          body="$RUNNER_TEMP/final.md"
+          read_value() { if [[ -f "$1" ]]; then cat "$1"; else printf unavailable; fi; }
+          plan_run="$(read_value "$RUNNER_TEMP/plan-run-id")"
+          apply_run="$(read_value "$RUNNER_TEMP/apply-run-id")"
+          verify_run="$(read_value "$RUNNER_TEMP/verify-run-id")"
+          plan_conclusion="$(read_value "$RUNNER_TEMP/plan-conclusion")"
+          apply_conclusion="$(read_value "$RUNNER_TEMP/apply-conclusion")"
+          verify_conclusion="$(read_value "$RUNNER_TEMP/verify-conclusion")"
+          {
+            echo '# Configuration Approver finalizer execution'
+            echo
+            echo "- Target SHA: \`$TARGET_SHA\`"
+            echo "- Reviewed full CI run: \`$REVIEWED_CI_RUN\` — production image, hardening, rollback, same-SHA and checksum proof passed"
+            echo "- Successful exact-SHA deployment run: \`$DEPLOY_RUN\`"
+            echo "- Plan run: \`$plan_run\` — workflow \`$plan_conclusion\`; sanitized result required \`PASS\`"
+            echo "- Authorized apply run: \`$apply_run\` — workflow \`$apply_conclusion\`; sanitized result required \`PASS\`"
+            echo "- Final verification run: \`$verify_run\` — workflow \`$verify_conclusion\`; sanitized result required \`PASS\` and \`NONE_ALREADY_READY\`"
+            echo '- Authorization: `BOOTSTRAP_M1_02B_FIXTURES`'
+            echo '- NILES mutation switch: verified not enabled by each staging-control run'
+            echo '- Live Incident acceptance: not executed'
+            for pair in 'Fresh plan:plan.md' 'Authorized apply:apply.md' 'Final verification:verify.md'; do
+              title="${pair%%:*}"; file="${pair#*:}"
+              echo; echo "## $title"; echo
+              if [[ -f "$RUNNER_TEMP/$file" ]]; then cat "$RUNNER_TEMP/$file"; else echo '**Sanitized artifact:** unavailable'; fi
+            done
+          } > "$body"
+          if [[ -f "$RUNNER_TEMP/completed" && "$EXECUTE_OUTCOME" == success ]]; then
+            gh issue edit "$RESULT_ISSUE" --repo "$GITHUB_REPOSITORY" --title 'Configuration Approver finalizer completed' --body-file "$body"
+            gh issue close "$RESULT_ISSUE" --repo "$GITHUB_REPOSITORY" --reason completed
+          else
+            gh issue edit "$RESULT_ISSUE" --repo "$GITHUB_REPOSITORY" --title 'Configuration Approver finalizer blocked' --body-file "$body"
+          fi
+
+      - name: Enforce successful completion
+        if: always()
+        run: test -f "$RUNNER_TEMP/completed"
+
+  cleanup:
+    needs: operate
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: main
+          persist-credentials: true
+          fetch-depth: 0
+      - name: Remove artifact-gated execution workflow
+        run: |
+          set -euo pipefail
+          git config user.name 'nvs-maintenance-bot'
+          git config user.email 'nvs-maintenance-bot@users.noreply.github.com'
+          git pull --ff-only origin main
+          rm -f .github/workflows/one-shot-configuration-approver-finalizer-artifact-gated.yml
+          if git diff --quiet --exit-code; then exit 0; fi
+          git add .github/workflows/one-shot-configuration-approver-finalizer-artifact-gated.yml
+          git commit -m 'chore: remove completed artifact-gated configuration approver finalizer'
+          git push origin HEAD:main

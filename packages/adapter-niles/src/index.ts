@@ -673,6 +673,7 @@ function normalizeIncident(
   const status = safeString(payload?.['status']);
   const priority = safeString(payload?.['priority']);
   const requesterId = safeString(payload?.['requesterId']);
+  const assignmentGroup = safeString(payload?.['assignmentGroup']);
   const assignmentGroupId = safeString(payload?.['assignmentGroupId']);
   const assignedTo = safeString(payload?.['assignedTo']);
   const incident: NilesIncidentRecord = { id };
@@ -684,6 +685,7 @@ function normalizeIncident(
     incident.priority = priority as NonNullable<NilesIncidentRecord['priority']>;
   }
   if (requesterId) incident.requesterId = requesterId;
+  if (assignmentGroup) incident.assignmentGroup = assignmentGroup;
   if (assignmentGroupId) incident.assignmentGroupId = assignmentGroupId;
   if (assignedTo) incident.assignedTo = assignedTo;
   return incident;
@@ -720,6 +722,24 @@ function asArrayPayload(value: unknown): unknown[] {
     return items;
   }
   return [];
+}
+
+function assignmentPayload(input: {
+  assignmentGroupId?: string;
+  assignmentGroup?: string;
+}): { assignmentGroupId: string } | { assignmentGroup: string } {
+  if (input.assignmentGroupId) {
+    return { assignmentGroupId: input.assignmentGroupId };
+  }
+  if (input.assignmentGroup) {
+    return { assignmentGroup: input.assignmentGroup };
+  }
+  throw new NilesLiveAdapterOperationError(
+    undefined,
+    'build assignment payload',
+    undefined,
+    'malformed',
+  );
 }
 
 export class NilesIncidentApiAdapter implements NilesIncidentLiveAdapter {
@@ -857,7 +877,8 @@ export class NilesIncidentApiAdapter implements NilesIncidentLiveAdapter {
     runId: string;
     runNamespacePrefix: string;
     requesterUserId: string;
-    assignmentGroupId: string;
+    assignmentGroupId?: string;
+    assignmentGroup?: string;
     serviceId: string;
     offeringId?: string;
     impact: 'low' | 'medium' | 'high';
@@ -878,7 +899,7 @@ export class NilesIncidentApiAdapter implements NilesIncidentLiveAdapter {
         impact: input.impact,
         urgency: input.urgency,
         requesterId: input.requesterUserId,
-        assignmentGroupId: input.assignmentGroupId,
+        ...assignmentPayload(input),
         serviceId: input.serviceId,
         ...(input.offeringId ? { offeringId: input.offeringId } : {}),
         metadata: {
@@ -920,7 +941,8 @@ export class NilesIncidentApiAdapter implements NilesIncidentLiveAdapter {
     session: ActorSession;
     tenantId: string;
     incidentId: string;
-    assignmentGroupId: string;
+    assignmentGroupId?: string;
+    assignmentGroup?: string;
     correlationId: string;
   }): Promise<NilesIncidentRecord> {
     return this.request({
@@ -929,7 +951,7 @@ export class NilesIncidentApiAdapter implements NilesIncidentLiveAdapter {
       path: `/grc/itsm/incidents/${input.incidentId}/assign`,
       pathTemplate: '/grc/itsm/incidents/:incidentId/assign',
       operation: 'assign incident',
-      body: { assignmentGroupId: input.assignmentGroupId },
+      body: assignmentPayload(input),
     }).then((response) => ({
       ...normalizeIncident(response.payload, response.transport),
       transport: response.transport,

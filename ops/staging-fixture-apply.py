@@ -144,11 +144,32 @@ def _selected(proposal: dict[str, Any], key: str) -> dict[str, Any]:
     return item
 
 
+def _selected_assignment_group(proposal: dict[str, Any]) -> dict[str, Any]:
+    selected = proposal.get("selected")
+    item = selected.get("assignmentGroup") if isinstance(selected, dict) else None
+    if not isinstance(item, dict):
+        raise ApplyError("fixture proposal is missing selected assignmentGroup.")
+    mode = item.get("mode")
+    label = item.get("label")
+    if not isinstance(label, str) or not label.strip() or len(label) > 160:
+        raise ApplyError("fixture proposal assignmentGroup label is invalid.")
+    if mode == "LEGACY_LABEL":
+        if len(label) > 100 or "id" in item:
+            raise ApplyError("legacy assignmentGroup proposal is invalid.")
+        return item
+    if mode != "CANONICAL_ID":
+        raise ApplyError("fixture proposal assignmentGroup mode is invalid.")
+    identifier = item.get("id")
+    if not isinstance(identifier, str) or not UUID.fullmatch(identifier):
+        raise ApplyError("fixture proposal assignmentGroup UUID is invalid.")
+    return item
+
+
 def _render_fixture(proposal: dict[str, Any]) -> str:
     tenant_id = proposal.get("tenantId")
     if not isinstance(tenant_id, str) or not UUID.fullmatch(tenant_id):
         raise ApplyError("fixture proposal tenant UUID is invalid.")
-    group = _selected(proposal, "assignmentGroup")
+    group = _selected_assignment_group(proposal)
     service = _selected(proposal, "service")
     offering = _selected(proposal, "offering")
     ci = _selected(proposal, "configurationItem")
@@ -170,7 +191,12 @@ def _render_fixture(proposal: dict[str, Any]) -> str:
             "      journey: normal",
             "resources:",
             "  assignmentGroup:",
-            f"    id: {group['id']}",
+            f"    mode: {group['mode']}",
+            *(
+                [f"    id: {group['id']}"]
+                if group["mode"] == "CANONICAL_ID"
+                else []
+            ),
             f"    label: {_yaml_string(group['label'])}",
             "  service:",
             f"    id: {service['id']}",

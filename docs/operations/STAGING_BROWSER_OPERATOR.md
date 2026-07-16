@@ -61,7 +61,7 @@ It also confirms that the tenant choice catalog contains `pending_external_depen
 /opt/nvs/releases/nvs-fixture-proposal-latest.json
 ```
 
-A successful summary prints only the selector match counts and a SHA-256 proposal digest. Refine a selector and rerun `plan` whenever it matches zero or multiple eligible records.
+A successful summary prints only the selector match counts, assignment binding mode, and a SHA-256 proposal digest. Refine a selector and rerun `plan` whenever a canonical selector matches multiple eligible records. If the tenant has no active assignment-group records, planning uses the frozen NILES legacy `assignmentGroup` label contract with the deterministic label `NVS Service Desk`; it does not create shared NILES group data.
 
 ### `apply`
 

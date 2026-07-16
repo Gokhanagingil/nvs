@@ -244,6 +244,12 @@ def _choose_assignment_group(values: Any, query: str) -> tuple[dict[str, Any], i
     if len(active) == 1:
         _validate_uuid("assignment group", active[0])
         return active[0], len(candidates), "SOLE_ACTIVE_FALLBACK"
+    if len(active) == 0:
+        return (
+            {"mode": "LEGACY_LABEL", "label": "NVS Service Desk"},
+            len(candidates),
+            "LEGACY_LABEL_FALLBACK",
+        )
 
     scored = [(_assignment_group_score(item), item) for item in active]
     best_score = max((score for score, _item in scored), default=0)
@@ -295,6 +301,15 @@ def _selection(item: dict[str, Any]) -> dict[str, Any]:
             else {}
         ),
     }
+
+
+def _assignment_selection(item: dict[str, Any], mode: str) -> dict[str, Any]:
+    if mode == "LEGACY_LABEL_FALLBACK":
+        label = item.get("label")
+        if not isinstance(label, str) or not label.strip() or len(label) > 100:
+            raise PlanError("legacy assignment label is invalid.")
+        return {"mode": "LEGACY_LABEL", "label": label}
+    return {"mode": "CANONICAL_ID", **_selection(item)}
 
 
 def _run(args: argparse.Namespace) -> int:
@@ -366,7 +381,7 @@ def _run(args: argparse.Namespace) -> int:
             "configurationItem": "EXACT_QUERY",
         },
         "selected": {
-            "assignmentGroup": _selection(group),
+            "assignmentGroup": _assignment_selection(group, group_mode),
             "service": _selection(service),
             "offering": _selection(offering),
             "configurationItem": _selection(ci),

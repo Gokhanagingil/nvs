@@ -107,19 +107,24 @@ describe('NILES legacy assignment-label adapter contract', () => {
     expect(assignBody).not.toHaveProperty('assignmentGroupId');
   });
 
-  it('rejects an assignment operation that supplies neither representation before network access', async () => {
+  it('rejects an assignment operation that supplies neither representation before network access', () => {
     const fetchMock = vi.fn<FetchImplementation>();
     const adapter = new NilesIncidentApiAdapter(fetchMock, 100);
+    let captured: unknown;
 
-    await expect(
+    try {
       adapter.assignIncident({
         environment,
         session,
         tenantId,
         incidentId,
         correlationId: 'assign-without-binding',
-      }),
-    ).rejects.toMatchObject({
+      });
+    } catch (error) {
+      captured = error;
+    }
+
+    expect(captured).toMatchObject({
       code: 'NILES_MALFORMED_RESPONSE',
       category: 'ADAPTER',
       retryable: false,

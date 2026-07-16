@@ -62,6 +62,11 @@ source = source.replace(
 );
 source = source
   .replace('    do {\\n      attempt += 1;', '    for (;;) {\\n      attempt += 1;')
-  .replace('    } while (true);\\n  }\\n\\n  private allowlistMatches', '    }\\n  }\\n\\n  private allowlistMatches');
+  .replace('    } while (true);\\n  }\\n\\n  private allowlistMatches', '    }\\n  }\\n\\n  private allowlistMatches')
+  .replace('        const status = this.incident.status;\\n', "        const status = this.incident.status ?? 'open';\\n")
+  .replace(
+    "      fixture,\\n      undefined,\\n      { slaObservationTimeoutMs: 100, slaObservationIntervalMs: 0, sleep: async () => {} },\\n    );",
+    '      fixture,\\n    );',
+  );
 
 await writeFile(path, source, 'utf8');

@@ -1,0 +1,53 @@
+name: diagnose PR15 quality gate
+
+on:
+  push:
+    branches:
+      - agent/staging-live-acceptance
+    paths:
+      - .github/workflows/pr15-debug.yml
+
+permissions:
+  contents: write
+
+jobs:
+  diagnose:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: agent/staging-live-acceptance
+          persist-credentials: true
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa
+        with:
+          version: 11.13.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.18.0
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec playwright install --with-deps chromium
+      - name: Run full gate and capture failure
+        run: |
+          pnpm exec prettier --write .github/workflows/pr15-debug.yml
+          set +e
+          pnpm run ci > /tmp/pr15-ci.log 2>&1
+          status=$?
+          set -e
+          if [[ "$status" -ne 0 ]]; then
+            tail -n 320 /tmp/pr15-ci.log > .github/pr15-ci-error.txt
+            git config user.name "nvs-maintenance-bot"
+            git config user.email "nvs-maintenance-bot@users.noreply.github.com"
+            git add .github/workflows/pr15-debug.yml .github/pr15-ci-error.txt
+            git commit -m "chore: capture PR15 quality-gate error"
+            git push origin HEAD:agent/staging-live-acceptance
+            cat /tmp/pr15-ci.log
+            exit "$status"
+          fi
+          rm -f .github/workflows/pr15-debug.yml
+          git config user.name "nvs-maintenance-bot"
+          git config user.email "nvs-maintenance-bot@users.noreply.github.com"
+          git add -A
+          git commit -m "chore: remove PR15 diagnostic workflow"
+          git push origin HEAD:agent/staging-live-acceptance

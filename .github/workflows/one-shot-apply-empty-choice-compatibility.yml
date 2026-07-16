@@ -104,3 +104,5 @@ jobs:
           git add .github/workflows/one-shot-apply-empty-choice-compatibility.yml
           git commit -m 'chore: remove completed choice-compatibility fixer'
           git push origin HEAD:main
+
+# Reviewed manual retrigger: 2026-07-16

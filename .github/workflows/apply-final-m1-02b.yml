@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - agent/m1-02b-final-fixes
+  pull_request:
+    branches:
+      - main
 
 permissions:
   contents: write
@@ -14,7 +17,7 @@ concurrency:
 
 jobs:
   apply-and-verify:
-    if: github.actor != 'github-actions[bot]'
+    if: github.actor != 'github-actions[bot]' && github.head_ref == 'agent/m1-02b-final-fixes'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5

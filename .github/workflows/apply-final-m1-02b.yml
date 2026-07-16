@@ -43,14 +43,25 @@ jobs:
       - name: Focused regressions
         run: pnpm exec vitest run tests/niles-incident-adapter.test.ts tests/live-incident.test.ts tests/storage.test.ts
       - name: Full quality gate
-        run: pnpm run ci
+        run: |
+          if ! pnpm run ci > /tmp/full-gate.log 2>&1; then
+            tail -n 240 /tmp/full-gate.log > .github/isolated-full-gate-error.txt
+            git config user.name "nvs-maintenance-bot"
+            git config user.email "nvs-maintenance-bot@users.noreply.github.com"
+            git add .github/isolated-full-gate-error.txt
+            git commit -m "chore: capture isolated full-gate error"
+            git push origin HEAD:agent/m1-02b-final-fixes
+            cat /tmp/full-gate.log
+            exit 1
+          fi
+          cat /tmp/full-gate.log
       - name: Shell and diff validation
         run: |
           bash -n ops/*.sh ops/ci/*.sh
           git diff --check
       - name: Commit verified code only
         run: |
-          rm -f .github/scripts/apply-final-m1-02b.py .github/scripts/patch-test-choice.py .github/workflows/apply-final-m1-02b.yml
+          rm -f .github/scripts/apply-final-m1-02b.py .github/scripts/patch-test-choice.py .github/workflows/apply-final-m1-02b.yml .github/isolated-full-gate-error.txt
           git config user.name "nvs-maintenance-bot"
           git config user.email "nvs-maintenance-bot@users.noreply.github.com"
           git add -A

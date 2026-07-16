@@ -1,9 +1,11 @@
 name: one-shot apply empty choice-catalog compatibility
 
 on:
-  issue_comment:
+  workflow_run:
+    workflows:
+      - ci
     types:
-      - created
+      - completed
 
 permissions:
   contents: write
@@ -12,10 +14,10 @@ permissions:
 jobs:
   patch:
     if: >-
-      github.event.issue.number == 23 &&
-      github.event.issue.pull_request == null &&
-      github.event.comment.user.login == github.repository_owner &&
-      github.event.comment.body == 'APPLY_REVIEWED_CHOICE_COMPATIBILITY_PATCH'
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.head_branch == 'ops/choice-compatibility-ci-trigger' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 35
     steps:

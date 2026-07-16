@@ -139,6 +139,122 @@ text, context_count = re.subn(
 if context_count != 1:
     raise SystemExit(f'loadContext source replacement count={context_count}')
 
+find_present = 'async function findConfigurationApprover(context)' in text
+ensure_present = 'async function ensureConfigurationApprover(context, current)' in text
+if find_present != ensure_present:
+    raise SystemExit('configuration approver helper insertion is partially present')
+if not find_present:
+    marker = 'async function applyPlan(context, plan) {'
+    helpers = """async function findConfigurationApprover(context) {
+  const payload = await api(
+    context,
+    context.sessions.admin,
+    'GET',
+    `/users?page=1&limit=100&search=${encodeURIComponent(configurationApproverEmail(context.tenantId))}`,
+    undefined,
+    undefined,
+    'find configuration approver',
+  );
+  const match = requireUnique(
+    'configuration approver user',
+    exactMatches(
+      arrayFrom(payload, 'users'),
+      'email',
+      configurationApproverEmail(context.tenantId),
+    ),
+  );
+  return match ? validateConfigurationApproverUser(match, context.tenantId) : undefined;
+}
+
+async function ensureConfigurationApprover(context, current) {
+  let credential = await readConfigurationApproverCredential(context.tenantId);
+  let created = false;
+  if (!credential) {
+    credential = {
+      email: configurationApproverEmail(context.tenantId),
+      password: generateConfigurationApproverPassword(),
+      state: 'PENDING',
+    };
+    await writePrivateJson(APPROVER_CREDENTIAL_PATH, {
+      schemaVersion: APPROVER_CREDENTIAL_SCHEMA,
+      tenantId: context.tenantId,
+      email: credential.email,
+      password: credential.password,
+      state: 'PENDING',
+      createdAt: new Date().toISOString(),
+    });
+  }
+
+  let user = await findConfigurationApprover(context);
+  if (!user) {
+    try {
+      const createdPayload = await api(
+        context,
+        context.sessions.admin,
+        'POST',
+        '/users',
+        {
+          email: credential.email,
+          password: credential.password,
+          firstName: 'NVS',
+          lastName: 'Configuration Approver',
+          department: 'NVS Validation',
+          role: 'admin',
+          isActive: true,
+          isGlobalAdmin: false,
+          hasItsmAccess: true,
+          mustChangePassword: false,
+        },
+        undefined,
+        'create configuration approver',
+      );
+      user = validateConfigurationApproverUser(createdPayload, context.tenantId);
+      created = true;
+    } catch (error) {
+      for (let attempt = 0; attempt < 20 && !user; attempt += 1) {
+        await new Promise((resolve) => globalThis.setTimeout(resolve, 250));
+        user = await findConfigurationApprover(context);
+      }
+      if (!user) throw error;
+    }
+  }
+
+  if (user.id === context.sessions.admin.userId) {
+    throw new BootstrapError(
+      'CONFIGURATION_APPROVER_SELF_APPROVAL_FORBIDDEN',
+      'The configuration approver must be distinct from the governed SLA requester.',
+    );
+  }
+  const session = await loginConfigurationApprover(context, credential);
+  if (session.userId !== user.id) {
+    clearSession(session);
+    throw new BootstrapError(
+      'CONFIGURATION_APPROVER_IDENTITY_MISMATCH',
+      'The configuration approver credential resolved to an unexpected user.',
+    );
+  }
+  await writePrivateJson(APPROVER_CREDENTIAL_PATH, {
+    schemaVersion: APPROVER_CREDENTIAL_SCHEMA,
+    tenantId: context.tenantId,
+    email: credential.email,
+    password: credential.password,
+    state: 'READY',
+    userId: user.id,
+    verifiedAt: new Date().toISOString(),
+  });
+  credential.password = '';
+  return {
+    session,
+    userId: user.id,
+    disposition: created ? 'CREATED' : current.kind === 'READY' ? 'REUSED' : 'RECOVERED',
+  };
+}
+
+"""
+    if text.count(marker) != 1:
+        raise SystemExit(f'applyPlan helper insertion marker count={text.count(marker)}')
+    text = text.replace(marker, helpers + marker, 1)
+
 target.write_text(text, encoding='utf-8')
 PY
 

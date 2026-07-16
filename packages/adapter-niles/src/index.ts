@@ -825,6 +825,30 @@ export class NilesIncidentApiAdapter implements NilesIncidentLiveAdapter {
     }));
   }
 
+  readChoiceValues(input: {
+    environment: EnvironmentDefinitionV1;
+    session: ActorSession;
+    tenantId: string;
+    table: 'itsm_incidents' | 'itsm_incident_ci';
+    field: 'pendingReason' | 'relationshipType' | 'impactScope';
+    correlationId: string;
+  }): Promise<{ values: string[]; transport?: NilesTransportEvidence }> {
+    const query = new URLSearchParams({ table: input.table, field: input.field });
+    return this.request({
+      ...input,
+      method: 'GET',
+      path: `/grc/itsm/choices?${query.toString()}`,
+      pathTemplate: '/grc/itsm/choices?table=:table&field=:field',
+      operation: `read ${input.table}.${input.field} choices`,
+    }).then((response) => ({
+      values: asArrayPayload(response.payload).flatMap((entry) => {
+        const value = safeString(asRecord(entry)?.['value']);
+        return value ? [value] : [];
+      }),
+      transport: response.transport,
+    }));
+  }
+
   createIncident(input: {
     environment: EnvironmentDefinitionV1;
     session: ActorSession;

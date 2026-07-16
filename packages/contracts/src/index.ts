@@ -583,11 +583,11 @@ export const nilesIncidentFixtureV1Schema = z
         configurationItem: fixtureResourceRefSchema.optional(),
         affectedCi: z
           .object({
-            relationshipType: z.string().min(1).max(80).default('affected'),
+            relationshipType: z.string().min(1).max(80).default('affected_by'),
             impactScope: z.string().min(1).max(120).optional(),
           })
           .strict()
-          .default({ relationshipType: 'affected', impactScope: 'service-impact' }),
+          .default({ relationshipType: 'affected_by', impactScope: 'service_impacting' }),
         impact: incidentImpactSchema,
         urgency: incidentUrgencySchema,
         expectedPriority: z.enum(['p1', 'p2', 'p3', 'p4']).optional(),

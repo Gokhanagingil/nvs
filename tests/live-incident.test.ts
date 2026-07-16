@@ -86,12 +86,12 @@ const fixture: NilesIncidentFixtureV1 = {
     service: { id: '66666666-6666-4666-8666-666666666666' },
     offering: { id: '77777777-7777-4777-8777-777777777777' },
     configurationItem: { id: '88888888-8888-4888-8888-888888888888' },
-    affectedCi: { relationshipType: 'affected', impactScope: 'service-impact' },
+    affectedCi: { relationshipType: 'affected_by', impactScope: 'service_impacting' },
     impact: 'high',
     urgency: 'high',
     expectedPriority: 'p1',
     hold: {
-      pendingReason: 'external_provider',
+      pendingReason: 'pending_external_dependency',
       pendingReasonDetail: 'Waiting for provider data.',
     },
     resolutionNotes: 'Synthetic resolution notes confirm restored payment processing.',
@@ -260,6 +260,26 @@ class StatefulIncidentAdapter implements NilesIncidentLiveAdapter {
         httpStatus: 200,
         durationMs: 1,
         correlationId: 'fixture_read',
+      },
+    };
+  }
+
+  async readChoiceValues(input: { field: 'pendingReason' | 'relationshipType' | 'impactScope' }) {
+    this.operations.push(`GET choices ${input.field}`);
+    const values =
+      input.field === 'pendingReason'
+        ? ['pending_external_dependency']
+        : input.field === 'relationshipType'
+          ? ['affected_by']
+          : ['service_impacting'];
+    return {
+      values,
+      transport: {
+        method: 'GET' as const,
+        pathTemplate: '/grc/itsm/choices?table=:table&field=:field',
+        httpStatus: 200,
+        durationMs: 1,
+        correlationId: `choice_${input.field}`,
       },
     };
   }
@@ -487,6 +507,13 @@ function buildCore(
       mutationsEnabled: () => true,
       clock: () => '2026-07-15T12:00:00.000Z',
       correlationIdFactory: (seed) => `live_${seed.replace(/[^a-z0-9]+/gi, '_').toLowerCase()}`,
+      slaObservationTimeoutMs: 25,
+      slaObservationIntervalMs: 1,
+      sleep: async (milliseconds) => {
+        if (milliseconds > 0) {
+          await new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
+        }
+      },
       ...(backgroundCoordinator ? { backgroundCoordinator } : {}),
     },
   );

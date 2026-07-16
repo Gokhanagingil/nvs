@@ -293,6 +293,14 @@ export interface NilesIncidentLiveAdapter {
     incidentId: string;
     correlationId: string;
   }): Promise<NilesSlaSummary>;
+  readChoiceValues?(input: {
+    environment: EnvironmentDefinitionV1;
+    session: ActorSession;
+    tenantId: string;
+    table: 'itsm_incidents' | 'itsm_incident_ci';
+    field: 'pendingReason' | 'relationshipType' | 'impactScope';
+    correlationId: string;
+  }): Promise<{ values: string[]; transport?: NilesTransportEvidence }>;
   readJournalSummary(input: {
     environment: EnvironmentDefinitionV1;
     session: ActorSession;
@@ -357,6 +365,9 @@ export interface LiveExecutionDependencies {
   monotonicClock?: () => number;
   correlationIdFactory?: (seed: string) => string;
   backgroundCoordinator?: (operation: () => Promise<void>) => void;
+  slaObservationTimeoutMs?: number;
+  slaObservationIntervalMs?: number;
+  sleep?: (milliseconds: number) => Promise<void>;
 }
 
 export interface CompileOnlyRunInput {
@@ -545,6 +556,7 @@ const AMBIGUOUS_CREATE_ERROR_CODES = new Set([
   'NILES_NETWORK_FAILURE',
   'NILES_UPSTREAM_FAILURE',
   'NILES_LIVE_ADAPTER_FAILURE',
+  'NILES_MALFORMED_RESPONSE',
 ]);
 
 type LiveObservationOperation = {
@@ -1239,6 +1251,100 @@ export class NvsCore {
     }
   }
 
+  private async verifyFixtureChoiceCompatibility(
+    environment: EnvironmentDefinitionV1,
+    fixture: NilesIncidentFixtureV1,
+    session: ActorSession,
+    correlationSeed: string,
+  ): Promise<NilesTransportEvidence[]> {
+    const reader = this.liveDependencies().incidentAdapter.readChoiceValues;
+    if (!reader) {
+      throw new LiveRunBlockedError(
+        'NILES_FIXTURE_CHOICE_READ_UNAVAILABLE',
+        'The NILES adapter does not expose the read-only choice catalog required for fixture compatibility verification.',
+        'ENVIRONMENT',
+      );
+    }
+    const requirements = [
+      {
+        table: 'itsm_incidents' as const,
+        field: 'pendingReason' as const,
+        expected: fixture.resources.hold.pendingReason,
+      },
+      {
+        table: 'itsm_incident_ci' as const,
+        field: 'relationshipType' as const,
+        expected: fixture.resources.affectedCi.relationshipType,
+      },
+      ...(fixture.resources.affectedCi.impactScope
+        ? [
+            {
+              table: 'itsm_incident_ci' as const,
+              field: 'impactScope' as const,
+              expected: fixture.resources.affectedCi.impactScope,
+            },
+          ]
+        : []),
+    ];
+    const transports: NilesTransportEvidence[] = [];
+    for (const requirement of requirements) {
+      const result = await reader.call(this.liveDependencies().incidentAdapter, {
+        environment,
+        session,
+        tenantId: fixture.tenantId,
+        table: requirement.table,
+        field: requirement.field,
+        correlationId: this.liveCorrelation(
+          `${correlationSeed}_choice_${requirement.table}_${requirement.field}`,
+        ),
+      });
+      if (result.transport) transports.push(result.transport);
+      if (!result.values.includes(requirement.expected)) {
+        throw new LiveRunBlockedError(
+          'NILES_FIXTURE_CHOICE_UNSUPPORTED',
+          `Configured ${requirement.table}.${requirement.field} value is not available in the tenant choice catalog.`,
+          'ENVIRONMENT',
+        );
+      }
+    }
+    return transports;
+  }
+
+  private async pollSlaSummary(input: {
+    environment: EnvironmentDefinitionV1;
+    session: ActorSession;
+    tenantId: string;
+    incidentId: string;
+    correlationSeed: string;
+    accept: (summary: NilesSlaSummary) => boolean;
+  }): Promise<{ summary: NilesSlaSummary; transports: NilesTransportEvidence[] }> {
+    const live = this.liveDependencies();
+    const timeoutMs = Math.max(0, live.slaObservationTimeoutMs ?? 10_000);
+    const intervalMs = Math.max(0, live.slaObservationIntervalMs ?? 300);
+    const monotonic = live.monotonicClock ?? (() => Date.now());
+    const sleep =
+      live.sleep ??
+      ((milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds)));
+    const startedAt = monotonic();
+    const transports: NilesTransportEvidence[] = [];
+    let attempt = 0;
+    for (;;) {
+      attempt += 1;
+      const summary = await live.incidentAdapter.readSlaSummary({
+        environment: input.environment,
+        session: input.session,
+        tenantId: input.tenantId,
+        incidentId: input.incidentId,
+        correlationId: this.liveCorrelation(`${input.correlationSeed}_${attempt}`),
+      });
+      if (summary.transport) transports.push(summary.transport);
+      if (input.accept(summary) || monotonic() - startedAt >= timeoutMs) {
+        return { summary, transports };
+      }
+      await sleep(intervalMs);
+    }
+  }
+
   private allowlistMatches(
     entries: ReadonlyArray<{ scenarioId: string; variationValues: Record<string, string> }>,
     scenarioId: string,
@@ -1480,6 +1586,12 @@ export class NvsCore {
       try {
         sessions = await this.authenticateLiveActors(environment, fixture, 'confirmed_readiness');
         pass('actor-authentication', 'Required live actor profiles authenticated read-only.');
+        const choiceTransports = await this.verifyFixtureChoiceCompatibility(
+          environment,
+          fixture,
+          sessions.tenantAdmin,
+          'confirmed_readiness',
+        );
         const verifiedResources = await Promise.all([
           live.incidentAdapter.verifyResource({
             environment,
@@ -1544,8 +1656,8 @@ export class NvsCore {
           pass(
             'fixture-resources',
             fixture.resources.sla.policyRef
-              ? 'Required fixture resources were verified read-only; SLA policyRef remains observational because no stable read-only policy endpoint is contracted.'
-              : 'Required fixture resources were verified read-only.',
+              ? `Required fixture resources and ${choiceTransports.length} choice-catalog reads were verified read-only; SLA policyRef remains observational because no stable read-only policy endpoint is contracted.`
+              : `Required fixture resources and ${choiceTransports.length} choice-catalog reads were verified read-only.`,
           );
         }
       } catch (error) {
@@ -2068,6 +2180,12 @@ export class NvsCore {
 
     try {
       sessions = await this.authenticateLiveActors(environment, fixture, input.runId);
+      await this.verifyFixtureChoiceCompatibility(
+        environment,
+        fixture,
+        sessions.tenantAdmin,
+        `${input.runId}_fixture`,
+      );
       const verifiedResources = await Promise.all([
         live.incidentAdapter.verifyResource({
           environment,
@@ -2410,19 +2528,34 @@ export class NvsCore {
                       'The incident must exist before SLA observation.',
                     ),
                   );
-                const summary = await live.incidentAdapter.readSlaSummary({
+                const requiredObjectiveTypes = fixture.resources.sla.objectiveTypes;
+                const phase =
+                  step.source.blueprintStepId === 'observe-held-sla' ? 'held' : 'active';
+                const polled = await this.pollSlaSummary({
                   environment,
                   session: sessions!.serviceDesk,
                   tenantId: fixture.tenantId,
                   incidentId: incident.id,
-                  correlationId,
+                  correlationSeed: `${input.runId}_${phase}_sla`,
+                  accept: (candidate) => {
+                    if (!fixture.resources.sla.required) return true;
+                    const observed = observedSlaObjectiveTypes(candidate);
+                    const objectivesPresent = requiredObjectiveTypes.every((objective) =>
+                      observed.has(objective),
+                    );
+                    return (
+                      objectivesPresent &&
+                      (phase === 'active'
+                        ? candidate.records.some((record) => isRunningSlaStatus(record.status))
+                        : candidate.records.some(isCurrentlyPaused))
+                    );
+                  },
                 });
+                const summary = polled.summary;
                 const observedObjectiveTypes = observedSlaObjectiveTypes(summary);
-                const requiredObjectiveTypes = fixture.resources.sla.objectiveTypes;
-                const phase =
-                  step.source.blueprintStepId === 'observe-held-sla' ? 'held' : 'active';
                 const slaEvidence = {
                   ...transportObservation(summary.transport),
+                  ...operationsEvidence(polled.transports),
                   incidentId: incident.id,
                   slaRecords: summary.records.length,
                   slaPhase: phase,
@@ -2522,21 +2655,29 @@ export class NvsCore {
                   'INCIDENT_NOT_RESUMED',
                   'The incident did not resume to in-progress state.',
                 );
-                const resumedSla = await live.incidentAdapter
-                  .readSlaSummary({
-                    environment,
-                    session: sessions!.serviceDesk,
-                    tenantId: fixture.tenantId,
-                    incidentId: incident.id,
-                    correlationId,
-                  })
-                  .catch((error: Error) => {
-                    throw attachOperationEvidence(error, [incident!.transport]);
-                  });
+                const resumedPoll = await this.pollSlaSummary({
+                  environment,
+                  session: sessions!.serviceDesk,
+                  tenantId: fixture.tenantId,
+                  incidentId: incident.id,
+                  correlationSeed: `${input.runId}_resumed_sla`,
+                  accept: (candidate) => {
+                    if (!fixture.resources.sla.required) return true;
+                    const observed = observedSlaObjectiveTypes(candidate);
+                    return (
+                      fixture.resources.sla.objectiveTypes.every((objective) =>
+                        observed.has(objective),
+                      ) && !candidate.records.some(isCurrentlyPaused)
+                    );
+                  },
+                }).catch((error: Error) => {
+                  throw attachOperationEvidence(error, [incident!.transport]);
+                });
+                const resumedSla = resumedPoll.summary;
                 if (fixture.resources.sla.required) {
                   const resumedEvidence = {
                     ...transportObservation(resumedSla.transport),
-                    ...operationsEvidence([incident.transport, resumedSla.transport]),
+                    ...operationsEvidence([incident.transport, ...resumedPoll.transports]),
                     incidentId: incident.id,
                     status: incident.status ?? null,
                     slaRecords: resumedSla.records.length,
@@ -2566,7 +2707,7 @@ export class NvsCore {
                 }
                 return {
                   ...transportObservation(incident.transport),
-                  ...operationsEvidence([incident.transport, resumedSla.transport]),
+                  ...operationsEvidence([incident.transport, ...resumedPoll.transports]),
                   incidentId: incident.id,
                   status: incident.status ?? null,
                   supportedStateField: 'status',
@@ -2599,21 +2740,29 @@ export class NvsCore {
                   'INCIDENT_NOT_RESOLVED',
                   'The incident did not reach resolved state.',
                 );
-                const resolvedSla = await live.incidentAdapter
-                  .readSlaSummary({
-                    environment,
-                    session: sessions!.serviceDesk,
-                    tenantId: fixture.tenantId,
-                    incidentId: incident.id,
-                    correlationId,
-                  })
-                  .catch((error: Error) => {
-                    throw attachOperationEvidence(error, [incident!.transport]);
-                  });
+                const resolvedPoll = await this.pollSlaSummary({
+                  environment,
+                  session: sessions!.serviceDesk,
+                  tenantId: fixture.tenantId,
+                  incidentId: incident.id,
+                  correlationSeed: `${input.runId}_resolved_sla`,
+                  accept: (candidate) => {
+                    if (!fixture.resources.sla.required) return true;
+                    const observed = observedSlaObjectiveTypes(candidate);
+                    return (
+                      fixture.resources.sla.objectiveTypes.every((objective) =>
+                        observed.has(objective),
+                      ) && candidate.records.some(isStoppedResolutionSlaRecord)
+                    );
+                  },
+                }).catch((error: Error) => {
+                  throw attachOperationEvidence(error, [incident!.transport]);
+                });
+                const resolvedSla = resolvedPoll.summary;
                 if (fixture.resources.sla.required) {
                   const resolvedEvidence = {
                     ...transportObservation(resolvedSla.transport),
-                    ...operationsEvidence([incident.transport, resolvedSla.transport]),
+                    ...operationsEvidence([incident.transport, ...resolvedPoll.transports]),
                     incidentId: incident.id,
                     status: incident.status ?? null,
                     slaRecords: resolvedSla.records.length,
@@ -2642,7 +2791,7 @@ export class NvsCore {
                 }
                 return {
                   ...transportObservation(incident.transport),
-                  ...operationsEvidence([incident.transport, resolvedSla.transport]),
+                  ...operationsEvidence([incident.transport, ...resolvedPoll.transports]),
                   incidentId: incident.id,
                   status: incident.status ?? null,
                   supportedStateField: 'status',

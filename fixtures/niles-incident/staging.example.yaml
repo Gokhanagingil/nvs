@@ -22,13 +22,13 @@ resources:
     id: 77777777-7777-4777-8777-777777777777
     label: Synthetic Payment API CI
   affectedCi:
-    relationshipType: affected
-    impactScope: service-impact
+    relationshipType: affected_by
+    impactScope: service_impacting
   impact: high
   urgency: high
   expectedPriority: p1
   hold:
-    pendingReason: external_provider
+    pendingReason: pending_external_dependency
     pendingReasonDetail: Waiting for payment provider diagnostics.
   resolutionNotes: Synthetic provider remediation restored payment authorization successfully.
   closeAuthority:

@@ -5,7 +5,8 @@ The NVS control plane remains bound to the staging host loopback interface. Thes
 Use the `main` branch only:
 
 - **Actions → staging operator → Run workflow** for non-mutating verification and discovery;
-- **Actions → staging fixture → Run workflow** for guarded server-owned fixture planning and application.
+- **Actions → staging fixture → Run workflow** for guarded server-owned fixture planning and application;
+- **Actions → staging live acceptance → Run workflow** for one explicitly confirmed M1-02B real Incident journey.
 
 ## Read-only staging operator
 
@@ -81,15 +82,46 @@ The operation writes only the server-owned staging environment and Incident fixt
 
 Applying a fixture does **not** enable NILES mutation and does not create or modify a NILES business record. The expected remaining live gate after a successful application is the server mutation switch.
 
+## Guarded M1-02B live acceptance
+
+Run the live workflow only after fixture application is successful. Supply the exact currently deployed SHA and enter:
+
+```text
+RUN_M1_02B_LIVE_INCIDENT
+```
+
+The workflow then:
+
+1. proves the mutation switch is initially disabled and the immutable running image matches `expected_sha`;
+2. takes an exact mode-`0600` backup of `.env` and creates an exclusive 15-minute server lease;
+3. starts a detached lease watchdog;
+4. enables the mutation switch only for that lease and recreates the same NVS image;
+5. runs confirmed read-only actor/resource readiness;
+6. starts one deterministic `payment-api-service-degradation / journey=normal` live run;
+7. polls the durable NVS checkpoint until `COMPLETED` or `RECOVERY_REQUIRED`;
+8. stores the detailed sanitized run report privately under `/opt/nvs/releases`;
+9. restores the exact original `.env`, recreates the same image, and verifies that mutation is disabled again.
+
+The GitHub summary never prints the Incident UUID or number. It reports only the run ID, final verdict/error code, required-step counts, cleanup policy/status, and final Incident disposition.
+
+Two successful acceptance classifications are recognized:
+
+- `PASS` when the actual NILES authority contract permits every required step and the declared retained-closed policy is satisfied;
+- `ACCEPTED_WITH_PRODUCT_BLOCKER` when all required pre-close steps pass, requester close is truthfully blocked with `NILES_CLOSE_AUTHORITY_UNSATISFIABLE`, and the run-owned Incident is verified deleted under `DELETE_IF_RUN_OWNED`.
+
+Any other `FAIL`, `BLOCKED`, timeout, unknown create outcome, incomplete cleanup, or recovery-required checkpoint fails the workflow. The `always()` cleanup step invokes `force-disable`, and the detached watchdog independently restores the original environment if the GitHub runner disappears.
+
 ## Security boundaries
 
-- Both workflows are manual-only and refuse to run from a branch other than `main`.
+- All workflows are manual-only and refuse to run from a branch other than `main`.
 - Jobs use the protected `staging` GitHub environment and the same pinned SSH trust contract as deployment.
+- Fixture application and live acceptance share one GitHub concurrency group so they cannot overlap.
 - Reviewed scripts are checked out from `main`, copied to a mode-`0700` temporary server directory, and removed after the operation.
 - Discovery runs inside the existing NVS container so it reaches NILES only through the approved private Docker network.
 - Credentials and bearer material stay in process memory and are never serialized.
 - Read-only operations do not write `/opt/nvs/.env`, `/opt/nvs/config`, `/opt/nvs/data`, or a NILES business endpoint.
 - Fixture application writes only reviewed NVS config files and rollback snapshots; it never writes `.env` or NILES.
-- Neither workflow changes `NVS_ENABLE_NILES_MUTATIONS`.
+- Live acceptance is the only browser workflow that temporarily edits `.env`; it restores the exact original bytes and never commits or prints them.
+- Production environments remain forbidden and port `4100` remains loopback-only.
 
 Interactive web-console access still requires an approved SSH tunnel or a separately approved authenticated reverse proxy. Do not publish port `4100` directly.

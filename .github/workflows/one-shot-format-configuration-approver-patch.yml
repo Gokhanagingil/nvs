@@ -1,0 +1,52 @@
+name: one-shot format configuration approver patch
+
+on:
+  push:
+    branches:
+      - ops/patch-configuration-approver-domain-access
+    paths:
+      - .github/workflows/one-shot-format-configuration-approver-patch.yml
+      - .github/workflows/one-shot-patch-configuration-approver-domain-access.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nvs-one-shot-format-configuration-approver-patch
+  cancel-in-progress: false
+
+jobs:
+  format:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ops/patch-configuration-approver-domain-access
+          persist-credentials: true
+          fetch-depth: 0
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa
+        with:
+          version: 11.13.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.18.0
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Format temporary workflows
+        run: |
+          set -euo pipefail
+          pnpm exec prettier --write \
+            .github/workflows/one-shot-format-configuration-approver-patch.yml \
+            .github/workflows/one-shot-patch-configuration-approver-domain-access.yml
+          if git diff --quiet --exit-code; then
+            exit 0
+          fi
+          git config user.name 'nvs-maintenance-bot'
+          git config user.email 'nvs-maintenance-bot@users.noreply.github.com'
+          git add \
+            .github/workflows/one-shot-format-configuration-approver-patch.yml \
+            .github/workflows/one-shot-patch-configuration-approver-domain-access.yml
+          git commit -m 'style: format configuration approver patch workflow'
+          git push origin HEAD:ops/patch-configuration-approver-domain-access

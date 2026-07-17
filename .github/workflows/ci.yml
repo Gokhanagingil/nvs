@@ -61,3 +61,140 @@ jobs:
             test-results
           if-no-files-found: ignore
           retention-days: 7
+
+  plan_server_owned_fixture:
+    needs: foundation
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.head_ref == 'ops/plan-server-owned-fixture' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      actions: write
+      contents: read
+      pull-requests: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Run read-only server-owned fixture plan and staging verification
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPLOY_SHA: 921198f636b60b00d4eff143570bba38914a7440
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -Eeuo pipefail
+          repo="$GITHUB_REPOSITORY"
+          workspace="$RUNNER_TEMP/nvs-server-owned-fixture-plan"
+          mkdir -p "$workspace"
+
+          latest_dispatch_run() {
+            local workflow="$1"
+            {
+              gh run list \
+                --repo "$repo" \
+                --workflow "$workflow" \
+                --branch main \
+                --event workflow_dispatch \
+                --limit 1 \
+                --json databaseId \
+                --jq '.[0].databaseId // 0'
+            } 2>/dev/null || printf '0\n'
+          }
+
+          dispatch_run() {
+            local workflow="$1"
+            shift
+            local previous candidate run_id=''
+            previous="$(latest_dispatch_run "$workflow")"
+            gh workflow run "$workflow" --repo "$repo" --ref main "$@" >/dev/null
+            for _attempt in $(seq 1 90); do
+              sleep 2
+              candidate="$(latest_dispatch_run "$workflow")"
+              if [[ "$candidate" != '0' && "$candidate" != "$previous" ]]; then
+                run_id="$candidate"
+                break
+              fi
+            done
+            [[ -n "$run_id" ]]
+            printf '%s\n' "$run_id"
+          }
+
+          wait_and_download() {
+            local run_id="$1"
+            local artifact_name="$2"
+            local destination="$3"
+            mkdir -p "$destination"
+            set +e
+            gh run watch "$run_id" --repo "$repo" --exit-status
+            local watch_status=$?
+            set -e
+            local download_status=1
+            for _attempt in $(seq 1 20); do
+              if gh run download "$run_id" \
+                --repo "$repo" \
+                --name "$artifact_name" \
+                --dir "$destination" >/dev/null 2>&1; then
+                download_status=0
+                break
+              fi
+              sleep 2
+            done
+            if [[ "$download_status" -ne 0 ]]; then
+              echo "sanitized artifact unavailable for workflow run $run_id" >&2
+              return 1
+            fi
+            if [[ "$watch_status" -ne 0 ]]; then
+              for safe_file in "$destination"/*.md; do
+                [[ -f "$safe_file" ]] && cat "$safe_file"
+              done
+              return "$watch_status"
+            fi
+          }
+
+          plan_run="$(dispatch_run staging-fixture.yml \
+            --field operation=plan \
+            --field environment_id=staging-example \
+            --field expected_sha="$DEPLOY_SHA" \
+            --field assignment_group_query='NVS Service Desk' \
+            --field service_query='NVS Payment API' \
+            --field offering_query='NVS Payment API Standard' \
+            --field ci_query='NVS-PAYMENT-API-STG' \
+            --field proposal_digest='' \
+            --field confirmation='')"
+          plan_dir="$workspace/plan"
+          wait_and_download \
+            "$plan_run" \
+            "nvs-staging-fixture-${plan_run}-1" \
+            "$plan_dir"
+          plan_file="$plan_dir/nvs-staging-fixture.md"
+          test -f "$plan_file"
+          grep -F -- '**Result:** PASS' "$plan_file" >/dev/null
+          digest="$(sed -n 's/^- Proposal digest: `\([0-9a-f]\{64\}\)`$/\1/p' "$plan_file")"
+          [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
+          grep -F -- '- Assignment-group eligible selection: `1`' "$plan_file" >/dev/null
+          grep -F -- '- Service eligible matches: `1`' "$plan_file" >/dev/null
+          grep -F -- '- Offering eligible matches linked to the selected service: `1`' "$plan_file" >/dev/null
+          grep -F -- '- CI eligible matches: `1`' "$plan_file" >/dev/null
+
+          verify_run="$(dispatch_run staging-operator.yml \
+            --field operation=verify \
+            --field environment_id=staging-example \
+            --field expected_sha="$DEPLOY_SHA" \
+            --field query='')"
+          gh run watch "$verify_run" --repo "$repo" --exit-status
+
+          body="$workspace/result.md"
+          {
+            echo '## Read-only server-owned fixture plan'
+            echo
+            echo "- Deployed exact SHA: \`$DEPLOY_SHA\`"
+            echo "- Fixture plan run: \`$plan_run\`"
+            echo "- Staging verification run: \`$verify_run\`"
+            echo "- Proposal digest: \`$digest\`"
+            echo '- Unique assignment group, service, offering, and CI: `PASS`'
+            echo '- Mutation switch modified: `NO`'
+            echo '- Incident created: `NO`'
+            echo '- Result: `PASS`'
+            echo
+            echo 'The proposal remains server-owned and unapplied. Applying it requires the separate exact confirmation `APPLY_M1_02B_FIXTURE`.'
+          } > "$body"
+          gh pr comment "$PR_NUMBER" --repo "$repo" --body-file "$body"
